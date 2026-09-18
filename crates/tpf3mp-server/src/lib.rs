@@ -25,6 +25,7 @@ pub use crate::{
 use crate::{
     directory::{Directory, DirectoryConfig},
     metrics::{Gauges, Metrics},
+    room::{RoomEnv, Timeouts},
 };
 
 pub struct ServerConfig {
@@ -48,6 +49,12 @@ pub struct ServerConfig {
     /// keeps rooms in memory only. Restored rooms can only be rejoined with
     /// the same `secret`.
     pub data_dir: Option<PathBuf>,
+    /// A member that has steps to run but has not advanced for this long
+    /// stops holding its room until it catches up.
+    pub stall_timeout: Duration,
+    /// A member still loading the world this long after the start stops
+    /// holding its room until it catches up.
+    pub load_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -65,6 +72,11 @@ impl ServerConfig {
             ruleset: Arc::new(|| Box::new(AcceptAll)),
             tick: Duration::from_millis(100),
             data_dir: None,
+            // Long enough for an autosave or a hitch; short enough that one
+            // frozen machine does not stop a room for good.
+            stall_timeout: Duration::from_secs(20),
+            // Large worlds take minutes to load.
+            load_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -115,9 +127,15 @@ impl Server {
             secret: config.secret,
             max_rooms: config.max_rooms,
             ruleset: config.ruleset,
-            tick: config.tick,
-            metrics: Arc::clone(&metrics),
-            data_dir: config.data_dir,
+            env: RoomEnv {
+                tick: config.tick,
+                metrics: Arc::clone(&metrics),
+                data_dir: config.data_dir,
+                timeouts: Timeouts {
+                    stall: config.stall_timeout,
+                    load: config.load_timeout,
+                },
+            },
         }));
         let restored = directory.recover();
         if restored > 0 {

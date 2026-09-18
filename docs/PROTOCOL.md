@@ -99,6 +99,14 @@ events for `sealed_through + 1` at once, without running a step.
   `0`, meaning it has loaded the world.
 - **Catching up.** A member who reconnects does not hold the room until its
   progress is back within the pacing window.
+- **Stalls.** A member stops holding the room when either:
+  - it has sealed steps to run but has not advanced for the stall timeout
+    (20 s by default: long enough for an autosave);
+  - it is still loading after the load timeout (5 min).
+
+  This way one frozen game, or a client that stops reporting, cannot stop a
+  room for good. The member rejoins the pacing set by catching up; nobody is
+  kicked. Pausing restarts every member's stall timer.
 
 ## Game messages from the client
 

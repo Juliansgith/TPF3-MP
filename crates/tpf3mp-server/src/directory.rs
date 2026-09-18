@@ -5,7 +5,6 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
 };
 
 use ring::hmac;
@@ -16,8 +15,8 @@ use tpf3mp_proto::{
 use tracing::{info, warn};
 
 use crate::{
-    metrics::{self, Metrics},
-    room::{NewMember, ROOM_QUEUE, Room, RoomHandle, RoomSecrets, RoomSpec},
+    metrics,
+    room::{NewMember, ROOM_QUEUE, Room, RoomEnv, RoomHandle, RoomSecrets, RoomSpec},
     ruleset::RulesetFactory,
 };
 
@@ -26,18 +25,14 @@ pub(crate) struct Directory {
     max_rooms: usize,
     key: hmac::Key,
     ruleset: RulesetFactory,
-    tick: Duration,
-    metrics: Arc<Metrics>,
-    data_dir: Option<PathBuf>,
+    env: RoomEnv,
 }
 
 pub(crate) struct DirectoryConfig {
     pub(crate) secret: [u8; 32],
     pub(crate) max_rooms: usize,
     pub(crate) ruleset: RulesetFactory,
-    pub(crate) tick: Duration,
-    pub(crate) metrics: Arc<Metrics>,
-    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) env: RoomEnv,
 }
 
 impl Directory {
@@ -47,9 +42,7 @@ impl Directory {
             max_rooms: config.max_rooms,
             key: hmac::Key::new(hmac::HMAC_SHA256, &config.secret),
             ruleset: config.ruleset,
-            tick: config.tick,
-            metrics: config.metrics,
-            data_dir: config.data_dir,
+            env: config.env,
         }
     }
 
@@ -57,7 +50,7 @@ impl Directory {
     /// cannot be recovered is renamed to `*.broken` and kept for diagnosis,
     /// never deleted. Returns how many rooms were restored.
     pub(crate) fn recover(self: &Arc<Self>) -> usize {
-        let Some(dir) = &self.data_dir else {
+        let Some(dir) = &self.env.data_dir else {
             return 0;
         };
         let Ok(entries) = fs::read_dir(dir) else {
@@ -71,14 +64,8 @@ impl Directory {
         paths.sort();
         let mut restored = 0;
         for path in paths {
-            let recovered = Room::recover(
-                &path,
-                self.key.clone(),
-                (self.ruleset)(),
-                self.tick,
-                Arc::clone(&self.metrics),
-                self.data_dir.clone(),
-            );
+            let recovered =
+                Room::recover(&path, self.key.clone(), (self.ruleset)(), self.env.clone());
             match recovered {
                 Ok(Some(room)) => {
                     info!(room = %room.id(), "restored a running room from its log");
@@ -134,9 +121,7 @@ impl Directory {
                 settings: request.settings,
                 secrets,
                 ruleset: (self.ruleset)(),
-                tick: self.tick,
-                metrics: Arc::clone(&self.metrics),
-                data_dir: self.data_dir.clone(),
+                env: self.env.clone(),
             },
             owner,
         );
@@ -145,7 +130,7 @@ impl Directory {
         let handle = RoomHandle::new(commands);
         rooms.insert(id, handle.clone());
         drop(rooms);
-        metrics::increment(&self.metrics.rooms_created);
+        metrics::increment(&self.env.metrics.rooms_created);
         tokio::spawn(room.run(receiver, Arc::clone(self)));
         Ok((handle, Invite { room: id, token }, view))
     }

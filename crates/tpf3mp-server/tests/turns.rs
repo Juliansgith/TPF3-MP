@@ -171,6 +171,50 @@ async fn a_slow_player_holds_the_room() {
 }
 
 #[tokio::test]
+async fn a_stalled_player_stops_holding_the_room() {
+    let server = RunningServer::start(|config| {
+        config.stall_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let clients = vec![server.client("ann").await, server.client("bob").await];
+    let (mut players, _) = start(clients, FAST).await;
+    let bob = players.pop().unwrap();
+    let mut ann = players.pop().unwrap();
+    // Bob loads, then his game freezes while his connection stays up.
+    bob.test.client.report_progress(0).await.unwrap();
+
+    ann.play_for(Duration::from_secs(3)).await;
+    let sealed = ann.follower.as_ref().unwrap().sealed_through();
+    // Held, the room would stop at 102 steps (see a_slow_player_holds_the_room).
+    // Released after half a second, it runs on at 50 steps per second.
+    assert!(
+        sealed > 120,
+        "the room is still held at {sealed} by a frozen player"
+    );
+    drop(bob);
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn a_player_that_never_loads_is_released_after_the_load_timeout() {
+    let server = RunningServer::start(|config| {
+        config.load_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let clients = vec![server.client("ann").await, server.client("bob").await];
+    let (mut players, _) = start(clients, FAST).await;
+    let mut bob = players.pop().unwrap();
+    let mut ann = players.pop().unwrap();
+    bob.reports_progress = false;
+
+    ann.play_for(Duration::from_millis(300)).await;
+    assert_eq!(ann.follower.as_ref().unwrap().sealed_through(), 0);
+    ann.play_until(|p| p.executed >= 20).await;
+    drop(bob);
+    server.shut_down().await;
+}
+
+#[tokio::test]
 async fn bursts_are_rate_limited() {
     let server = RunningServer::start(|_| {}).await;
     let (mut players, _) = start(vec![server.client("ann").await], FAST).await;

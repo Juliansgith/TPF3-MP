@@ -17,6 +17,7 @@ pub(crate) struct Metrics {
     pub(crate) intents_refused: AtomicU64,
     pub(crate) divergences: AtomicU64,
     pub(crate) slow_consumers: AtomicU64,
+    pub(crate) stalls: AtomicU64,
 }
 
 /// Values measured at scrape time rather than counted.
@@ -35,7 +36,7 @@ pub(crate) fn add(counter: &AtomicU64, amount: u64) {
 
 impl Metrics {
     pub(crate) fn render(&self, gauges: &Gauges) -> String {
-        let counters: [(&str, &str, &AtomicU64); 10] = [
+        let counters: [(&str, &str, &AtomicU64); 11] = [
             (
                 "sessions_opened",
                 "Sessions that completed the handshake.",
@@ -73,6 +74,11 @@ impl Metrics {
                 "slow_consumers",
                 "Sessions disconnected for not reading fast enough.",
                 &self.slow_consumers,
+            ),
+            (
+                "stalls",
+                "Members that stopped advancing and no longer hold their room.",
+                &self.stalls,
             ),
         ];
         let mut out = String::new();

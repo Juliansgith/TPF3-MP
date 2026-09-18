@@ -228,7 +228,19 @@ struct Member {
     /// Whether this member's current link has an open turn stream.
     streaming: bool,
     pace: Pace,
+    /// When this member's progress last moved forward.
+    advanced: Instant,
     intents: TokenBucket,
+}
+
+/// How long the room waits for a member before it stops holding everyone
+/// else for them. A demoted member rejoins the pacing set by catching up.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timeouts {
+    /// A member with sealed steps to run that has not advanced for this long.
+    pub(crate) stall: Duration,
+    /// A member still loading the world this long after the start.
+    pub(crate) load: Duration,
 }
 
 /// How a member relates to the room clock.
@@ -263,6 +275,8 @@ struct Game {
     log_first_turn: u64,
     resume_window: usize,
     last_tick: Instant,
+    /// When the game started (or was restored), for the load timeout.
+    started: Instant,
     /// Checkpoint rounds by step.
     rounds: BTreeMap<u64, Round>,
 }
@@ -292,8 +306,18 @@ pub(crate) struct Room {
     metrics: Arc<Metrics>,
     /// Where running games are logged; `None` keeps rooms in memory only.
     data_dir: Option<PathBuf>,
+    timeouts: Timeouts,
     log: Option<RoomLog>,
     closed: bool,
+}
+
+/// What every room of a server shares.
+#[derive(Clone)]
+pub(crate) struct RoomEnv {
+    pub(crate) tick: Duration,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) timeouts: Timeouts,
 }
 
 /// Why a room log could not be turned back into a room.
@@ -320,9 +344,7 @@ pub(crate) struct RoomSpec {
     pub(crate) settings: RoomSettings,
     pub(crate) secrets: RoomSecrets,
     pub(crate) ruleset: Box<dyn Ruleset>,
-    pub(crate) tick: Duration,
-    pub(crate) metrics: Arc<Metrics>,
-    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) env: RoomEnv,
 }
 
 impl Room {
@@ -337,9 +359,10 @@ impl Room {
             members: Vec::new(),
             phase: Phase::Lobby,
             ruleset: spec.ruleset,
-            tick: spec.tick,
-            metrics: spec.metrics,
-            data_dir: spec.data_dir,
+            tick: spec.env.tick,
+            metrics: spec.env.metrics,
+            data_dir: spec.env.data_dir,
+            timeouts: spec.env.timeouts,
             log: None,
             closed: false,
         };
@@ -354,9 +377,7 @@ impl Room {
         path: &Path,
         key: hmac::Key,
         mut ruleset: Box<dyn Ruleset>,
-        tick: Duration,
-        metrics: Arc<Metrics>,
-        data_dir: Option<PathBuf>,
+        env: RoomEnv,
     ) -> Result<Option<Self>, RecoverError> {
         let (log, records) = RoomLog::open(path)?;
         let (first, turns) = records.split_first().ok_or(RecoverError::Empty)?;
@@ -420,6 +441,7 @@ impl Room {
                 link: None,
                 streaming: false,
                 pace: Pace::CatchingUp(None),
+                advanced: Instant::now(),
                 intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
             })
             .collect();
@@ -448,9 +470,10 @@ impl Room {
             members,
             phase: Phase::Running(Box::new(game)),
             ruleset,
-            tick,
-            metrics,
-            data_dir,
+            tick: env.tick,
+            metrics: env.metrics,
+            data_dir: env.data_dir,
+            timeouts: env.timeouts,
             log: Some(log),
             closed: false,
         }))
@@ -858,12 +881,54 @@ impl Room {
             member.pace = Pace::CatchingUp(None);
             return;
         }
-        member.pace = match member.pace {
+        let pace = match member.pace {
             Pace::Loading => Pace::Following(step),
             Pace::Following(previous) => Pace::Following(previous.max(step)),
             Pace::CatchingUp(_) if step.saturating_add(window) >= sealed => Pace::Following(step),
             Pace::CatchingUp(_) => Pace::CatchingUp(Some(step)),
         };
+        let moved = match (member.pace, pace) {
+            (Pace::Following(before), Pace::Following(after)) => after > before,
+            (_, Pace::Following(_)) => true,
+            _ => false,
+        };
+        if moved {
+            member.advanced = Instant::now();
+        }
+        member.pace = pace;
+    }
+
+    /// Stops members who stopped advancing from holding the room: one that
+    /// has sealed steps to run but has not moved for the stall timeout, or
+    /// one still loading after the load timeout. While the room is paused
+    /// nobody is expected to move, so every clock restarts.
+    fn demote_stalled(&mut self, now: Instant) {
+        let Phase::Running(game) = &self.phase else {
+            return;
+        };
+        let (sealed, paused, started) = (game.sealed_through, game.speed.is_paused(), game.started);
+        for member in self.members.iter_mut().filter(|m| m.streaming) {
+            if paused {
+                member.advanced = now;
+                continue;
+            }
+            let stalled = match member.pace {
+                Pace::Loading => now.saturating_duration_since(started) >= self.timeouts.load,
+                Pace::Following(step) => {
+                    step < sealed
+                        && now.saturating_duration_since(member.advanced) >= self.timeouts.stall
+                }
+                Pace::CatchingUp(_) => false,
+            };
+            if stalled {
+                info!(room = %self.id, player = %member.player, pace = ?member.pace, "a member stopped advancing; the room no longer waits for it");
+                metrics::increment(&self.metrics.stalls);
+                member.pace = match member.pace {
+                    Pace::Following(step) => Pace::CatchingUp(Some(step)),
+                    _ => Pace::CatchingUp(None),
+                };
+            }
+        }
     }
 
     fn checkpoint(
@@ -974,6 +1039,7 @@ impl Room {
 
     fn on_tick(&mut self, now: Instant) {
         self.decide_waiting_rounds(now);
+        self.demote_stalled(now);
         let Phase::Running(game) = &mut self.phase else {
             return;
         };
@@ -1084,6 +1150,7 @@ impl Member {
             link: Some(new.link),
             streaming: false,
             pace: Pace::CatchingUp(None),
+            advanced: Instant::now(),
             intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
         }
     }
@@ -1139,6 +1206,7 @@ impl Game {
             log_first_turn: 1,
             resume_window: RESUME_WINDOW,
             last_tick: Instant::now(),
+            started: Instant::now(),
             rounds: BTreeMap::new(),
         }
     }
@@ -1382,6 +1450,7 @@ mod tests {
             link: None,
             streaming: false,
             pace: Pace::Loading,
+            advanced: Instant::now(),
             intents: TokenBucket::new(1, 1),
         }
     }
