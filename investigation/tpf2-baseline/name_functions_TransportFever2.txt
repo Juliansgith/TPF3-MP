@@ -1,0 +1,28 @@
+﻿== TransportFever2.exe (PE, x86_64)
+   image_arch                   x86_64
+   image_format                 pe
+   total_functions              115484
+   assert_funcsig_strings       18897
+   assert_pretty_strings        0
+   assert_file_strings          729
+   references_resolved          88198
+   references_outside_bounds    0
+   functions_named_funcsig      20746
+   functions_named_pretty       0
+   functions_named_ambiguous    3454
+   functions_file_direct        20062
+   functions_file_inferred      34374
+   distinct_source_files        725
+   source_prefix                c:\gitlab-runner\builds\1bjompbz\0\ug\urban_games\train_fever\src\
+   wrote tpf2.{symbols.json,symbols.csv,ghidra.py,x64dbg.json,ida.py} -> C:\Users\Sepgi\AppData\Local\Temp\claude\C--Users-Sepgi-Desktop-Transport-fever-modding-TPF3-MP\b5cd5165-d2d9-481a-999c-128b13e86c93\scratchpad\nf_out
+
+== validation (C:\Users\Sepgi\Desktop\Transport fever modding\TPF3-MP\.claude\worktrees\agent-afdfe756f9164a8c0\investigation\tpf2-baseline\tpf2_known_rvas.txt)
+  0x15aa00    OK  GameSim::Step  [funcsig]  src=game\gamesim.cpp
+  0x118e90    OK  CGame::Step  [funcsig]  src=game\game.cpp
+  0x1184d0    OK  CGame::RunGameSimLoop  [funcsig]  src=game\game.cpp
+  0x6785c0    OK  UI::CMenuUI::StartSavegame  [funcsig]  src=game\ui\components\menuui.cpp
+  0x663370    OK  UI::CMenuUI::CreatePage  [funcsig]  src=game\ui\components\menuui.cpp
+  0x2877a0    OK  not funcsig-named; source=game\gametime.cpp
+  0x9dc750    OK  not funcsig-named; source=game\command\make_command.cpp
+  0x9d2a00    OK  not funcsig-named; source=game\command\commandlist.cpp
+   ALL OK

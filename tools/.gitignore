@@ -1,0 +1,5 @@
+# Python bytecode and virtualenvs created while running the recon tools.
+__pycache__/
+*.pyc
+.venv/
+venv/

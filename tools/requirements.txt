@@ -1,0 +1,9 @@
+# Python packages for the TPF3-MP release-day recon tools (tools/re, tools/probe).
+# Python 3.12. Install into a venv:  python -m venv .venv && .venv/Scripts/pip install -r tools/requirements.txt
+# Versions are the ones validated against Transport Fever 2 build 35924.
+
+pefile==2024.8.26     # PE parsing (binary_survey, name_functions, tpfbin) -- also used by the prior art
+capstone==5.0.9       # x86-64 ref verification and arm64 ADRP+ADD decoding (name_functions, tpfbin)
+numpy==2.5.3          # vectorised rip-relative reference scan over .text (tpfbin)
+lief==1.0.0           # ELF and Mach-O parsing for the Linux/macOS day-one builds (tpfbin)
+lupa==2.8             # bundled Lua 5.1/5.2/5.3/5.4 for syntax-checking the probe mods (tools/probe/check_lua.py)

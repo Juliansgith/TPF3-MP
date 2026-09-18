@@ -1,0 +1,20 @@
+# Known TPF2 build-35924 RVAs (image base 0x140000000) from the prior art, used
+# to validate tools/re/name_functions.py.
+#
+#   <rva>  <name-substring>   the binary asserts with this function's __FUNCSIG__,
+#                             so the pipeline MUST name it correctly.
+#   <rva>  ~ <src-substring>  the binary embeds NO __FUNCSIG__ for it, so the
+#                             pipeline must decline to name it and instead
+#                             attribute it to the right source file. The prior
+#                             art recovered these three names from RTTI / a
+#                             decompile / differential capture, not from an
+#                             assert string -- so "unnamed but correct file" is
+#                             the honest __FUNCSIG__/__FILE__ result.
+15aa00  GameSim::Step
+118e90  CGame::Step
+1184d0  CGame::RunGameSimLoop
+6785c0  UI::CMenuUI::StartSavegame
+663370  UI::CMenuUI::CreatePage
+2877a0  ~ gametime.cpp
+9dc750  ~ make_command.cpp
+9d2a00  ~ commandlist.cpp
