@@ -26,6 +26,8 @@ pub(crate) const fn compress_bound(len: usize) -> usize {
 pub enum ChunkError {
     #[error("{len}-byte compressed chunk exceeds the {max}-byte bound for its size")]
     TooLarge { len: usize, max: usize },
+    #[error("chunk is not exactly one standard zstd frame")]
+    NotOneFrame,
     #[error("chunk does not decompress: {0}")]
     Decompress(io::Error),
     #[error("chunk decompresses to {actual} bytes instead of {expected}")]
@@ -50,6 +52,11 @@ pub(crate) fn decompressor() -> io::Result<Decompressor<'static>> {
 /// zstd decodes into a buffer of `raw_len` bytes and fails rather than grow
 /// it, so a hostile frame cannot make this allocate more than the manifest
 /// allows, and decoding time stays linear in the frame and output sizes.
+///
+/// The input must be exactly one standard frame. zstd would also accept
+/// skippable frames and several frames in a row; stored as received and served
+/// on, those would let a peer smuggle arbitrary bytes to everyone who later
+/// downloads the chunk.
 pub(crate) fn decode(
     decompressor: &mut Decompressor<'_>,
     id: &ChunkId,
@@ -63,6 +70,12 @@ pub(crate) fn decode(
             len: frame.len(),
             max,
         });
+    }
+    let standard = frame
+        .first_chunk::<4>()
+        .is_some_and(|magic| u32::from_le_bytes(*magic) == zstd::zstd_safe::MAGICNUMBER);
+    if !standard || zstd::zstd_safe::find_frame_compressed_size(frame) != Ok(frame.len()) {
+        return Err(ChunkError::NotOneFrame);
     }
     let mut raw = Vec::with_capacity(expected);
     decompressor
@@ -161,11 +174,38 @@ mod tests {
                 actual: 10_000
             })
         ));
-        // More content than the manifest allows never fits the buffer.
+        // More content than the manifest allows never fits the buffer. (Were
+        // the buffer allocated larger, the length check would catch it.)
         assert!(matches!(
             decode_new(&id, 9_999, &frame),
-            Err(ChunkError::Decompress(_))
+            Err(ChunkError::Decompress(_) | ChunkError::LengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn exactly_one_standard_frame_is_accepted() {
+        let data = sample(10_000);
+        let id = ChunkId::of(&data);
+        let frame = frame_of(&data);
+        // A skippable frame: magic 0x184D2A50, a length, then anything.
+        let mut skippable = vec![0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0];
+        skippable.extend_from_slice(b"evil");
+        let with_trailer = [frame.as_slice(), &skippable].concat();
+        let with_prefix = [skippable.as_slice(), &frame].concat();
+        let half = frame_of(&data[..5_000]);
+        let rest = frame_of(&data[5_000..]);
+        let two_frames = [half.as_slice(), &rest].concat();
+        for input in [with_trailer, with_prefix, two_frames] {
+            assert!(
+                matches!(
+                    decode_new(&id, 10_000, &input),
+                    Err(ChunkError::NotOneFrame)
+                ),
+                "{} bytes accepted",
+                input.len()
+            );
+        }
+        assert!(decode_new(&id, 10_000, &frame).is_ok());
     }
 
     #[test]

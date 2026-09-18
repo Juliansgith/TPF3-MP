@@ -16,7 +16,9 @@
 //! - a receiver asks its own store which chunks it lacks
 //!   ([`ChunkStore::missing`]), fetches only those, and hands them in any order
 //!   to a [`ChunkSink`], which verifies each one, survives restarts, and
-//!   finally assembles the file and verifies it against the manifest.
+//!   finally assembles the file and verifies it against the manifest;
+//! - the store retains every snapshot it ingested or received until it is
+//!   released, and garbage collection removes chunks nothing references.
 //!
 //! Manifests and chunks may come from hostile peers. Decoding is bounded
 //! before anything is allocated, every chunk is checked against its id after
@@ -44,7 +46,7 @@ pub use manifest::{
 };
 pub use params::{ChunkParams, MAX_CHUNK_LEN, MIN_CHUNK_FLOOR, ParamsError};
 pub use sink::{ChunkSink, Progress, SinkError};
-pub use store::{ChunkStore, GcStats, StateDamage, StoreConfig, StoreError};
+pub use store::{ChunkStore, GcStats, RecordDamage, StoreConfig, StoreError};
 
 /// The largest file a manifest may describe. Saves are expected to stay below
 /// 500 MB.

@@ -146,13 +146,10 @@ fn damaged_chunk_files_are_rejected() {
             matches!(e, ChunkError::BadFile(_))
         }),
         (original[..8].to_vec(), |e| {
-            matches!(
-                e,
-                ChunkError::Decompress(_) | ChunkError::LengthMismatch { .. }
-            )
+            matches!(e, ChunkError::NotOneFrame)
         }),
         (original[..original.len() - 1].to_vec(), |e| {
-            matches!(e, ChunkError::Decompress(_))
+            matches!(e, ChunkError::NotOneFrame)
         }),
         (huge_length, |e| matches!(e, ChunkError::BadFile(_))),
         (zero_length, |e| matches!(e, ChunkError::BadFile(_))),
@@ -233,47 +230,105 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// Garbage collection keeps every chunk of the live manifests, and
-    /// nothing else.
+    /// Garbage collection keeps every chunk of the live and the retained
+    /// manifests, and nothing else.
     #[test]
-    fn gc_keeps_exactly_the_live_chunks(seeds in proptest::collection::vec(any::<u64>(), 1..5), live_mask: u8) {
+    fn gc_keeps_exactly_the_live_chunks(
+        seeds in proptest::collection::vec(any::<u64>(), 1..5),
+        live_mask: u8,
+        retain_mask: u8,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // Files that share a prefix, so chunks are shared between manifests.
+        // Files that share a prefix, so chunks are shared between manifests,
+        // and end in their own index, so no two are the same snapshot.
         let base = repetitive_bytes(9, 200_000);
         let manifests: Vec<Manifest> = seeds
             .iter()
-            .map(|&seed| {
+            .enumerate()
+            .map(|(index, &seed)| {
                 let mut data = base.clone();
                 data.extend(random_bytes(seed, 20_000 + (seed % 150_000) as usize));
+                data.push(index as u8);
                 ingest(&store, &data)
             })
             .collect();
-        let live: Vec<&Manifest> = manifests
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| live_mask & (1 << index) != 0)
-            .map(|(_, manifest)| manifest)
-            .collect();
-        let expected: BTreeSet<ChunkId> = live.iter().flat_map(|manifest| ids(manifest)).collect();
+        let chosen = |mask: u8| {
+            manifests
+                .iter()
+                .enumerate()
+                .filter(move |(index, _)| mask & (1 << index) != 0)
+                .map(|(_, manifest)| manifest)
+        };
+        // Ingest retains every snapshot; release the ones this case does not.
+        for manifest in chosen(!retain_mask) {
+            store.release(&manifest.id()).unwrap();
+        }
+        let expected: BTreeSet<ChunkId> = chosen(live_mask | retain_mask).flat_map(ids).collect();
         let before = chunk_files(dir.path());
-        let stats = store.gc(live.iter().copied()).unwrap();
+        let stats = store.gc(chosen(live_mask)).unwrap();
         let after = chunk_files(dir.path());
         prop_assert_eq!(&after, &expected);
         prop_assert_eq!(stats.kept_chunks as usize, expected.len());
         prop_assert_eq!(stats.removed_chunks as usize, before.len() - expected.len());
         prop_assert_eq!(store.used_bytes(), stats.kept_bytes);
-        for manifest in live {
+        for manifest in chosen(live_mask | retain_mask) {
             prop_assert_eq!(store.missing(manifest).unwrap(), []);
         }
     }
 }
 
 #[test]
+fn ingested_snapshots_are_retained_until_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let data = random_bytes(21, 400_000);
+    let manifest = ingest(&store, &data);
+    assert_eq!(store.retained().unwrap(), [manifest.id()]);
+    assert_eq!(store.manifest(&manifest.id()).unwrap(), manifest);
+    // A collection with nothing live keeps what is retained.
+    let stats = store.gc([]).unwrap();
+    assert_eq!(stats.removed_chunks, 0);
+    assert_eq!(store.missing(&manifest).unwrap(), []);
+    // After a restart, the store still knows its snapshots.
+    drop(store);
+    let store = self::store(dir.path());
+    assert_eq!(store.retained().unwrap(), [manifest.id()]);
+    store.release(&manifest.id()).unwrap();
+    assert!(store.retained().unwrap().is_empty());
+    assert!(matches!(
+        store.manifest(&manifest.id()),
+        Err(StoreError::UnknownSnapshot(id)) if id == manifest.id()
+    ));
+    store.gc([]).unwrap();
+    assert!(chunk_files(dir.path()).is_empty());
+}
+
+#[test]
+fn chunk_files_too_short_to_be_chunks_count_as_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let data = random_bytes(22, 400_000);
+    let manifest = ingest(&store, &data);
+    let id = manifest.chunks()[1].id;
+    // What a power failure without flushing can leave behind.
+    fs::write(chunk_file(dir.path(), &id), b"").unwrap();
+    assert!(!store.has(&id).unwrap());
+    assert_eq!(store.missing(&manifest).unwrap()[0].id, id);
+    // Storing the chunk again replaces the empty file.
+    ingest(&store, &data);
+    assert!(store.has(&id).unwrap());
+    let dest = dir.path().join("out.sav");
+    store.assemble(&manifest, &dest).unwrap();
+    assert!(fs::read(&dest).unwrap() == data);
+}
+
+#[test]
 fn gc_with_nothing_live_empties_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
-    ingest(&store, &random_bytes(10, 500_000));
+    let manifest = ingest(&store, &random_bytes(10, 500_000));
+    store.release(&manifest.id()).unwrap();
     fs::write(dir.path().join("tmp").join("leftover"), b"partial write").unwrap();
     let stats = store.gc([]).unwrap();
     assert!(stats.removed_chunks > 0);
@@ -436,11 +491,23 @@ fn assembly_replaces_the_destination_only_when_verified() {
     let error = store.assemble(&manifest, &dest).unwrap_err();
     assert!(matches!(error, StoreError::Corrupt { .. }), "{error}");
     assert_eq!(fs::read(&dest).unwrap(), b"the previous save");
-    assert!(!dir.path().join(".world.sav.tpf3mp-partial").exists());
+    assert!(partial_files(dir.path()).is_empty());
 
+    // What an assembly interrupted by a crash leaves behind is cleared.
+    let stale = dir.path().join(".world.sav.2a-7.tpf3mp-partial");
+    fs::write(&stale, b"half a save").unwrap();
     ingest(&store, &data);
     store.assemble(&manifest, &dest).unwrap();
     assert!(fs::read(&dest).unwrap() == data);
+    assert!(partial_files(dir.path()).is_empty());
+}
+
+fn partial_files(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".tpf3mp-partial"))
+        .collect()
 }
 
 #[test]

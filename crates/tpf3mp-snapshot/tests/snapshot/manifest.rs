@@ -79,8 +79,15 @@ fn apply(bytes: &mut Vec<u8>, mutation: &Mutation) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
+    /// Half the inputs start with the right magic and version, so decoding
+    /// gets past the first check.
     #[test]
-    fn arbitrary_bytes_are_rejected_or_canonical(bytes in vec(any::<u8>(), 0..600)) {
+    fn arbitrary_bytes_are_rejected_or_canonical(
+        prefixed: bool,
+        tail in vec(any::<u8>(), 0..600),
+    ) {
+        let mut bytes = if prefixed { b"T3SM\x01".to_vec() } else { Vec::new() };
+        bytes.extend_from_slice(&tail);
         check_outcome(&bytes)?;
     }
 

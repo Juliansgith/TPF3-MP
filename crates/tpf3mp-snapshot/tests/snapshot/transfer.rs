@@ -4,11 +4,12 @@ use std::fs;
 
 use proptest::prelude::*;
 use tpf3mp_snapshot::{
-    ChunkError, ChunkId, ChunkSink, ChunkStore, Manifest, SinkError, StoreError,
+    ChunkError, ChunkId, ChunkSink, ChunkStore, FileHash, Manifest, SinkError, StoreError,
 };
 
 use crate::common::{
-    chunk_file, chunk_files, random_bytes, repetitive_bytes, serve, small_params, store, store_with,
+    chunk_file, chunk_files, encode_manifest, random_bytes, repetitive_bytes, serve, small_params,
+    store, store_with,
 };
 
 struct Setup {
@@ -163,7 +164,10 @@ fn hostile_chunks_are_rejected_without_a_trace() {
     type Expected = fn(&ChunkError) -> bool;
     let cases: [(&[u8], Expected); 5] = [
         (&flipped, |e| {
-            matches!(e, ChunkError::HashMismatch | ChunkError::Decompress(_))
+            matches!(
+                e,
+                ChunkError::HashMismatch | ChunkError::Decompress(_) | ChunkError::NotOneFrame
+            )
         }),
         (&other, |e| {
             matches!(
@@ -174,13 +178,8 @@ fn hostile_chunks_are_rejected_without_a_trace() {
             )
         }),
         (&oversized, |e| matches!(e, ChunkError::TooLarge { .. })),
-        (truncated, |e| matches!(e, ChunkError::Decompress(_))),
-        (b"", |e| {
-            matches!(
-                e,
-                ChunkError::LengthMismatch { .. } | ChunkError::Decompress(_)
-            )
-        }),
+        (truncated, |e| matches!(e, ChunkError::NotOneFrame)),
+        (b"", |e| matches!(e, ChunkError::NotOneFrame)),
     ];
     for (bad, expected) in cases {
         match sink.put(&first.id, bad) {
@@ -278,10 +277,12 @@ fn transfers_resume_after_a_restart() {
     serve(&setup.server, &mut sink, &rest);
     sink.finish(&setup.out).unwrap();
     assert!(fs::read(&setup.out).unwrap() == data);
+    // The finished snapshot is retained, no longer pending.
     assert_eq!(client.pending().unwrap(), []);
+    assert_eq!(client.retained().unwrap(), [manifest.id()]);
     assert!(matches!(
         ChunkSink::resume(&client, &manifest.id()),
-        Err(SinkError::Store(StoreError::NoState(_)))
+        Err(SinkError::Store(StoreError::UnknownSnapshot(_)))
     ));
 }
 
@@ -317,6 +318,159 @@ fn a_damaged_chunk_found_at_the_end_is_fetched_again() {
 }
 
 #[test]
+fn every_damaged_chunk_is_found_in_one_round() {
+    let setup = setup();
+    let data = random_bytes(14, 1_200_000);
+    let manifest = setup.publish(&data);
+    let mut sink = ChunkSink::open(&setup.client, manifest.clone()).unwrap();
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+
+    // A power failure without flushing: several chunks come back empty or
+    // garbled.
+    let chunks = manifest.chunks();
+    let victims = [chunks[1].id, chunks[3].id, chunks[chunks.len() - 1].id];
+    fs::write(chunk_file(&setup.client_root, &victims[0]), b"").unwrap();
+    for id in &victims[1..] {
+        let path = chunk_file(&setup.client_root, id);
+        let mut file = fs::read(&path).unwrap();
+        let last = file.len() - 1;
+        file[last] ^= 1;
+        fs::write(&path, &file).unwrap();
+    }
+    // The empty file already counts as missing.
+    assert_eq!(
+        sink.refresh().unwrap().chunks_total - 1,
+        sink.progress().chunks_present
+    );
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+    assert!(sink.finish(&setup.out).is_err());
+    let missing: Vec<ChunkId> = sink.missing().iter().map(|entry| entry.id).collect();
+    assert_eq!(missing, &victims[1..]);
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+    sink.finish(&setup.out).unwrap();
+    assert!(fs::read(&setup.out).unwrap() == data);
+}
+
+#[test]
+fn a_failed_publish_leaves_nothing_behind_and_can_be_retried() {
+    let setup = setup();
+    let data = random_bytes(15, 300_000);
+    let manifest = setup.publish(&data);
+    let mut sink = ChunkSink::open(&setup.client, manifest.clone()).unwrap();
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+    // Something in the way of the destination.
+    fs::create_dir(&setup.out).unwrap();
+    let error = sink.finish(&setup.out).unwrap_err();
+    assert!(
+        matches!(error, SinkError::Store(StoreError::Io { .. })),
+        "{error}"
+    );
+    assert!(setup.out.is_dir());
+    fs::remove_dir(&setup.out).unwrap();
+    sink.finish(&setup.out).unwrap();
+    assert!(fs::read(&setup.out).unwrap() == data);
+    assert_eq!(setup.client.retained().unwrap(), [manifest.id()]);
+}
+
+#[test]
+fn inconsistent_manifests_are_dropped() {
+    let setup = setup();
+    let real = setup.publish(&random_bytes(16, 300_000));
+    // The right chunks under a false file hash can never be assembled.
+    let bytes = encode_manifest(
+        [16 << 10, 64 << 10, 256 << 10],
+        real.total_size(),
+        FileHash([7; 32]),
+        real.chunks(),
+    );
+    let lying = Manifest::from_bytes(&bytes).unwrap();
+    let mut sink = ChunkSink::open(&setup.client, lying.clone()).unwrap();
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+    let error = sink.finish(&setup.out).unwrap_err();
+    assert!(
+        matches!(error, SinkError::Inconsistent(StoreError::FileHashMismatch)),
+        "{error}"
+    );
+    assert!(!setup.out.exists());
+    assert_eq!(setup.client.pending().unwrap(), []);
+    assert!(matches!(sink.finish(&setup.out), Err(SinkError::Finished)));
+    // Nothing pins its chunks any more.
+    drop(sink);
+    setup.client.gc([]).unwrap();
+    assert!(chunk_files(&setup.client_root).is_empty());
+}
+
+#[test]
+fn one_transfer_per_snapshot_at_a_time() {
+    let setup = setup();
+    let manifest = setup.publish(&random_bytes(17, 200_000));
+    let sink = ChunkSink::open(&setup.client, manifest.clone()).unwrap();
+    assert!(matches!(
+        ChunkSink::open(&setup.client, manifest.clone()),
+        Err(SinkError::AlreadyOpen(id)) if id == manifest.id()
+    ));
+    assert!(matches!(
+        ChunkSink::resume(&setup.client, &manifest.id()),
+        Err(SinkError::AlreadyOpen(_))
+    ));
+    drop(sink);
+    ChunkSink::resume(&setup.client, &manifest.id()).unwrap();
+}
+
+/// A valid zstd frame that does not compress at all: raw blocks only, as a
+/// careless or hostile peer might send.
+fn uncompressed_frame(data: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 128 << 10;
+    // Magic, then a single-segment header with a 4-byte content size.
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xa0];
+    frame.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    let blocks: Vec<&[u8]> = data.chunks(BLOCK).collect();
+    for (index, block) in blocks.iter().enumerate() {
+        let last = u32::from(index + 1 == blocks.len());
+        let header = (u32::try_from(block.len()).unwrap() << 3) | last;
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(block);
+    }
+    frame
+}
+
+#[test]
+fn received_chunks_can_be_compressed_again() {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let keeper = store(dirs[0].path());
+    let recompressor = store_with(dirs[1].path(), |config| config.recompress_received = true);
+    // Compressible, so a raw-block frame is much larger than a real one.
+    let data: Vec<u8> = (0..600_000usize)
+        .map(|i| b"transport fever "[i % 16] ^ u8::from(i / 4096 % 3 == 0))
+        .collect();
+    let manifest = Manifest::compute(&data[..], small_params()).unwrap();
+    for store in [&keeper, &recompressor] {
+        let mut sink = ChunkSink::open(store, manifest.clone()).unwrap();
+        for entry in sink.missing() {
+            let start = entry.offset as usize;
+            let raw = &data[start..start + entry.len as usize];
+            let theirs = uncompressed_frame(raw);
+            sink.put(&entry.id, &theirs).unwrap();
+            let stored = store.read_compressed(&entry.id).unwrap();
+            if store.config().recompress_received {
+                assert_eq!(stored, zstd::bulk::compress(raw, 3).unwrap());
+                assert!(stored.len() * 4 < theirs.len());
+            } else {
+                assert_eq!(stored, theirs);
+            }
+        }
+        let out = store.root().join("world.sav");
+        sink.finish(&out).unwrap();
+        assert!(fs::read(&out).unwrap() == data);
+    }
+}
+
+#[test]
 fn abandoned_transfers_are_collected() {
     let setup = setup();
     let manifest = setup.publish(&random_bytes(8, 600_000));
@@ -346,10 +500,10 @@ fn damaged_transfer_state_is_reported_and_dropped() {
 
     assert!(matches!(
         ChunkSink::resume(&setup.client, &manifest.id()),
-        Err(SinkError::Store(StoreError::DamagedState { .. }))
+        Err(SinkError::Store(StoreError::DamagedRecord { .. }))
     ));
     let stats = setup.client.gc([]).unwrap();
-    assert_eq!(stats.dropped_pending, 1);
+    assert_eq!(stats.damaged_records, 1);
     assert_eq!(setup.client.pending().unwrap(), []);
     // Starting over from the real manifest works.
     ChunkSink::open(&setup.client, manifest).unwrap();
@@ -359,7 +513,7 @@ fn damaged_transfer_state_is_reported_and_dropped() {
 fn a_full_store_refuses_chunks_until_collected() {
     let setup = setup();
     // An earlier snapshot fills most of the store.
-    setup
+    let earlier = setup
         .client
         .ingest(&random_bytes(10, 300_000)[..], small_params())
         .unwrap();
@@ -386,9 +540,10 @@ fn a_full_store_refuses_chunks_until_collected() {
     assert!(client.used_bytes() <= limit);
     assert!(sink.missing().iter().any(|entry| entry.id == id));
 
-    // Collecting with nothing else live drops the earlier snapshot and makes
-    // room; the transfer's own chunks stay.
+    // Releasing the earlier snapshot and collecting makes room; the
+    // transfer's own chunks stay.
     let kept = sink.progress().chunks_present;
+    client.release(&earlier.id()).unwrap();
     client.gc([]).unwrap();
     assert_eq!(sink.refresh().unwrap().chunks_present, kept);
     let missing = sink.missing();
