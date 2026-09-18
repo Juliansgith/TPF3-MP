@@ -31,6 +31,13 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1.0.9"
 
+# tpf3mp-canon
+# Test-only: the differential tests run TPF2MP's original Lua economy next to
+# the Rust port. TPF2MP targets Lua 5.1, where every number is a double, so the
+# vendored interpreter must be 5.1 (5.3+ would add integer semantics).
+mlua = { version = "0.12.1", features = ["lua51", "vendored"] }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
