@@ -1,7 +1,9 @@
-//! The server's rooms: creation, lookup and removal.
+//! The server's rooms: creation, recovery, lookup and removal.
 
 use std::{
     collections::HashMap,
+    fs,
+    path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -11,6 +13,7 @@ use tokio::sync::mpsc;
 use tpf3mp_proto::{
     CreateRoom, FixedBytes, Invite, MAX_ROOM_MEMBERS, RequestError, RoomId, RoomView,
 };
+use tracing::{info, warn};
 
 use crate::{
     metrics::{self, Metrics},
@@ -25,24 +28,71 @@ pub(crate) struct Directory {
     ruleset: RulesetFactory,
     tick: Duration,
     metrics: Arc<Metrics>,
+    data_dir: Option<PathBuf>,
+}
+
+pub(crate) struct DirectoryConfig {
+    pub(crate) secret: [u8; 32],
+    pub(crate) max_rooms: usize,
+    pub(crate) ruleset: RulesetFactory,
+    pub(crate) tick: Duration,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl Directory {
-    pub(crate) fn new(
-        secret: &[u8; 32],
-        max_rooms: usize,
-        ruleset: RulesetFactory,
-        tick: Duration,
-        metrics: Arc<Metrics>,
-    ) -> Self {
+    pub(crate) fn new(config: DirectoryConfig) -> Self {
         Self {
             rooms: Mutex::default(),
-            max_rooms,
-            key: hmac::Key::new(hmac::HMAC_SHA256, secret),
-            ruleset,
-            tick,
-            metrics,
+            max_rooms: config.max_rooms,
+            key: hmac::Key::new(hmac::HMAC_SHA256, &config.secret),
+            ruleset: config.ruleset,
+            tick: config.tick,
+            metrics: config.metrics,
+            data_dir: config.data_dir,
         }
+    }
+
+    /// Restores every running room logged in the data directory. A log that
+    /// cannot be recovered is renamed to `*.broken` and kept for diagnosis,
+    /// never deleted. Returns how many rooms were restored.
+    pub(crate) fn recover(self: &Arc<Self>) -> usize {
+        let Some(dir) = &self.data_dir else {
+            return 0;
+        };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        paths.sort();
+        let mut restored = 0;
+        for path in paths {
+            let recovered = Room::recover(
+                &path,
+                self.key.clone(),
+                (self.ruleset)(),
+                self.tick,
+                Arc::clone(&self.metrics),
+                self.data_dir.clone(),
+            );
+            match recovered {
+                Ok(Some(room)) => {
+                    info!(room = %room.id(), "restored a running room from its log");
+                    self.register(room);
+                    restored += 1;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "cannot restore a room; keeping its log aside");
+                    let _ = fs::rename(&path, path.with_extension("broken"));
+                }
+            }
+        }
+        restored
     }
 
     /// Creates a room with `owner` as its first member and starts its task.
@@ -67,11 +117,14 @@ impl Directory {
         let token = FixedBytes(random());
         let secrets = RoomSecrets {
             key: self.key.clone(),
-            invite_tag: hmac::sign(&self.key, &RoomSecrets::invite_input(&id, &token)),
-            password_tag: request
-                .password
+            invite_tag: hmac::sign(&self.key, &RoomSecrets::invite_input(&id, &token))
                 .as_ref()
-                .map(|password| hmac::sign(&self.key, &RoomSecrets::password_input(&id, password))),
+                .to_vec(),
+            password_tag: request.password.as_ref().map(|password| {
+                hmac::sign(&self.key, &RoomSecrets::password_input(&id, password))
+                    .as_ref()
+                    .to_vec()
+            }),
         };
         let room = Room::new(
             RoomSpec {
@@ -83,6 +136,7 @@ impl Directory {
                 ruleset: (self.ruleset)(),
                 tick: self.tick,
                 metrics: Arc::clone(&self.metrics),
+                data_dir: self.data_dir.clone(),
             },
             owner,
         );
@@ -94,6 +148,15 @@ impl Directory {
         metrics::increment(&self.metrics.rooms_created);
         tokio::spawn(room.run(receiver, Arc::clone(self)));
         Ok((handle, Invite { room: id, token }, view))
+    }
+
+    fn register(self: &Arc<Self>, room: Room) {
+        let (commands, receiver) = mpsc::channel(ROOM_QUEUE);
+        self.rooms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(room.id(), RoomHandle::new(commands));
+        tokio::spawn(room.run(receiver, Arc::clone(self)));
     }
 
     pub(crate) fn get(&self, id: &RoomId) -> Option<RoomHandle> {

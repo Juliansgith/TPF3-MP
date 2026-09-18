@@ -11,8 +11,12 @@ hardened container profile.
 - **A TLS certificate** for a hostname that points at the server, such as
   `tpf3mp.<ip>.sslip.io`. Agents verify it against public certificate
   authorities, exactly as a browser would.
-- **A data volume** for the invite key (`/data/invite.key`). Back it up:
-  losing it invalidates every invite.
+- **A data volume** holding:
+  - `/data/invite.key`: losing it invalidates every invite, including those
+    of restored games.
+  - `/data/rooms/`: one log per running game, so games survive restarts.
+
+  Back up both.
 
 ## First deployment
 
@@ -77,9 +81,26 @@ players on another version which side to update. To upgrade:
 git pull && cd deploy && docker compose up -d --build
 ```
 
-The old container gets SIGTERM and closes every session with
-`SHUTTING_DOWN`. **Rooms are held in memory until room persistence lands,
-so an upgrade ends running games.** Announce restarts to players.
+What happens during the restart:
+
+1. The old container gets SIGTERM and closes every session with
+   `SHUTTING_DOWN`.
+2. With `--data-dir` (the image's default), every running game has been
+   logged turn by turn. The new server restores those games at start.
+3. Players reconnect with the same identity and resume after the last turn
+   they applied. The event log continues without a gap. Lobbies that had not
+   started are not kept.
+
+Persistence details:
+
+- **Crash safety.** Each turn is written to the operating system as it is
+  sealed, so a process crash loses nothing. A power loss or kernel crash can
+  lose the last few turns; a client that saw them is told
+  `ResumeUnavailable`.
+- **Damaged logs.** A log the server cannot restore is renamed to `*.broken`
+  and kept for diagnosis. Nothing is deleted.
+- **Invite key.** Restored games are rejoined with their original invites,
+  which only verify with the same `invite.key`.
 
 ## Capacity
 

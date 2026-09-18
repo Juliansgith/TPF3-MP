@@ -32,6 +32,13 @@ impl Pacer {
         }
     }
 
+    /// Continues a clock that stood at `step`, for a room recovered from its
+    /// log.
+    pub(crate) fn resume_at(&mut self, step: u64) {
+        self.ideal = step;
+        self.remainder = 0;
+    }
+
     /// Steps that `duration` covers at `speed`, rounded up.
     fn steps_in(&self, duration: Duration, speed: Speed) -> u64 {
         let units = duration.as_micros() * u128::from(self.steps_per_second) * u128::from(speed.0);

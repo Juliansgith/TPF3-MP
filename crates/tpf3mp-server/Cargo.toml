@@ -11,9 +11,12 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crc32fast.workspace = true
 getrandom.workspace = true
+postcard.workspace = true
 quinn.workspace = true
 ring.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tpf3mp-net.workspace = true

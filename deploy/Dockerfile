@@ -23,4 +23,5 @@ ENTRYPOINT ["/usr/local/bin/tpf3mp-server"]
 CMD ["--listen", "0.0.0.0:29470", \
      "--cert", "/certs/fullchain.pem", "--key", "/certs/privkey.pem", \
      "--secret-file", "/data/invite.key", \
+     "--data-dir", "/data/rooms", \
      "--admin-listen", "0.0.0.0:9470"]

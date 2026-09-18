@@ -44,6 +44,12 @@ struct Args {
     #[arg(long)]
     secret_file: Option<PathBuf>,
 
+    /// Directory where running games are logged, so they survive a restart.
+    /// Restored rooms are rejoined with their old invites, which needs the
+    /// same --secret-file.
+    #[arg(long, requires = "secret_file")]
+    data_dir: Option<PathBuf>,
+
     /// TCP address of the admin endpoint (`/metrics`, `/healthz`). It has no
     /// authentication: keep it on loopback or a private network.
     #[arg(long)]
@@ -88,6 +94,7 @@ async fn main() -> Result<()> {
     let mut config = ServerConfig::new(args.listen, identity);
     config.max_sessions = args.max_sessions;
     config.max_rooms = args.max_rooms;
+    config.data_dir = args.data_dir.clone();
     match &args.secret_file {
         Some(path) => config.secret = load_or_create_secret(path)?,
         None => warn!("no --secret-file: invites will not survive a restart"),

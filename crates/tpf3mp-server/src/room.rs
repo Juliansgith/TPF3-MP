@@ -3,21 +3,25 @@
 //! [`RoomHandle`]. The turn invariants it upholds are in `docs/PROTOCOL.md`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    io,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use ring::hmac;
+use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
     time::MissedTickBehavior,
 };
 use tpf3mp_net::close;
 use tpf3mp_proto::{
-    ContentFingerprint, Event, EventBody, FixedBytes, IntentRejection, LaneDigest, MemberView,
-    Payload, Platform, PlayerId, RequestError, RoomId, RoomPhase, RoomSettings, RoomView,
-    ServerMessage, Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, encode_frame,
+    ContentFingerprint, Event, EventBody, FRAME_HEADER_LEN, FixedBytes, IntentRejection,
+    LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError, RoomId, RoomPhase,
+    RoomSettings, RoomView, ServerMessage, Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage,
+    TurnStart, decode_frame, encode_frame,
 };
 use tracing::{debug, error, info, warn};
 
@@ -25,6 +29,7 @@ use crate::{
     directory::Directory,
     metrics::{self, Metrics},
     pacing::Pacer,
+    persist::{self, RoomLog, StartMember, StartRecord},
     ruleset::Ruleset,
     verdict::{self, Report, Verdict},
 };
@@ -168,8 +173,9 @@ impl RoomHandle {
 /// Secret material that authorizes joining a room.
 pub(crate) struct RoomSecrets {
     pub(crate) key: hmac::Key,
-    pub(crate) invite_tag: hmac::Tag,
-    pub(crate) password_tag: Option<hmac::Tag>,
+    /// Kept as bytes: they are persisted, and ring verifies against slices.
+    pub(crate) invite_tag: Vec<u8>,
+    pub(crate) password_tag: Option<Vec<u8>>,
 }
 
 impl RoomSecrets {
@@ -279,7 +285,27 @@ pub(crate) struct Room {
     ruleset: Box<dyn Ruleset>,
     tick: Duration,
     metrics: Arc<Metrics>,
+    /// Where running games are logged; `None` keeps rooms in memory only.
+    data_dir: Option<PathBuf>,
+    log: Option<RoomLog>,
     closed: bool,
+}
+
+/// Why a room log could not be turned back into a room.
+#[derive(Debug, Error)]
+pub(crate) enum RecoverError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("the log has no start record")]
+    Empty,
+    #[error("the start record is unreadable: {0}")]
+    Start(postcard::Error),
+    #[error("the log's format version {0} is not supported")]
+    Version(u16),
+    #[error("turn record {0} is unreadable")]
+    Turn(usize),
+    #[error("turn record {0} breaks the log's continuity")]
+    Continuity(usize),
 }
 
 pub(crate) struct RoomSpec {
@@ -291,6 +317,7 @@ pub(crate) struct RoomSpec {
     pub(crate) ruleset: Box<dyn Ruleset>,
     pub(crate) tick: Duration,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl Room {
@@ -307,10 +334,125 @@ impl Room {
             ruleset: spec.ruleset,
             tick: spec.tick,
             metrics: spec.metrics,
+            data_dir: spec.data_dir,
+            log: None,
             closed: false,
         };
         room.members.push(Member::new(owner));
         room
+    }
+
+    /// Rebuilds a running room from its log: replays every turn through the
+    /// ruleset and seats everyone who had not left, disconnected and ready to
+    /// resume. A log whose players had all left is deleted and gives `None`.
+    pub(crate) fn recover(
+        path: &Path,
+        key: hmac::Key,
+        mut ruleset: Box<dyn Ruleset>,
+        tick: Duration,
+        metrics: Arc<Metrics>,
+        data_dir: Option<PathBuf>,
+    ) -> Result<Option<Self>, RecoverError> {
+        let (log, records) = RoomLog::open(path)?;
+        let (first, turns) = records.split_first().ok_or(RecoverError::Empty)?;
+        let start: StartRecord = postcard::from_bytes(first).map_err(RecoverError::Start)?;
+        if start.version != persist::FORMAT_VERSION {
+            return Err(RecoverError::Version(start.version));
+        }
+        let mut game = Game::new(start.settings);
+        let mut departed = BTreeSet::new();
+        for (index, frame) in turns.iter().enumerate() {
+            let turn = match frame
+                .get(FRAME_HEADER_LEN..)
+                .map(decode_frame::<TurnMessage>)
+            {
+                Some(Ok(TurnMessage::Turn(turn))) => turn,
+                _ => return Err(RecoverError::Turn(index)),
+            };
+            if turn.number != game.next_turn || turn.sealed_through < game.sealed_through {
+                return Err(RecoverError::Continuity(index));
+            }
+            let first_event = turn
+                .events
+                .first()
+                .map_or(game.next_event, |event| event.seq);
+            for event in &turn.events {
+                if event.seq != game.next_event {
+                    return Err(RecoverError::Continuity(index));
+                }
+                game.next_event += 1;
+                ruleset.apply(event);
+                match &event.body {
+                    EventBody::PlayerLeft { player } => {
+                        departed.insert(*player);
+                    }
+                    EventBody::PlayerJoined { player, .. } => {
+                        departed.remove(player);
+                    }
+                    EventBody::Command { .. } => {}
+                }
+            }
+            game.log.push(LoggedTurn {
+                first_event,
+                frame: Arc::from(frame.as_slice()),
+            });
+            game.next_turn += 1;
+            game.sealed_through = turn.sealed_through;
+            game.speed = turn.speed;
+            game.announced_speed = turn.speed;
+        }
+        game.pacer.resume_at(game.sealed_through);
+        let members: Vec<Member> = start
+            .members
+            .into_iter()
+            .filter(|member| !departed.contains(&member.player))
+            .map(|member| Member {
+                player: member.player,
+                name: member.name,
+                platform: member.platform,
+                ready: true,
+                content: member.content,
+                link: None,
+                streaming: false,
+                pace: Pace::CatchingUp(None),
+                intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
+            })
+            .collect();
+        if members.is_empty() {
+            log.delete()?;
+            return Ok(None);
+        }
+        // The live room hands ownership to the earliest remaining member at
+        // each departure, which leaves the same owner as this.
+        let owner = if members.iter().any(|member| member.player == start.owner) {
+            start.owner
+        } else {
+            members[0].player
+        };
+        Ok(Some(Self {
+            id: start.id,
+            name: start.name,
+            owner,
+            max_players: start.max_players,
+            settings: start.settings,
+            secrets: RoomSecrets {
+                key,
+                invite_tag: start.invite_tag,
+                password_tag: start.password_tag,
+            },
+            members,
+            phase: Phase::Running(game),
+            ruleset,
+            tick,
+            metrics,
+            data_dir,
+            log: Some(log),
+            closed: false,
+        }))
+    }
+
+    pub(crate) fn id(&self) -> RoomId {
+        self.id
     }
 
     pub(crate) fn view(&self) -> RoomView {
@@ -541,6 +683,12 @@ impl Room {
     /// Hands ownership on and closes the room when nobody is left.
     fn after_departure(&mut self, player: PlayerId) {
         if self.members.is_empty() {
+            // Everyone left: the game is over, and so is its log.
+            if let Some(log) = self.log.take()
+                && let Err(error) = log.delete()
+            {
+                warn!(room = %self.id, %error, "cannot delete the log of a closed room");
+            }
             self.closed = true;
             return;
         }
@@ -596,9 +744,44 @@ impl Room {
             }
         }
         self.phase = Phase::Running(game);
+        self.open_log();
         info!(room = %self.id, players = self.members.len(), "game started");
         metrics::increment(&self.metrics.games_started);
         Ok(())
+    }
+
+    /// Starts the log of a game that has just started. A game whose log
+    /// cannot be written keeps running, in memory only.
+    fn open_log(&mut self) {
+        let Some(dir) = &self.data_dir else {
+            return;
+        };
+        let start = StartRecord {
+            version: persist::FORMAT_VERSION,
+            id: self.id,
+            name: self.name.clone(),
+            owner: self.owner,
+            max_players: self.max_players,
+            settings: self.settings,
+            invite_tag: self.secrets.invite_tag.clone(),
+            password_tag: self.secrets.password_tag.clone(),
+            members: self
+                .members
+                .iter()
+                .map(|member| StartMember {
+                    player: member.player,
+                    name: member.name.clone(),
+                    platform: member.platform,
+                    content: member.content,
+                })
+                .collect(),
+        };
+        match RoomLog::create(dir, &start) {
+            Ok(log) => self.log = Some(log),
+            Err(error) => {
+                error!(room = %self.id, %error, "cannot create the room log; the game will not survive a restart");
+            }
+        }
     }
 
     fn set_speed(&mut self, player: PlayerId, speed: Speed) -> Result<(), RequestError> {
@@ -816,6 +999,12 @@ impl Room {
                 return;
             }
         };
+        if let Some(log) = &mut self.log
+            && let Err(error) = frames.iter().try_for_each(|frame| log.append(frame))
+        {
+            error!(room = %self.id, %error, "cannot append to the room log; it stops here");
+            self.log = None;
+        }
         for frame in frames {
             for index in 0..self.members.len() {
                 if self.members[index].streaming {

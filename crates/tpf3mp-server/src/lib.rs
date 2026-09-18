@@ -6,11 +6,12 @@ mod connection;
 mod directory;
 mod metrics;
 mod pacing;
+mod persist;
 mod room;
 mod ruleset;
 mod verdict;
 
-use std::{fmt, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -22,7 +23,7 @@ pub use crate::{
     ruleset::{AcceptAll, Ruleset, RulesetFactory},
 };
 use crate::{
-    directory::Directory,
+    directory::{Directory, DirectoryConfig},
     metrics::{Gauges, Metrics},
 };
 
@@ -43,6 +44,10 @@ pub struct ServerConfig {
     pub ruleset: RulesetFactory,
     /// Interval at which running rooms seal turns.
     pub tick: Duration,
+    /// Where running games are logged and restored from at start. `None`
+    /// keeps rooms in memory only. Restored rooms can only be rejoined with
+    /// the same `secret`.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -59,6 +64,7 @@ impl ServerConfig {
             secret,
             ruleset: Arc::new(|| Box::new(AcceptAll)),
             tick: Duration::from_millis(100),
+            data_dir: None,
         }
     }
 }
@@ -72,6 +78,7 @@ impl fmt::Debug for ServerConfig {
             .field("handshake_timeout", &self.handshake_timeout)
             .field("max_rooms", &self.max_rooms)
             .field("tick", &self.tick)
+            .field("data_dir", &self.data_dir)
             .finish_non_exhaustive()
     }
 }
@@ -104,17 +111,23 @@ impl Server {
         let quic = tpf3mp_net::server_config(config.identity)?;
         let endpoint = quinn::Endpoint::server(quic, config.listen)?;
         let metrics = Arc::new(Metrics::default());
+        let directory = Arc::new(Directory::new(DirectoryConfig {
+            secret: config.secret,
+            max_rooms: config.max_rooms,
+            ruleset: config.ruleset,
+            tick: config.tick,
+            metrics: Arc::clone(&metrics),
+            data_dir: config.data_dir,
+        }));
+        let restored = directory.recover();
+        if restored > 0 {
+            tracing::info!(rooms = restored, "restored running rooms");
+        }
         let shared = Arc::new(Shared {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             max_sessions: config.max_sessions,
             handshake_timeout: config.handshake_timeout,
-            directory: Arc::new(Directory::new(
-                &config.secret,
-                config.max_rooms,
-                config.ruleset,
-                config.tick,
-                Arc::clone(&metrics),
-            )),
+            directory,
             server_version: Text::new(env!("CARGO_PKG_VERSION"))
                 .expect("the crate version is short printable text"),
             metrics,
