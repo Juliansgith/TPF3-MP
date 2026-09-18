@@ -262,7 +262,17 @@ async fn one_member_cannot_flood_the_others_off_the_lobby() {
         events: mut ann_events,
         ..
     } = ann;
-    let ann_drain = tokio::spawn(async move { while ann_events.recv().await.is_some() {} });
+    let seen_by_ann = Arc::new(std::sync::Mutex::new(0));
+    let ann_drain = tokio::spawn({
+        let seen_by_ann = Arc::clone(&seen_by_ann);
+        async move {
+            while let Some(event) = ann_events.recv().await {
+                if let tpf3mp_agent::ClientEvent::RoomUpdate(room) = event {
+                    *seen_by_ann.lock().unwrap() = room.members.len();
+                }
+            }
+        }
+    });
 
     let mallory = new_identity();
     let (_endpoint, _connection, mut send, mut recv) = raw_session(&server, &mallory).await;
@@ -297,6 +307,9 @@ async fn one_member_cannot_flood_the_others_off_the_lobby() {
         .await
         .ok()
         .map(|reason| common::application_close_code(&reason));
+    // Had Bob's seat been freed, the room would have told Ann (two members).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let members_left = *seen_by_ann.lock().unwrap();
     ann_drain.abort();
     drop(ann_client);
     server.shut_down().await;
@@ -304,7 +317,8 @@ async fn one_member_cannot_flood_the_others_off_the_lobby() {
         bob_closed.is_none(),
         "Mallory's {answered} no-op ready requests ({sent} bytes) made the server send \
          {answered} room views to every member; Bob was disconnected with close code \
-         {bob_closed:?} (SLOW_CONSUMER is 6)"
+         {bob_closed:?} (SLOW_CONSUMER is 6), and Ann's lobby still lists {members_left} \
+         members"
     );
 }
 
