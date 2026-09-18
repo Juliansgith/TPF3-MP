@@ -8,22 +8,6 @@ use tpf3mp_proto::Speed;
 /// One step, in units of microseconds times speed percent.
 const UNITS_PER_STEP: u128 = 1_000_000 * 100;
 
-/// The longest input delay the room adapts to. A member slower than this
-/// waits for its turns rather than delaying everyone further.
-pub(crate) const MAX_INPUT_DELAY: Duration = Duration::from_millis(1500);
-
-/// The input delay a room needs: the room's setting, or enough to hide the
-/// worst round trip among its pacing members, whichever is larger.
-///
-/// A turn reaches a member one way (about half the round trip) after it is
-/// sealed, and must arrive before that member's game reaches it. Three
-/// quarters of the round trip leaves half a one-way trip for jitter, and one
-/// tick covers turns waiting to be sealed.
-pub(crate) fn input_delay(setting: Duration, worst_rtt: Duration, tick: Duration) -> Duration {
-    let needed = worst_rtt * 3 / 4 + tick;
-    setting.max(needed).min(MAX_INPUT_DELAY.max(setting))
-}
-
 /// Advances a room's ideal step count in real time and turns it into the
 /// frontier the sequencer may seal.
 #[derive(Debug, Clone)]
@@ -46,13 +30,6 @@ impl Pacer {
             ideal: 0,
             remainder: 0,
         }
-    }
-
-    /// Changes how far the frontier runs ahead of the ideal clock. A shorter
-    /// delay never pulls the frontier back; it only stops it until the clock
-    /// catches up.
-    pub(crate) fn set_input_delay(&mut self, input_delay: Duration) {
-        self.input_delay = input_delay;
     }
 
     /// Continues a clock that stood at `step`, for a room recovered from its
@@ -201,43 +178,6 @@ mod tests {
         );
         // No debt accumulated while held.
         assert_eq!(pacer.advance(TICK, Speed::NORMAL, Some(0), 0), 2);
-    }
-
-    #[test]
-    fn input_delay_covers_the_worst_round_trip_within_bounds() {
-        let setting = Duration::from_millis(250);
-        let tick = Duration::from_millis(100);
-        // Nearby players: the room's setting stands.
-        assert_eq!(
-            input_delay(setting, Duration::from_millis(40), tick),
-            setting
-        );
-        // A player 400 ms away: 3/4 of the round trip plus a tick.
-        assert_eq!(
-            input_delay(setting, Duration::from_millis(400), tick),
-            Duration::from_millis(400)
-        );
-        // Beyond the cap, that player waits instead of everyone.
-        assert_eq!(
-            input_delay(setting, Duration::from_secs(5), tick),
-            MAX_INPUT_DELAY
-        );
-        // A room that asked for more than the cap keeps its setting.
-        let patient = Duration::from_secs(2);
-        assert_eq!(input_delay(patient, Duration::from_secs(5), tick), patient);
-    }
-
-    #[test]
-    fn a_longer_input_delay_moves_the_frontier_but_a_shorter_one_never_retracts_it() {
-        let mut pacer = pacer();
-        let sealed = pacer.advance(Duration::from_secs(1), Speed::NORMAL, Some(0), 0);
-        assert_eq!(sealed, 5 + 2);
-        pacer.set_input_delay(Duration::from_millis(1000));
-        let longer = pacer.advance(Duration::ZERO, Speed::NORMAL, Some(sealed), sealed);
-        assert_eq!(longer, 5 + 5, "one second of lead at 5 steps per second");
-        pacer.set_input_delay(Duration::from_millis(250));
-        let shorter = pacer.advance(Duration::ZERO, Speed::NORMAL, Some(longer), longer);
-        assert_eq!(shorter, longer);
     }
 
     #[test]

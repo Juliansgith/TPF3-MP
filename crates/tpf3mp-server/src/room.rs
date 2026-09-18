@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     directory::Directory,
     metrics::{self, Metrics},
-    pacing::{self, Pacer},
+    pacing::Pacer,
     persist::{self, RoomLog, StartMember, StartRecord},
     ruleset::Ruleset,
     verdict::{self, Report, Verdict},
@@ -1045,20 +1045,6 @@ impl Room {
         };
         let elapsed = now.saturating_duration_since(game.last_tick);
         game.last_tick = now;
-        // Hide the worst round trip among the members who pace the room.
-        let worst_rtt = self
-            .members
-            .iter()
-            .filter(|m| m.streaming && !matches!(m.pace, Pace::CatchingUp(_)))
-            .filter_map(|m| m.link.as_ref())
-            .map(|link| link.connection.rtt())
-            .max()
-            .unwrap_or_default();
-        game.pacer.set_input_delay(pacing::input_delay(
-            Duration::from_millis(u64::from(self.settings.input_delay_ms)),
-            worst_rtt,
-            self.tick,
-        ));
         let slowest = slowest_pacer(&self.members);
         let frontier = game
             .pacer
