@@ -17,6 +17,7 @@ tpf3mp-agent = { path = "crates/tpf3mp-agent" }
 tpf3mp-server = { path = "crates/tpf3mp-server" }
 tpf3mp-hookcore = { path = "crates/tpf3mp-hookcore" }
 tpf3mp-ipc = { path = "crates/tpf3mp-ipc" }
+tpf3mp-snapshot = { path = "crates/tpf3mp-snapshot" }
 
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -57,6 +58,15 @@ sha2 = "0.11.0"
 toml = "1.1.6"
 windows-sys = "0.61.2"
 
+# tpf3mp-snapshot
+blake3 = "1.8.7"
+fastcdc = "5.0.0"
+tempfile = "3.27.0"
+# Without default features zstd leaves out the dictionary builder and the
+# decoders for pre-1.0 frame formats. Chunks arrive from untrusted peers, and
+# the legacy decoders would only widen what they can reach.
+zstd = { version = "0.14.0", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
@@ -70,3 +80,8 @@ unwrap_used = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Unoptimized zstd runs at a tenth of its speed, which slows every debug build
+# and test that touches snapshots.
+[profile.dev.package.zstd-sys]
+opt-level = 3
