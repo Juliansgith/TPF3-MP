@@ -1,120 +1,49 @@
-//! End-to-end handshake tests: a real server and real clients over loopback QUIC.
+//! Handshake and identity: version checks, identity proofs, limits and
+//! hostile clients.
 
-// `allow-unwrap-in-tests` covers `#[test]` functions only, not the helpers here.
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::{
-    net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use tokio::{sync::oneshot, task::JoinHandle};
-use tpf3mp_agent::{ConnectError, ConnectOptions, Session, connect};
+use common::{RunningServer, application_close_code, new_identity};
+use tpf3mp_agent::{ConnectError, connect};
 use tpf3mp_net::{
-    ServerIdentity, ServerTrust, client_config, close, read_preamble, write_message, write_preamble,
+    Identity, ServerIdentity, ServerTrust, close, read_message, read_preamble, write_message,
+    write_preamble,
 };
 use tpf3mp_proto::{
-    CONTROL_MAX_FRAME, Message, PROTOCOL_VERSION, RejectReason, SessionId, Text, Welcome,
+    CONTROL_MAX_FRAME, ClientMessage, Hello, PROTOCOL_VERSION, Platform, RejectReason, Request,
+    ServerMessage, Text,
 };
-use tpf3mp_server::{Server, ServerConfig};
 
-struct RunningServer {
-    address: SocketAddr,
-    trust: ServerTrust,
-    stop: Option<oneshot::Sender<()>>,
-    task: JoinHandle<()>,
-}
-
-impl RunningServer {
-    async fn start(configure: impl FnOnce(&mut ServerConfig)) -> Self {
-        let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
-        let trust = ServerTrust::Pinned(identity.leaf().clone());
-        let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
-        configure(&mut config);
-        let server = Server::bind(config).unwrap();
-        let address = server.local_addr().unwrap();
-        let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(server.run(async {
-            let _ = stopped.await;
-        }));
-        Self {
-            address,
-            trust,
-            stop: Some(stop),
-            task,
-        }
-    }
-
-    fn options(&self) -> ConnectOptions {
-        ConnectOptions::new(self.address, "localhost", self.trust.clone())
-    }
-
-    async fn shut_down(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        tokio::time::timeout(Duration::from_secs(10), &mut self.task)
-            .await
-            .expect("the server drains within 10 s")
-            .unwrap();
-    }
-
-    /// A bare QUIC connection that speaks whatever the test sends.
-    async fn raw_connection(&self) -> (quinn::Endpoint, quinn::Connection) {
-        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        endpoint.set_default_client_config(client_config(self.trust.clone()).unwrap());
-        let connection = endpoint
-            .connect(self.address, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        (endpoint, connection)
-    }
-}
-
-fn application_close_code(error: &quinn::ConnectionError) -> Option<quinn::VarInt> {
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => Some(close.error_code),
-        _ => None,
-    }
-}
-
-async fn closed_within(connection: &quinn::Connection, limit: Duration) -> quinn::ConnectionError {
-    tokio::time::timeout(limit, connection.closed())
+async fn closed_within(connection: &quinn::Connection) -> quinn::ConnectionError {
+    tokio::time::timeout(common::WAIT, connection.closed())
         .await
         .expect("the server closes the connection")
 }
 
-/// Connects, retrying while the server still counts a session that is
-/// closing: slots are freed asynchronously when the close arrives.
-async fn connect_when_a_slot_frees(server: &RunningServer) -> Session {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match connect(server.options()).await {
-            Ok(session) => return session,
-            Err(ConnectError::Rejected(RejectReason::ServerFull)) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(error) => panic!("connect failed: {error}"),
-        }
-    }
-}
-
 #[tokio::test]
-async fn handshake_opens_a_session() {
+async fn handshake_opens_a_session_for_a_proven_identity() {
     let server = RunningServer::start(|_| {}).await;
-    let session = connect(server.options()).await.unwrap();
+    let identity = new_identity();
+    let (client, _events) = connect(server.options(Arc::clone(&identity), "ann"))
+        .await
+        .unwrap();
+    assert_eq!(client.player(), identity.player());
     assert_eq!(
-        session.welcome().server_version.as_str(),
+        client.welcome().server_version.as_str(),
         env!("CARGO_PKG_VERSION")
     );
-    let other = connect(server.options()).await.unwrap();
-    assert_ne!(
-        session.welcome().session_id,
-        other.welcome().session_id,
-        "every session gets its own ID"
-    );
-    session.close().await;
+    let (other, _other_events) = connect(server.options(new_identity(), "bob"))
+        .await
+        .unwrap();
+    assert_ne!(client.welcome().session_id, other.welcome().session_id);
+    client.close().await;
     other.close().await;
     server.shut_down().await;
 }
@@ -122,7 +51,7 @@ async fn handshake_opens_a_session() {
 #[tokio::test]
 async fn version_mismatch_is_reported_with_both_versions() {
     let server = RunningServer::start(|_| {}).await;
-    let mut options = server.options();
+    let mut options = server.options(new_identity(), "ann");
     options.protocol_version = PROTOCOL_VERSION + 1;
     let error = connect(options).await.unwrap_err();
     assert!(
@@ -137,18 +66,102 @@ async fn version_mismatch_is_reported_with_both_versions() {
     server.shut_down().await;
 }
 
+/// Sends a hand-made Hello on a raw connection and returns the answer.
+async fn raw_hello(
+    server: &RunningServer,
+    make: impl FnOnce(&quinn::Connection) -> Hello,
+) -> (ServerMessage, quinn::Connection) {
+    let (_endpoint, connection) = server.raw_connection().await;
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
+    assert_eq!(read_preamble(&mut recv).await.unwrap(), PROTOCOL_VERSION);
+    let hello = ClientMessage::Hello(make(&connection));
+    write_message(&mut send, &hello, CONTROL_MAX_FRAME)
+        .await
+        .unwrap();
+    let answer = read_message::<ServerMessage>(&mut recv, CONTROL_MAX_FRAME)
+        .await
+        .unwrap();
+    (answer, connection)
+}
+
+fn hello(identity: &Identity, proof_by: &Identity, connection: &quinn::Connection) -> Hello {
+    Hello {
+        client_version: Text::new("test").unwrap(),
+        platform: Platform::current(),
+        name: Text::new("mallory").unwrap(),
+        identity: identity.player(),
+        proof: proof_by.prove(connection).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn a_proof_by_another_key_is_rejected() {
+    let server = RunningServer::start(|_| {}).await;
+    let victim = new_identity();
+    let attacker = new_identity();
+    let (answer, connection) =
+        raw_hello(&server, |connection| hello(&victim, &attacker, connection)).await;
+    assert!(
+        matches!(&answer, ServerMessage::Reject(reject) if reject.reason == RejectReason::BadProof),
+        "{answer:?}"
+    );
+    let reason = closed_within(&connection).await;
+    assert_eq!(application_close_code(&reason), Some(close::REJECTED));
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn a_proof_does_not_replay_on_another_connection() {
+    let server = RunningServer::start(|_| {}).await;
+    let victim = new_identity();
+    // A genuine proof, captured from the victim's first connection...
+    let (_first_endpoint, first) = server.raw_connection().await;
+    let captured = victim.prove(&first).unwrap();
+    // ...is worthless on any other connection: it signs that TLS session.
+    let (answer, _connection) = raw_hello(&server, |_| Hello {
+        client_version: Text::new("test").unwrap(),
+        platform: Platform::current(),
+        name: Text::new("mallory").unwrap(),
+        identity: victim.player(),
+        proof: captured,
+    })
+    .await;
+    assert!(
+        matches!(&answer, ServerMessage::Reject(reject) if reject.reason == RejectReason::BadProof),
+        "{answer:?}"
+    );
+    server.shut_down().await;
+}
+
 #[tokio::test]
 async fn full_server_rejects_with_a_reason_and_recovers() {
     let server = RunningServer::start(|config| config.max_sessions = 1).await;
-    let first = connect(server.options()).await.unwrap();
-    let error = connect(server.options()).await.unwrap_err();
+    let (first, _events) = connect(server.options(new_identity(), "ann"))
+        .await
+        .unwrap();
+    let error = connect(server.options(new_identity(), "bob"))
+        .await
+        .unwrap_err();
     assert!(
         matches!(error, ConnectError::Rejected(RejectReason::ServerFull)),
         "{error}"
     );
     first.close().await;
-    let second = connect_when_a_slot_frees(&server).await;
-    second.close().await;
+    // The slot frees once the server has processed the close.
+    let deadline = Instant::now() + common::WAIT;
+    loop {
+        match connect(server.options(new_identity(), "bob")).await {
+            Ok((second, _events)) => {
+                second.close().await;
+                break;
+            }
+            Err(ConnectError::Rejected(RejectReason::ServerFull)) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("connect failed: {error}"),
+        }
+    }
     server.shut_down().await;
 }
 
@@ -156,7 +169,7 @@ async fn full_server_rejects_with_a_reason_and_recovers() {
 async fn untrusted_certificate_is_refused() {
     let server = RunningServer::start(|_| {}).await;
     let impostor = ServerIdentity::self_signed(&["localhost"]).unwrap();
-    let mut options = server.options();
+    let mut options = server.options(new_identity(), "ann");
     options.trust = ServerTrust::Pinned(impostor.leaf().clone());
     let error = connect(options).await.unwrap_err();
     assert!(matches!(error, ConnectError::Connection(_)), "{error}");
@@ -169,10 +182,10 @@ async fn oversized_frame_is_a_protocol_violation() {
     let (_endpoint, connection) = server.raw_connection().await;
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
     write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
-    assert_eq!(read_preamble(&mut recv).await.unwrap(), PROTOCOL_VERSION);
+    read_preamble(&mut recv).await.unwrap();
     let too_large = u32::try_from(CONTROL_MAX_FRAME + 1).unwrap();
     send.write_all(&too_large.to_le_bytes()).await.unwrap();
-    let reason = closed_within(&connection, Duration::from_secs(5)).await;
+    let reason = closed_within(&connection).await;
     assert_eq!(
         application_close_code(&reason),
         Some(close::PROTOCOL_VIOLATION)
@@ -186,7 +199,7 @@ async fn foreign_protocol_is_a_protocol_violation() {
     let (_endpoint, connection) = server.raw_connection().await;
     let (mut send, _recv) = connection.open_bi().await.unwrap();
     send.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-    let reason = closed_within(&connection, Duration::from_secs(5)).await;
+    let reason = closed_within(&connection).await;
     assert_eq!(
         application_close_code(&reason),
         Some(close::PROTOCOL_VIOLATION)
@@ -201,14 +214,14 @@ async fn first_message_must_be_hello() {
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
     write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
     read_preamble(&mut recv).await.unwrap();
-    let not_hello = Message::Welcome(Welcome {
-        server_version: Text::new("0.0.0").unwrap(),
-        session_id: SessionId([0; 16]),
-    });
+    let not_hello = ClientMessage::Request {
+        id: 1,
+        request: Request::LeaveRoom,
+    };
     write_message(&mut send, &not_hello, CONTROL_MAX_FRAME)
         .await
         .unwrap();
-    let reason = closed_within(&connection, Duration::from_secs(5)).await;
+    let reason = closed_within(&connection).await;
     assert_eq!(
         application_close_code(&reason),
         Some(close::PROTOCOL_VIOLATION)
@@ -223,7 +236,7 @@ async fn silent_client_is_dropped_after_the_handshake_timeout() {
     })
     .await;
     let (_endpoint, connection) = server.raw_connection().await;
-    let reason = closed_within(&connection, Duration::from_secs(5)).await;
+    let reason = closed_within(&connection).await;
     assert_eq!(
         application_close_code(&reason),
         Some(close::HANDSHAKE_TIMEOUT)
@@ -234,10 +247,8 @@ async fn silent_client_is_dropped_after_the_handshake_timeout() {
 #[tokio::test]
 async fn shutdown_closes_open_sessions() {
     let server = RunningServer::start(|_| {}).await;
-    let session = connect(server.options()).await.unwrap();
+    let mut ann = server.client("ann").await;
     server.shut_down().await;
-    let reason = tokio::time::timeout(Duration::from_secs(5), session.closed())
-        .await
-        .expect("the session learns about the shutdown");
+    let reason = ann.closed().await;
     assert_eq!(application_close_code(&reason), Some(close::SHUTTING_DOWN));
 }

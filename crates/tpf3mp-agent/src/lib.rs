@@ -1,41 +1,70 @@
-//! The TPF3-MP client daemon that runs next to the game.
-//!
-//! Milestone M0 implements connecting to a server and completing the
-//! handshake. The session, turn buffer, snapshot cache and the shared-memory
-//! link to the in-game hook follow in M1 (see `docs/ARCHITECTURE.md`).
+//! The TPF3-MP client: connects to a server, proves the player's identity,
+//! and exposes rooms and the turn stream to the game side. The shared-memory
+//! link to the in-game hook builds on this (see `docs/ARCHITECTURE.md`).
+
+mod follower;
 
 use std::{
+    collections::HashMap,
     fmt, io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 use tpf3mp_net::{
-    NetError, ServerTrust, TlsError, client_config, close, read_message, read_preamble,
-    write_message, write_preamble,
+    Identity, IdentityError, NetError, ServerTrust, TlsError, client_config, close, read_message,
+    read_preamble, write_message, write_preamble,
 };
 use tpf3mp_proto::{
-    CONTROL_MAX_FRAME, Hello, Message, PROTOCOL_VERSION, Platform, RejectReason, Text, Welcome,
+    CONTROL_MAX_FRAME, ClientMessage, ContentFingerprint, CreateRoom, GameMessage, Hello,
+    IntentRejection, Invite, JoinRoom, LaneDigest, PROTOCOL_VERSION, Payload, Platform, PlayerId,
+    RejectReason, Request, RequestError, Response, RoomView, ServerMessage, Speed, TURN_MAX_FRAME,
+    Text, Turn, TurnMessage, TurnStart, Welcome,
 };
+
+pub use follower::{Action, FollowError, TurnFollower};
+
+/// How long a request may wait for its response.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Messages queued for the server before senders wait.
+const OUTGOING_QUEUE: usize = 256;
+/// Events queued for the application before the client stops reading. The
+/// server then sees a slow consumer and disconnects rather than buffer.
+const EVENT_QUEUE: usize = 4096;
 
 pub struct ConnectOptions {
     pub server: SocketAddr,
     /// The name the server's certificate must be valid for.
     pub server_name: String,
     pub trust: ServerTrust,
+    pub identity: Arc<Identity>,
+    pub name: Text<32>,
     pub client_version: Text<64>,
     /// The protocol version announced in the preamble. Only tests change it.
     pub protocol_version: u32,
 }
 
 impl ConnectOptions {
-    pub fn new(server: SocketAddr, server_name: impl Into<String>, trust: ServerTrust) -> Self {
+    pub fn new(
+        server: SocketAddr,
+        server_name: impl Into<String>,
+        trust: ServerTrust,
+        identity: Arc<Identity>,
+        name: Text<32>,
+    ) -> Self {
         Self {
             server,
             server_name: server_name.into(),
             trust,
+            identity,
+            name,
             client_version: Text::new(env!("CARGO_PKG_VERSION"))
                 .expect("the crate version is short printable text"),
             protocol_version: PROTOCOL_VERSION,
@@ -47,6 +76,8 @@ impl ConnectOptions {
 pub enum ConnectError {
     #[error(transparent)]
     Tls(#[from] TlsError),
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
     #[error("cannot open a UDP socket: {0}")]
     Socket(#[from] io::Error),
     #[error("cannot start the connection: {0}")]
@@ -72,45 +103,65 @@ fn version_mismatch(client: &u32, server: &u32) -> String {
     format!("this client speaks protocol {client} but the server speaks {server}: {advice}")
 }
 
-/// An open session with a server.
-pub struct Session {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ClientError {
+    #[error("the server refused: {0}")]
+    Refused(RequestError),
+    #[error("the connection to the server is gone")]
+    Disconnected,
+    #[error("the server did not answer in time")]
+    Timeout,
+    #[error("the server answered with an unexpected response")]
+    UnexpectedResponse,
+}
+
+/// Something the server told this client.
+#[derive(Debug)]
+pub enum ClientEvent {
+    RoomUpdate(RoomView),
+    IntentRejected {
+        client_seq: u64,
+        reason: IntentRejection,
+    },
+    Diverged {
+        step: u64,
+        lanes: Vec<u16>,
+    },
+    /// A turn stream began; turns that follow continue from it.
+    TurnStream(TurnStart),
+    Turn(Turn),
+    /// The connection ended.
+    Closed(quinn::ConnectionError),
+}
+
+type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<Response, RequestError>>>>>;
+
+/// An open, authenticated session with a server.
+pub struct Client {
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     welcome: Welcome,
-    _control: (SendStream, RecvStream),
+    player: PlayerId,
+    outgoing: mpsc::Sender<ClientMessage>,
+    pending: Pending,
+    reader_done: Arc<AtomicBool>,
+    next_request: AtomicU32,
 }
 
-impl Session {
-    pub fn welcome(&self) -> &Welcome {
-        &self.welcome
-    }
-
-    pub fn rtt(&self) -> Duration {
-        self.connection.rtt()
-    }
-
-    /// Completes when the connection ends, with the reason.
-    pub async fn closed(&self) -> quinn::ConnectionError {
-        self.connection.closed().await
-    }
-
-    /// Ends the session and waits until the server has been told.
-    pub async fn close(self) {
-        self.connection.close(close::NORMAL, b"client leaving");
-        self.endpoint.wait_idle().await;
-    }
-}
-
-impl fmt::Debug for Session {
+impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Session")
+        f.debug_struct("Client")
+            .field("player", &self.player)
             .field("session_id", &self.welcome.session_id)
             .finish_non_exhaustive()
     }
 }
 
-/// Connects to a server and completes the handshake.
-pub async fn connect(options: ConnectOptions) -> Result<Session, ConnectError> {
+/// Connects to a server and completes the handshake. Server messages arrive
+/// on the returned receiver.
+pub async fn connect(
+    options: ConnectOptions,
+) -> Result<(Client, mpsc::Receiver<ClientEvent>), ConnectError> {
     let local: SocketAddr = if options.server.is_ipv6() {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
@@ -121,13 +172,8 @@ pub async fn connect(options: ConnectOptions) -> Result<Session, ConnectError> {
     let connection = endpoint
         .connect(options.server, &options.server_name)?
         .await?;
-    match handshake(&connection, &options).await {
-        Ok((welcome, control)) => Ok(Session {
-            endpoint,
-            connection,
-            welcome,
-            _control: control,
-        }),
+    let (welcome, send, recv) = match handshake(&connection, &options).await {
+        Ok(opened) => opened,
         Err(error) => {
             let code = match &error {
                 ConnectError::VersionMismatch { .. } => close::VERSION_MISMATCH,
@@ -136,15 +182,50 @@ pub async fn connect(options: ConnectOptions) -> Result<Session, ConnectError> {
             };
             connection.close(code, b"");
             endpoint.wait_idle().await;
-            Err(error)
+            return Err(error);
         }
-    }
+    };
+
+    let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_QUEUE);
+    let (events, events_rx) = mpsc::channel(EVENT_QUEUE);
+    let pending = Pending::default();
+    let reader_done = Arc::new(AtomicBool::new(false));
+    tokio::spawn(write_control(send, outgoing_rx));
+    tokio::spawn(read_control(
+        recv,
+        connection.clone(),
+        Arc::clone(&pending),
+        Arc::clone(&reader_done),
+        events.clone(),
+    ));
+    tokio::spawn(read_turns(connection.clone(), events.clone()));
+    tokio::spawn({
+        let connection = connection.clone();
+        async move {
+            let reason = connection.closed().await;
+            let _ = events.send(ClientEvent::Closed(reason)).await;
+        }
+    });
+
+    Ok((
+        Client {
+            endpoint,
+            connection,
+            welcome,
+            player: options.identity.player(),
+            outgoing,
+            pending,
+            reader_done,
+            next_request: AtomicU32::new(1),
+        },
+        events_rx,
+    ))
 }
 
 async fn handshake(
     connection: &quinn::Connection,
     options: &ConnectOptions,
-) -> Result<(Welcome, (SendStream, RecvStream)), ConnectError> {
+) -> Result<(Welcome, SendStream, RecvStream), ConnectError> {
     let failed = |error| stream_failure(connection, error);
     let (mut send, mut recv) = connection.open_bi().await?;
     write_preamble(&mut send, options.protocol_version)
@@ -157,20 +238,23 @@ async fn handshake(
             server: server_protocol,
         });
     }
-    let hello = Message::Hello(Hello {
+    let hello = ClientMessage::Hello(Hello {
         client_version: options.client_version.clone(),
         platform: Platform::current(),
+        name: options.name.clone(),
+        identity: options.identity.player(),
+        proof: options.identity.prove(connection)?,
     });
     write_message(&mut send, &hello, CONTROL_MAX_FRAME)
         .await
         .map_err(failed)?;
-    match read_message(&mut recv, CONTROL_MAX_FRAME)
+    match read_message::<ServerMessage>(&mut recv, CONTROL_MAX_FRAME)
         .await
         .map_err(failed)?
     {
-        Message::Welcome(welcome) => Ok((welcome, (send, recv))),
-        Message::Reject(reject) => Err(ConnectError::Rejected(reject.reason)),
-        Message::Hello(_) => Err(ConnectError::UnexpectedMessage),
+        ServerMessage::Welcome(welcome) => Ok((welcome, send, recv)),
+        ServerMessage::Reject(reject) => Err(ConnectError::Rejected(reject.reason)),
+        _ => Err(ConnectError::UnexpectedMessage),
     }
 }
 
@@ -180,5 +264,254 @@ fn stream_failure(connection: &quinn::Connection, error: NetError) -> ConnectErr
     match connection.close_reason() {
         Some(reason) => ConnectError::Connection(reason),
         None => ConnectError::Protocol(error),
+    }
+}
+
+impl Client {
+    pub fn welcome(&self) -> &Welcome {
+        &self.welcome
+    }
+
+    pub fn player(&self) -> PlayerId {
+        self.player
+    }
+
+    pub fn rtt(&self) -> Duration {
+        self.connection.rtt()
+    }
+
+    /// Sends a request and waits for its response.
+    pub async fn request(&self, request: Request) -> Result<Response, ClientError> {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        self.pending_map().insert(id, reply);
+        // The reader marks itself done before failing every pending request,
+        // so a request registered after that is caught here.
+        if self.reader_done.load(Ordering::SeqCst) {
+            self.pending_map().remove(&id);
+            return Err(ClientError::Disconnected);
+        }
+        if self
+            .outgoing
+            .send(ClientMessage::Request { id, request })
+            .await
+            .is_err()
+        {
+            self.pending_map().remove(&id);
+            return Err(ClientError::Disconnected);
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Err(error))) => Err(ClientError::Refused(error)),
+            Ok(Err(_)) => Err(ClientError::Disconnected),
+            Err(_) => {
+                self.pending_map().remove(&id);
+                Err(ClientError::Timeout)
+            }
+        }
+    }
+
+    pub async fn create_room(&self, create: CreateRoom) -> Result<(Invite, RoomView), ClientError> {
+        match self.request(Request::CreateRoom(create)).await? {
+            Response::RoomCreated { invite, room } => Ok((invite, room)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn join_room(&self, join: JoinRoom) -> Result<RoomView, ClientError> {
+        match self.request(Request::JoinRoom(join)).await? {
+            Response::RoomJoined(room) => Ok(room),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn leave_room(&self) -> Result<(), ClientError> {
+        self.done(Request::LeaveRoom).await
+    }
+
+    pub async fn set_ready(&self, ready: bool) -> Result<(), ClientError> {
+        self.done(Request::SetReady(ready)).await
+    }
+
+    pub async fn declare_content(&self, content: ContentFingerprint) -> Result<(), ClientError> {
+        self.done(Request::DeclareContent(content)).await
+    }
+
+    pub async fn start_game(&self) -> Result<(), ClientError> {
+        self.done(Request::StartGame).await
+    }
+
+    pub async fn set_speed(&self, speed: Speed) -> Result<(), ClientError> {
+        self.done(Request::SetSpeed(speed)).await
+    }
+
+    async fn done(&self, request: Request) -> Result<(), ClientError> {
+        match self.request(request).await? {
+            Response::Done => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn send_intent(&self, client_seq: u64, payload: Payload) -> Result<(), ClientError> {
+        self.send(GameMessage::Intent {
+            client_seq,
+            payload,
+        })
+        .await
+    }
+
+    pub async fn report_progress(&self, step: u64) -> Result<(), ClientError> {
+        self.send(GameMessage::Progress { step }).await
+    }
+
+    pub async fn report_checkpoint(
+        &self,
+        step: u64,
+        lanes: Vec<LaneDigest>,
+    ) -> Result<(), ClientError> {
+        self.send(GameMessage::Checkpoint { step, lanes }).await
+    }
+
+    async fn send(&self, message: GameMessage) -> Result<(), ClientError> {
+        self.outgoing
+            .send(ClientMessage::Game(message))
+            .await
+            .map_err(|_| ClientError::Disconnected)
+    }
+
+    /// Ends the session and waits until the server has been told.
+    pub async fn close(self) {
+        self.connection.close(close::NORMAL, b"client leaving");
+        self.endpoint.wait_idle().await;
+    }
+
+    fn pending_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<u32, oneshot::Sender<Result<Response, RequestError>>>>
+    {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Background tasks hold the connection; without this, a dropped
+        // client would linger until the idle timeout.
+        self.connection.close(close::NORMAL, b"client dropped");
+    }
+}
+
+async fn write_control(mut send: SendStream, mut outgoing: mpsc::Receiver<ClientMessage>) {
+    while let Some(message) = outgoing.recv().await {
+        if write_message(&mut send, &message, CONTROL_MAX_FRAME)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+async fn read_control(
+    mut recv: RecvStream,
+    connection: quinn::Connection,
+    pending: Pending,
+    done: Arc<AtomicBool>,
+    events: mpsc::Sender<ClientEvent>,
+) {
+    loop {
+        let message = match read_message::<ServerMessage>(&mut recv, CONTROL_MAX_FRAME).await {
+            Ok(message) => message,
+            Err(error) => {
+                if !error.is_disconnect() {
+                    connection.close(close::PROTOCOL_VIOLATION, b"malformed control message");
+                }
+                break;
+            }
+        };
+        let event = match message {
+            ServerMessage::Response { id, result } => {
+                let reply = pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+                continue;
+            }
+            ServerMessage::RoomUpdate(room) => ClientEvent::RoomUpdate(room),
+            ServerMessage::IntentRejected { client_seq, reason } => {
+                ClientEvent::IntentRejected { client_seq, reason }
+            }
+            ServerMessage::Diverged { step, lanes } => ClientEvent::Diverged { step, lanes },
+            ServerMessage::Welcome(_) | ServerMessage::Reject(_) => {
+                connection.close(close::PROTOCOL_VIOLATION, b"unexpected handshake message");
+                break;
+            }
+        };
+        if events.send(event).await.is_err() {
+            break;
+        }
+    }
+    done.store(true, Ordering::SeqCst);
+    // Dropping the reply senders fails every waiting request.
+    pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+/// Reads turn streams one after another, so a stream that replaces an older
+/// one is only read once the older one has ended.
+async fn read_turns(connection: quinn::Connection, events: mpsc::Sender<ClientEvent>) {
+    while let Ok(mut recv) = connection.accept_uni().await {
+        match read_turn_stream(&mut recv, &events).await {
+            Ok(()) => {}
+            Err(TurnStreamError::Violation) => {
+                connection.close(close::PROTOCOL_VIOLATION, b"malformed turn stream");
+                return;
+            }
+            Err(TurnStreamError::Receiver) => return,
+        }
+    }
+}
+
+enum TurnStreamError {
+    Violation,
+    Receiver,
+}
+
+async fn read_turn_stream(
+    recv: &mut RecvStream,
+    events: &mpsc::Sender<ClientEvent>,
+) -> Result<(), TurnStreamError> {
+    match read_preamble(recv).await {
+        Ok(PROTOCOL_VERSION) => {}
+        Ok(_) => return Err(TurnStreamError::Violation),
+        Err(error) if error.is_disconnect() => return Ok(()),
+        Err(_) => return Err(TurnStreamError::Violation),
+    }
+    let start = match read_message::<TurnMessage>(recv, TURN_MAX_FRAME).await {
+        Ok(TurnMessage::Start(start)) => start,
+        Ok(TurnMessage::Turn(_)) => return Err(TurnStreamError::Violation),
+        Err(error) if error.is_disconnect() => return Ok(()),
+        Err(_) => return Err(TurnStreamError::Violation),
+    };
+    events
+        .send(ClientEvent::TurnStream(start))
+        .await
+        .map_err(|_| TurnStreamError::Receiver)?;
+    loop {
+        match read_message::<TurnMessage>(recv, TURN_MAX_FRAME).await {
+            Ok(TurnMessage::Turn(turn)) => events
+                .send(ClientEvent::Turn(turn))
+                .await
+                .map_err(|_| TurnStreamError::Receiver)?,
+            Ok(TurnMessage::Start(_)) => return Err(TurnStreamError::Violation),
+            // The server finished the stream, or the connection ended.
+            Err(error) if error.is_disconnect() => return Ok(()),
+            Err(_) => return Err(TurnStreamError::Violation),
+        }
     }
 }

@@ -17,3 +17,8 @@ pub const REJECTED: VarInt = VarInt::from_u32(3);
 pub const HANDSHAKE_TIMEOUT: VarInt = VarInt::from_u32(4);
 /// The server is shutting down.
 pub const SHUTTING_DOWN: VarInt = VarInt::from_u32(5);
+/// The client did not read what the server sent fast enough, and the
+/// server's bounded buffer for it filled up.
+pub const SLOW_CONSUMER: VarInt = VarInt::from_u32(6);
+/// The same player connected again; this older connection was replaced.
+pub const REPLACED: VarInt = VarInt::from_u32(7);

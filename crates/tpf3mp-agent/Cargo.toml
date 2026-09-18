@@ -1,6 +1,6 @@
 [package]
 name = "tpf3mp-agent"
-description = "The TPF3-MP client daemon that runs next to the game"
+description = "The TPF3-MP client that runs next to the game"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+dirs.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

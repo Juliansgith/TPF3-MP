@@ -1,21 +1,33 @@
-//! Wire protocol shared by `tpf3mp-server` and `tpf3mp-agent`.
+//! Wire protocol shared by `tpf3mp-server` and `tpf3mp-agent`. The semantics
+//! are specified in `docs/PROTOCOL.md`.
 //!
-//! A control stream opens with a fixed-layout [preamble](encode_preamble) that
+//! Every stream opens with a fixed-layout [preamble](encode_preamble) that
 //! carries the protocol version. Its layout never changes, so any two releases
 //! can tell each other which version they speak, however much else differs.
 //! After the preamble, every message is one frame: a little-endian `u32`
-//! payload length followed by a postcard-encoded [`Message`]. A frame above the
-//! channel's cap is a protocol violation. Decoding enforces the bounds of every
-//! field (see [`Text`]), so a decoded message is always within limits.
+//! payload length followed by a postcard-encoded message. A frame above the
+//! stream's cap is a protocol violation. Decoding enforces the bounds of every
+//! field (see [`Text`] and [`Payload`]), so a decoded message is within limits.
 
+mod bytes;
+mod control;
+mod ids;
 mod text;
+mod turn;
 
-use std::fmt;
-
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+pub use bytes::{FixedBytes, MAX_PAYLOAD, Payload, PayloadTooLarge};
+pub use control::{
+    AUTH_DOMAIN, AUTH_EXPORTER_LABEL, ClientMessage, ContentFingerprint, CreateRoom, GameMessage,
+    Hello, IntentRejection, JoinRoom, LaneDigest, MAX_CHECKPOINT_LANES, MAX_ROOM_MEMBERS,
+    MemberView, Reject, RejectReason, Request, RequestError, Response, RoomPhase, RoomSettings,
+    RoomView, ServerMessage, Speed, Welcome,
+};
+pub use ids::{Invite, InviteError, PlayerId, RoomId, SessionId, Signature};
 pub use text::{Text, TextError};
+pub use turn::{Event, EventBody, Turn, TurnMessage, TurnStart};
 
 /// Protocol version. Client and server must match exactly.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -23,8 +35,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Application protocol name negotiated during the TLS handshake.
 pub const ALPN: &[u8] = b"tpf3mp";
 
-/// Largest frame accepted on the control stream.
+/// Largest frame accepted on the control stream. An intent with a
+/// [`MAX_PAYLOAD`] payload fits.
 pub const CONTROL_MAX_FRAME: usize = 64 * 1024;
+
+/// Largest frame accepted on the turn stream. The server splits a tick's
+/// events over several turns rather than exceed it.
+pub const TURN_MAX_FRAME: usize = 1024 * 1024;
 
 const MAGIC: [u8; 6] = *b"TPF3MP";
 
@@ -57,80 +74,15 @@ pub enum PreambleError {
     BadMagic,
 }
 
-/// Every message on the control stream.
-///
-/// Variants are identified by their position: append new variants at the end
-/// and never reorder them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Message {
-    Hello(Hello),
-    Welcome(Welcome),
-    Reject(Reject),
-}
-
-/// The client's first message after the preamble.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hello {
-    pub client_version: Text<64>,
-    pub platform: Platform,
-}
-
-/// The server's answer to an accepted [`Hello`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Welcome {
-    pub server_version: Text<64>,
-    pub session_id: SessionId,
-}
-
-/// The server's answer to a [`Hello`] it will not serve. The server closes the
-/// connection after sending it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Reject {
-    pub reason: RejectReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RejectReason {
-    ServerFull,
-}
-
-impl fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ServerFull => f.write_str("the server is full; try again later"),
-        }
-    }
-}
-
-/// Non-secret identifier of one connection, safe to quote in bug reports.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub [u8; 16]);
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("s-")?;
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
 /// The operating system and CPU architecture a client runs on. Rooms mix
 /// platforms, and the server uses this to choose a room's anchor replica.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Platform {
     pub os: Os,
     pub arch: Arch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Os {
     Windows,
     Linux,
@@ -138,7 +90,7 @@ pub enum Os {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Arch {
     X86_64,
     Aarch64,
@@ -176,7 +128,7 @@ pub enum FrameError {
 
 /// Encodes `message` as one frame, refusing to produce a frame the receiver
 /// would reject.
-pub fn encode_frame(message: &Message, max: usize) -> Result<Vec<u8>, FrameError> {
+pub fn encode_frame<T: Serialize>(message: &T, max: usize) -> Result<Vec<u8>, FrameError> {
     let payload = postcard::to_stdvec(message)?;
     let too_large = FrameError::TooLarge {
         len: payload.len(),
@@ -205,7 +157,7 @@ pub fn frame_len(header: [u8; FRAME_HEADER_LEN], max: usize) -> Result<usize, Fr
 }
 
 /// Decodes one frame payload. The payload must contain exactly one message.
-pub fn decode_message(payload: &[u8]) -> Result<Message, FrameError> {
+pub fn decode_frame<T: DeserializeOwned>(payload: &[u8]) -> Result<T, FrameError> {
     let (message, rest) = postcard::take_from_bytes(payload)?;
     if !rest.is_empty() {
         return Err(FrameError::TrailingBytes(rest.len()));
@@ -217,13 +169,16 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, FrameError> {
 mod tests {
     use super::*;
 
-    fn hello() -> Message {
-        Message::Hello(Hello {
-            client_version: Text::new("0.1.0").unwrap(),
+    fn hello() -> ClientMessage {
+        ClientMessage::Hello(Hello {
+            client_version: Text::new("0.1").unwrap(),
             platform: Platform {
                 os: Os::MacOs,
                 arch: Arch::Aarch64,
             },
+            name: Text::new("Al").unwrap(),
+            identity: PlayerId(FixedBytes([1; 32])),
+            proof: Signature(FixedBytes([2; 64])),
         })
     }
 
@@ -258,40 +213,64 @@ mod tests {
     /// fields. Update deliberately, together with `PROTOCOL_VERSION`.
     #[test]
     fn hello_wire_format_is_stable() {
+        let mut expected = vec![
+            0, // ClientMessage::Hello
+            3, b'0', b'.', b'1', // client_version
+            2, 1, // Os::MacOs, Arch::Aarch64
+            2, b'A', b'l', // name
+        ];
+        expected.extend([1; 32]); // identity, no length prefix
+        expected.extend([2; 64]); // proof, no length prefix
         let frame = encode_frame(&hello(), CONTROL_MAX_FRAME).unwrap();
+        assert_eq!(payload(&frame), expected.as_slice());
         assert_eq!(
-            frame,
-            [
-                9, 0, 0, 0, // payload length
-                0, // Message::Hello
-                5, b'0', b'.', b'1', b'.', b'0', // client_version
-                2,    // Os::MacOs
-                1,    // Arch::Aarch64
-            ]
+            frame[..FRAME_HEADER_LEN],
+            u32::try_from(expected.len()).unwrap().to_le_bytes()
         );
     }
 
     #[test]
-    fn every_message_round_trips() {
-        let messages = [
-            hello(),
-            Message::Welcome(Welcome {
-                server_version: Text::new("0.1.0").unwrap(),
-                session_id: SessionId([7; 16]),
-            }),
-            Message::Reject(Reject {
-                reason: RejectReason::ServerFull,
-            }),
-        ];
-        for message in messages {
-            let frame = encode_frame(&message, CONTROL_MAX_FRAME).unwrap();
-            let header = frame[..FRAME_HEADER_LEN].try_into().unwrap();
-            assert_eq!(
-                frame_len(header, CONTROL_MAX_FRAME).unwrap(),
-                frame.len() - FRAME_HEADER_LEN
-            );
-            assert_eq!(decode_message(payload(&frame)).unwrap(), message);
-        }
+    fn game_message_wire_format_is_stable() {
+        let progress = ClientMessage::Game(GameMessage::Progress { step: 300 });
+        let frame = encode_frame(&progress, CONTROL_MAX_FRAME).unwrap();
+        // Game variant, Progress variant, varint 300.
+        assert_eq!(frame, [4, 0, 0, 0, 2, 1, 0xac, 0x02]);
+    }
+
+    #[test]
+    fn messages_round_trip() {
+        let turn = TurnMessage::Turn(Turn {
+            number: 9,
+            sealed_through: 120,
+            speed: Speed::NORMAL,
+            events: vec![Event {
+                seq: 41,
+                step: 118,
+                body: EventBody::Command {
+                    player: PlayerId(FixedBytes([3; 32])),
+                    client_seq: 7,
+                    payload: Payload::new(vec![1, 2, 3]).unwrap(),
+                },
+            }],
+        });
+        let frame = encode_frame(&turn, TURN_MAX_FRAME).unwrap();
+        assert_eq!(decode_frame::<TurnMessage>(payload(&frame)).unwrap(), turn);
+
+        let frame = encode_frame(&hello(), CONTROL_MAX_FRAME).unwrap();
+        assert_eq!(
+            decode_frame::<ClientMessage>(payload(&frame)).unwrap(),
+            hello()
+        );
+
+        let response = ServerMessage::Response {
+            id: 3,
+            result: Err(RequestError::BadInvite),
+        };
+        let frame = encode_frame(&response, CONTROL_MAX_FRAME).unwrap();
+        assert_eq!(
+            decode_frame::<ServerMessage>(payload(&frame)).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -316,7 +295,7 @@ mod tests {
     fn encoder_refuses_frames_above_the_cap() {
         assert!(matches!(
             encode_frame(&hello(), 4),
-            Err(FrameError::TooLarge { len: 9, max: 4 })
+            Err(FrameError::TooLarge { max: 4, .. })
         ));
     }
 
@@ -325,25 +304,24 @@ mod tests {
         let frame = encode_frame(&hello(), CONTROL_MAX_FRAME).unwrap();
         let body = payload(&frame);
         assert!(matches!(
-            decode_message(&body[..body.len() - 1]),
+            decode_frame::<ClientMessage>(&body[..body.len() - 1]),
             Err(FrameError::Malformed(_))
         ));
         let mut padded = body.to_vec();
         padded.push(0);
         assert!(matches!(
-            decode_message(&padded),
+            decode_frame::<ClientMessage>(&padded),
             Err(FrameError::TrailingBytes(1))
         ));
     }
 
     #[test]
     fn decoder_enforces_text_rules() {
-        // A hello whose client_version carries an escape sequence.
+        // A hello whose client_version carries a terminal escape sequence.
         let mut body = vec![0, 4];
         body.extend_from_slice(b"\x1b[2J");
-        body.extend_from_slice(&[0, 0]);
         assert!(matches!(
-            decode_message(&body),
+            decode_frame::<ClientMessage>(&body),
             Err(FrameError::Malformed(_))
         ));
     }
@@ -351,7 +329,7 @@ mod tests {
     #[test]
     fn decoder_rejects_unknown_variants() {
         assert!(matches!(
-            decode_message(&[200, 0]),
+            decode_frame::<ClientMessage>(&[200, 0]),
             Err(FrameError::Malformed(_))
         ));
     }
@@ -365,5 +343,13 @@ mod tests {
             SessionId(bytes).to_string(),
             "s-ab000000000000000000000000000001"
         );
+    }
+
+    #[test]
+    fn default_room_settings_are_valid() {
+        assert!(RoomSettings::DEFAULT.is_valid());
+        let mut settings = RoomSettings::DEFAULT;
+        settings.steps_per_second = 0;
+        assert!(!settings.is_valid());
     }
 }

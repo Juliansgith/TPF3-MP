@@ -1,6 +1,6 @@
 [package]
 name = "tpf3mp-net"
-description = "QUIC endpoints, TLS configuration and framed stream I/O for TPF3-MP"
+description = "QUIC endpoints, TLS configuration, identity and framed stream I/O for TPF3-MP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,9 @@ publish.workspace = true
 [dependencies]
 quinn.workspace = true
 rcgen.workspace = true
+ring.workspace = true
 rustls.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tpf3mp-proto.workspace = true
 webpki-roots.workspace = true

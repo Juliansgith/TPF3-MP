@@ -1,29 +1,23 @@
-//! The TPF3-MP dedicated server.
-//!
-//! Milestone M0 implements the connection handshake: the version preamble,
-//! then `Hello`, answered by `Welcome` or `Reject`. Rooms, the sequencer and
-//! the canonical state machine follow in M1 (see `docs/ARCHITECTURE.md`).
+//! The TPF3-MP dedicated server: handshake and identity, rooms, and the
+//! turn sequencer. The protocol is specified in `docs/PROTOCOL.md`.
 
-use std::{future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+mod connection;
+mod directory;
+mod pacing;
+mod room;
+mod ruleset;
+mod verdict;
 
-use quinn::{RecvStream, SendStream};
+use std::{fmt, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tpf3mp_net::{
-    NetError, ServerIdentity, TlsError, close, read_message, read_preamble, write_message,
-    write_preamble,
-};
-use tpf3mp_proto::{
-    CONTROL_MAX_FRAME, Message, PROTOCOL_VERSION, Platform, Reject, RejectReason, SessionId, Text,
-    Welcome,
-};
-use tracing::{debug, info};
+use tokio::sync::Semaphore;
+use tpf3mp_net::{ServerIdentity, TlsError, close};
+use tpf3mp_proto::Text;
 
-/// How long a peer gets to acknowledge a final message (a `Reject`, or the
-/// preamble after a version mismatch) before the server closes the connection.
-const LINGER: Duration = Duration::from_secs(2);
+use crate::directory::Directory;
+pub use crate::ruleset::{AcceptAll, Ruleset, RulesetFactory};
 
-#[derive(Debug)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub identity: ServerIdentity,
@@ -32,16 +26,45 @@ pub struct ServerConfig {
     /// Time from connecting to a completed handshake. Slower clients are
     /// closed with `HANDSHAKE_TIMEOUT`, so idle sockets cannot pin resources.
     pub handshake_timeout: Duration,
+    /// Rooms hosted at once.
+    pub max_rooms: usize,
+    /// Key for the HMAC tags of invites and room passwords. An invite stays
+    /// valid only while the server keeps this key.
+    pub secret: [u8; 32],
+    /// Creates the canonical rules of each new room.
+    pub ruleset: RulesetFactory,
+    /// Interval at which running rooms seal turns.
+    pub tick: Duration,
 }
 
 impl ServerConfig {
+    /// A configuration with defaults and a fresh random secret.
     pub fn new(listen: SocketAddr, identity: ServerIdentity) -> Self {
+        let mut secret = [0; 32];
+        getrandom::fill(&mut secret).expect("the operating system's random source is available");
         Self {
             listen,
             identity,
             max_sessions: 4096,
             handshake_timeout: Duration::from_secs(10),
+            max_rooms: 10_000,
+            secret,
+            ruleset: Arc::new(|| Box::new(AcceptAll)),
+            tick: Duration::from_millis(100),
         }
+    }
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The secret stays out of logs.
+        f.debug_struct("ServerConfig")
+            .field("listen", &self.listen)
+            .field("max_sessions", &self.max_sessions)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("max_rooms", &self.max_rooms)
+            .field("tick", &self.tick)
+            .finish_non_exhaustive()
     }
 }
 
@@ -53,25 +76,47 @@ pub enum ServerError {
     Bind(#[from] io::Error),
 }
 
+/// State shared by every connection.
+pub(crate) struct Shared {
+    pub(crate) sessions: Arc<Semaphore>,
+    pub(crate) handshake_timeout: Duration,
+    pub(crate) directory: Arc<Directory>,
+    pub(crate) server_version: Text<64>,
+}
+
 pub struct Server {
     endpoint: quinn::Endpoint,
-    sessions: Arc<Semaphore>,
-    handshake_timeout: Duration,
+    shared: Arc<Shared>,
 }
 
 impl Server {
     pub fn bind(config: ServerConfig) -> Result<Self, ServerError> {
         let quic = tpf3mp_net::server_config(config.identity)?;
         let endpoint = quinn::Endpoint::server(quic, config.listen)?;
-        Ok(Self {
-            endpoint,
+        let shared = Arc::new(Shared {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             handshake_timeout: config.handshake_timeout,
-        })
+            directory: Arc::new(Directory::new(
+                &config.secret,
+                config.max_rooms,
+                config.ruleset,
+                config.tick,
+            )),
+            server_version: Text::new(env!("CARGO_PKG_VERSION"))
+                .expect("the crate version is short printable text"),
+        });
+        Ok(Self { endpoint, shared })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.endpoint.local_addr()
+    }
+
+    /// A handle for observing the server while it runs.
+    pub fn stats(&self) -> ServerStats {
+        ServerStats {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Serves connections until `shutdown` completes, then closes every
@@ -83,11 +128,7 @@ impl Server {
                 () = &mut shutdown => break,
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else { break };
-                    tokio::spawn(serve(
-                        incoming,
-                        Arc::clone(&self.sessions),
-                        self.handshake_timeout,
-                    ));
+                    tokio::spawn(connection::serve(incoming, Arc::clone(&self.shared)));
                 }
             }
         }
@@ -97,133 +138,13 @@ impl Server {
     }
 }
 
-/// A client that completed the handshake. Dropping it frees the session slot.
-struct Session {
-    id: SessionId,
-    client_version: Text<64>,
-    platform: Platform,
-    _slot: OwnedSemaphorePermit,
-    _control: (SendStream, RecvStream),
+#[derive(Clone)]
+pub struct ServerStats {
+    shared: Arc<Shared>,
 }
 
-/// Why the server ended a connection during the handshake.
-#[derive(Debug, Error)]
-enum Refusal {
-    #[error("client speaks protocol {0}")]
-    VersionMismatch(u32),
-    #[error("no free session slot")]
-    ServerFull,
-    #[error("the client broke the protocol: {0}")]
-    Violation(#[from] NetError),
-    #[error("the first message was not a Hello")]
-    UnexpectedMessage,
-    #[error("the connection was lost: {0}")]
-    Lost(#[from] quinn::ConnectionError),
-}
-
-impl Refusal {
-    fn close(&self, connection: &quinn::Connection) {
-        let (code, reason): (quinn::VarInt, &[u8]) = match self {
-            Self::VersionMismatch(_) => (close::VERSION_MISMATCH, b"protocol version mismatch"),
-            Self::ServerFull => (close::REJECTED, b"server full"),
-            Self::Violation(_) | Self::UnexpectedMessage => {
-                (close::PROTOCOL_VIOLATION, b"protocol violation")
-            }
-            Self::Lost(_) => return,
-        };
-        connection.close(code, reason);
+impl ServerStats {
+    pub fn rooms(&self) -> usize {
+        self.shared.directory.len()
     }
-}
-
-async fn serve(incoming: quinn::Incoming, sessions: Arc<Semaphore>, handshake_timeout: Duration) {
-    let connection = match incoming.await {
-        Ok(connection) => connection,
-        Err(error) => {
-            debug!(%error, "connection attempt failed");
-            return;
-        }
-    };
-    // Addresses stay out of the logs; the stable ID correlates log lines.
-    let connection_id = connection.stable_id();
-    let session =
-        match tokio::time::timeout(handshake_timeout, handshake(&connection, &sessions)).await {
-            Ok(Ok(session)) => session,
-            Ok(Err(refusal)) => {
-                debug!(connection = connection_id, %refusal, "handshake refused");
-                refusal.close(&connection);
-                return;
-            }
-            Err(_) => {
-                debug!(connection = connection_id, "handshake timed out");
-                connection.close(close::HANDSHAKE_TIMEOUT, b"handshake timed out");
-                return;
-            }
-        };
-    info!(
-        connection = connection_id,
-        session = %session.id,
-        client = %session.client_version,
-        platform = ?session.platform,
-        "session started"
-    );
-    let reason = connection.closed().await;
-    info!(session = %session.id, %reason, "session ended");
-}
-
-async fn handshake(
-    connection: &quinn::Connection,
-    sessions: &Arc<Semaphore>,
-) -> Result<Session, Refusal> {
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    let client_protocol = read_preamble(&mut recv).await?;
-    // Always answer with our version, so the client can say which side is old.
-    write_preamble(&mut send, PROTOCOL_VERSION).await?;
-    if client_protocol != PROTOCOL_VERSION {
-        linger(&mut send).await;
-        return Err(Refusal::VersionMismatch(client_protocol));
-    }
-    let Message::Hello(hello) = read_message(&mut recv, CONTROL_MAX_FRAME).await? else {
-        return Err(Refusal::UnexpectedMessage);
-    };
-    let Ok(slot) = Arc::clone(sessions).try_acquire_owned() else {
-        let reject = Message::Reject(Reject {
-            reason: RejectReason::ServerFull,
-        });
-        write_message(&mut send, &reject, CONTROL_MAX_FRAME).await?;
-        linger(&mut send).await;
-        return Err(Refusal::ServerFull);
-    };
-    let id = new_session_id();
-    let welcome = Message::Welcome(Welcome {
-        server_version: server_version(),
-        session_id: id,
-    });
-    write_message(&mut send, &welcome, CONTROL_MAX_FRAME).await?;
-    Ok(Session {
-        id,
-        client_version: hello.client_version,
-        platform: hello.platform,
-        _slot: slot,
-        _control: (send, recv),
-    })
-}
-
-/// Finishes the stream and waits, briefly, until the peer has received all of
-/// it, so a final message is not lost when the connection closes.
-async fn linger(send: &mut SendStream) {
-    if send.finish().is_ok() {
-        // Timing out only means the peer may miss the reason; the connection
-        // closes either way.
-        let _ = tokio::time::timeout(LINGER, send.stopped()).await;
-    }
-}
-
-fn new_session_id() -> SessionId {
-    let mut bytes = [0; 16];
-    getrandom::fill(&mut bytes).expect("the operating system's random source is available");
-    SessionId(bytes)
-}
-
-fn server_version() -> Text<64> {
-    Text::new(env!("CARGO_PKG_VERSION")).expect("the crate version is short printable text")
 }

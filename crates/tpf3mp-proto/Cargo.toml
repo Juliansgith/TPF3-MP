@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
