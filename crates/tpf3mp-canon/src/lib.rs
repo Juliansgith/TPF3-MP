@@ -12,10 +12,15 @@
 //!   `HashMap` and `HashSet`; use `BTreeMap` and `BTreeSet`).
 //!
 //! Rules ported from TPF2MP's Lua economy must reproduce its parity vectors
-//! exactly, including Lua's rounding (see [`floor_div`]).
+//! exactly, including Lua's rounding (see [`floor_div`] and [`lua`]). The
+//! port lives in [`economy`]; `docs/ECONOMY.md` describes it and the
+//! differential tests that hold it to the original Lua.
 
 #![deny(clippy::float_arithmetic, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
+
+pub mod economy;
+pub mod lua;
 
 /// An amount of money in cents.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
