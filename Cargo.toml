@@ -15,6 +15,8 @@ tpf3mp-proto = { path = "crates/tpf3mp-proto" }
 tpf3mp-net = { path = "crates/tpf3mp-net" }
 tpf3mp-agent = { path = "crates/tpf3mp-agent" }
 tpf3mp-server = { path = "crates/tpf3mp-server" }
+tpf3mp-hookcore = { path = "crates/tpf3mp-hookcore" }
+tpf3mp-ipc = { path = "crates/tpf3mp-ipc" }
 
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -43,6 +45,17 @@ webpki-roots = "1.0.9"
 # vendored interpreter must be 5.1 (5.3+ would add integer semantics).
 mlua = { version = "0.12.1", features = ["lua51", "vendored"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
+# hook crates: the in-process native hook, its build-signature/detour engine and
+# the shared-memory link to the agent. The platform crates (ctor, libc,
+# windows-sys) and iced-x86 are pulled in only under the cfg() targets that need
+# them; see each crate's [target.'cfg(...)'.dependencies].
+ctor = "1.0.13"
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
+libc = "0.2.189"
+sha2 = "0.11.0"
+toml = "1.1.6"
+windows-sys = "0.61.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

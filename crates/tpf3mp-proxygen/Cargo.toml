@@ -1,0 +1,16 @@
+[package]
+name = "tpf3mp-proxygen"
+description = "Generates a Windows proxy DLL that forwards every export to the renamed original"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tpf3mp-hookcore.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "tpf3mp-hook"
+description = "The in-game native hook: platform entry points, profile loading and the agent IPC link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# cdylib is the shipped in-game library; rlib lets the logic be unit-tested.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tpf3mp-hookcore.workspace = true
+tpf3mp-ipc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(unix)'.dependencies]
+ctor.workspace = true
+
+[lints]
+workspace = true
