@@ -297,11 +297,10 @@ impl ChunkStore {
         if self.inner.config.sync_chunks && !written_dirs.is_empty() {
             let chunks_dir = self.inner.root.join(CHUNKS_DIR);
             for fan in written_dirs {
-                let dir = chunks_dir.join(fan);
-                sync_dir(&dir).map_err(io_error("flush", &dir))?;
+                sync_dir(&chunks_dir.join(fan));
             }
             // Fan-out directories may be new too.
-            sync_dir(&chunks_dir).map_err(io_error("flush", &chunks_dir))?;
+            sync_dir(&chunks_dir);
         }
         Ok(manifest)
     }
@@ -349,8 +348,8 @@ impl ChunkStore {
             let _ = fs::remove_file(&partial);
             return Err(error);
         }
-        let dir = parent_dir(dest);
-        sync_dir(dir).map_err(io_error("flush", dir))
+        sync_dir(parent_dir(dest));
+        Ok(())
     }
 
     /// Deletes every chunk that neither a manifest in `live` nor an unfinished
@@ -445,7 +444,8 @@ impl ChunkStore {
             let _ = fs::remove_file(&temp);
             return Err(io_error("save", &dest)(source));
         }
-        sync_dir(&dir).map_err(io_error("flush", &dir))
+        sync_dir(&dir);
+        Ok(())
     }
 
     pub(crate) fn load_pending(&self, id: &ManifestId) -> Result<Manifest, StoreError> {
@@ -759,14 +759,19 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// Makes renames into `dir` durable. Windows offers no portable way to open a
-/// directory for flushing, and NTFS journals metadata, so this is a no-op there.
+/// Makes renames into `dir` durable, as far as the platform allows. It is best
+/// effort, as in SQLite: some file systems refuse to flush a directory (and on
+/// macOS a flush is `F_FULLFSYNC`), while the rename it would make durable has
+/// already happened and the file itself was flushed. Failing here would report
+/// an error for work that succeeded.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+fn sync_dir(dir: &Path) {
+    if let Ok(dir) = File::open(dir) {
+        let _ = dir.sync_all();
+    }
 }
 
+/// Windows offers no portable way to open a directory for flushing, and NTFS
+/// journals metadata.
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
+fn sync_dir(_dir: &Path) {}
