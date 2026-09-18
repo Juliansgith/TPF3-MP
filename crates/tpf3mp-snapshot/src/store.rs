@@ -555,7 +555,10 @@ impl ChunkStore {
         let dest = self.chunk_path(id);
         let mut accounting = self.accounting();
         match fs::metadata(&dest) {
-            Ok(_) => return Ok(false),
+            // As in `has`: only a file counts. Anything else in the way makes
+            // the rename below fail with an error.
+            Ok(metadata) if metadata.is_file() => return Ok(false),
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("inspect", &dest)(error)),
         }

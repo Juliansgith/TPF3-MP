@@ -206,6 +206,23 @@ fn hostile_chunks_are_rejected_without_a_trace() {
 }
 
 #[test]
+fn something_else_in_a_chunks_place_is_an_error_not_a_chunk() {
+    let setup = setup();
+    let manifest = setup.publish(&random_bytes(12, 100_000));
+    let id = manifest.chunks()[0].id;
+    fs::create_dir_all(chunk_file(&setup.client_root, &id)).unwrap();
+    let mut sink = ChunkSink::open(&setup.client, manifest).unwrap();
+    assert!(sink.missing().iter().any(|entry| entry.id == id));
+    let frame = setup.server.read_compressed(&id).unwrap();
+    let error = sink.put(&id, &frame).unwrap_err();
+    assert!(
+        matches!(error, SinkError::Store(StoreError::Io { .. })),
+        "{error}"
+    );
+    assert!(sink.missing().iter().any(|entry| entry.id == id));
+}
+
+#[test]
 fn finishing_requires_every_chunk_and_happens_once() {
     let setup = setup();
     let manifest = setup.publish(&random_bytes(5, 500_000));
