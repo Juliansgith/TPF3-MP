@@ -31,6 +31,19 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1.0.9"
 
+# hook crates: the in-process native hook, its build-signature/detour engine and
+# the shared-memory link to the agent. The platform crates (ctor, libc,
+# windows-sys) and iced-x86 are pulled in only under the cfg() targets that need
+# them; see each crate's [target.'cfg(...)'.dependencies].
+tpf3mp-hookcore = { path = "crates/tpf3mp-hookcore" }
+tpf3mp-ipc = { path = "crates/tpf3mp-ipc" }
+ctor = "1.0.13"
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
+libc = "0.2.189"
+sha2 = "0.11.0"
+toml = "1.1.6"
+windows-sys = "0.61.2"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"

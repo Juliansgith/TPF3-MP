@@ -1,0 +1,35 @@
+[package]
+name = "tpf3mp-hookcore"
+description = "Game-agnostic build-signature scanning, per-build profiles and the x86-64 inline detour engine for the TPF3-MP hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+# The detour engine is x86-64 only. On other architectures it compiles to a stub
+# that returns `Unsupported`, so iced-x86 and the OS memory APIs are pulled in
+# only where the engine is real.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+iced-x86.workspace = true
+
+[target.'cfg(all(target_arch = "x86_64", windows))'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+# Signature profile for Transport Fever 2, Steam build 35924 (Windows x64).
+#
+# This is the reference build the TPF2 mods froze on; it is used to prove the
+# resolver against a real game binary (see tests/tpf2_static_proof.rs). TPF3 gets
+# its own profile per build on release day (docs/DAY_ONE.md).
+#
+# Signatures wildcard every build-variable byte (call/RIP-relative displacements)
+# and were checked to match exactly once across the whole .text section. The
+# prologue is the exact bytes the detour engine would relocate, so it carries no
+# wildcards. RVAs are from image base 0x140000000; the code section is readable
+# on disk for this build (the SteamStub `.bind` section does not encrypt .text).
+
+name = "Transport Fever 2 Build 35924 (Windows x64)"
+image_base = 0x140000000
+region = ".text"
+
+[build]
+sha256 = "782b904a8f7bbdac1f7a18528f1a5c778691e5aa3087c37c351bf6912585175c"
+size = 72843280
+pe_timestamp = 0x675ABCC6
+
+# GameSim::Step(frameTime, int): the per-batch simulation entry. 21-byte
+# prologue, all register/immediate operands, relocates verbatim.
+[[target]]
+name = "GameSim::Step"
+signature = "40 53 41 56 48 83 EC 68 48 8B DA 4C 8B F1 48 81 FA E8 03 00 00"
+prologue = "40 53 41 56 48 83 EC 68 48 8B DA 4C 8B F1 48 81 FA E8 03 00 00"
+required = true
+
+# CGame::Step: the main-thread pacing entry (16-byte prologue).
+[[target]]
+name = "CGame::Step"
+signature = "40 53 48 83 EC 20 48 8B 81 68 01 00 00 48 8B D9"
+prologue = "40 53 48 83 EC 20 48 8B 81 68 01 00 00 48 8B D9"
+required = true
+
+# CGameTime::GetSpeed: sits next to two near-identical siblings, so the
+# signature extends past the call (rel32 wildcarded) to the distinguishing
+# `mov eax,[rax+4]` and the ret. The prologue is only the leading, call-free
+# bytes.
+[[target]]
+name = "CGameTime::GetSpeed"
+signature = "48 83 EC 28 48 8D 51 10 48 8B 49 08 E8 ?? ?? ?? ?? 8B 40 04 48 83 C4 28 C3"
+prologue = "48 83 EC 28 48 8D 51 10 48 8B 49 08"
+required = true
+
+# UI::CMenuUI::StartSavegame: the in-process load entry. Shares a 7-push
+# prologue with CreatePage, so the signature runs through the distinctive
+# `lea rbp,[rsp-0x3a0]` and frame size.
+[[target]]
+name = "UI::CMenuUI::StartSavegame"
+signature = "40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 60 FC FF FF 48 81 EC A0 04 00 00 48 C7 44 24 70 FE FF FF FF"
+prologue = "40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 60 FC FF FF"
+required = true
+
+# UI::CMenuUI::CreatePage(Page): rebuilds a menu page. The signature runs to the
+# `mov [rsp+0x330],rbx` store (the byte that distinguishes it from a twin at
+# 0x215c480) and wildcards the stack-canary load. The prologue is the 20-byte
+# steal (7 pushes + lea).
+[[target]]
+name = "UI::CMenuUI::CreatePage"
+signature = "40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 20 FE FF FF 48 81 EC E0 02 00 00 48 C7 45 C0 FE FF FF FF 48 89 9C 24 30 03 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4"
+prologue = "40 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 20 FE FF FF"
+required = true
