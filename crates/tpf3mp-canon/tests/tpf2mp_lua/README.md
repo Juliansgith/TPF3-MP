@@ -30,7 +30,8 @@ The harness does not edit these files on disk. When it loads a module it
 inserts a short block before the module's final `return M` that hands the
 module's local functions to the harness (Lua 5.1's `debug` library would do
 the same, but mlua only loads it in unsafe mode). The block runs after every
-definition and changes no behaviour; see `../differential/harness.lua`.
+definition and changes no behaviour; `instrument` in
+`../differential/tpf2mp.rs` builds it.
 
 ## Updating to a newer TPF2MP commit
 
