@@ -45,6 +45,11 @@ struct Args {
     /// Steps between one bot's commands.
     #[arg(long, default_value_t = 10)]
     act_every: u64,
+    /// Bots play at the room's pace behind a jitter buffer, as games do,
+    /// instead of as soon as steps are sealed. Latencies are then the ones
+    /// players would feel.
+    #[arg(long)]
+    paced: bool,
     /// One-way latency added by the network emulator (in-process only).
     #[arg(long, default_value_t = 0, conflicts_with = "server")]
     latency_ms: u64,
@@ -109,6 +114,7 @@ async fn main() -> Result<()> {
                         target_step: args.steps,
                         act_every: args.act_every + u64::from(bot),
                         drift_at: None,
+                        paced: args.paced,
                     })
                     .collect(),
                 deadline,

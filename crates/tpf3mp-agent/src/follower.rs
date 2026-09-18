@@ -127,6 +127,15 @@ impl TurnFollower {
         None
     }
 
+    /// The step [`next_action`](Self::next_action) would execute next, if
+    /// the next action is executing a step. A game running at wall-clock
+    /// pace checks this to wait until the step is due.
+    pub fn next_step(&self) -> Option<u64> {
+        let step = self.executed + 1;
+        let event_first = self.queue.front().is_some_and(|event| event.step == step);
+        (!event_first && step <= self.sealed_through).then_some(step)
+    }
+
     /// The last step handed out for execution.
     pub fn executed(&self) -> u64 {
         self.executed
@@ -210,6 +219,20 @@ mod tests {
             vec![Action::Execute(3), Action::Execute(4)]
         );
         assert_eq!(follower.last_turn(), Some(3));
+    }
+
+    #[test]
+    fn next_step_names_the_step_only_when_executing_comes_next() {
+        let mut follower = TurnFollower::new(&start());
+        assert_eq!(follower.next_step(), None, "nothing sealed");
+        follower.accept(turn(1, 2, vec![event(1, 1)])).unwrap();
+        assert_eq!(follower.next_step(), None, "an event applies first");
+        assert_eq!(follower.next_action(), Some(Action::Apply(event(1, 1))));
+        assert_eq!(follower.next_step(), Some(1));
+        assert_eq!(follower.next_action(), Some(Action::Execute(1)));
+        assert_eq!(follower.next_step(), Some(2));
+        follower.next_action();
+        assert_eq!(follower.next_step(), None, "step 3 is not sealed");
     }
 
     #[test]

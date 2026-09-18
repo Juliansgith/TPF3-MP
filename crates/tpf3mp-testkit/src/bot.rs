@@ -9,13 +9,18 @@ use std::{
 
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tpf3mp_agent::{Action, Client, ClientError, ClientEvent, FollowError, TurnFollower};
+use tpf3mp_agent::{Action, Client, ClientError, ClientEvent, FollowError, Playout, TurnFollower};
 use tpf3mp_proto::{EventBody, LaneDigest, PlayerId};
 
 use crate::{
     rng::SplitMix64,
     toy::{Ledger, ToyCommand, ToyWorld},
 };
+
+/// A paced bot plays each step this long after the latest recent arrival.
+const PLAYOUT_MARGIN: Duration = Duration::from_millis(20);
+/// How long a late arrival keeps a paced bot's buffer grown.
+const PLAYOUT_MEMORY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct BotConfig {
@@ -31,6 +36,9 @@ pub struct BotConfig {
     pub act_every: u64,
     /// A step at which this replica's simulation drifts.
     pub drift_at: Option<u64>,
+    /// Executes steps at the room's wall-clock pace, as a game does, rather
+    /// than as soon as they are sealed.
+    pub paced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,10 +77,16 @@ pub struct Bot {
     config: BotConfig,
     world: ToyWorld,
     follower: Option<TurnFollower>,
+    /// When a paced bot plays each step.
+    playout: Option<Playout>,
+    /// When the next step falls due, while a paced bot waits for it.
+    wait_until: Option<Instant>,
     checkpoint_interval: u64,
     rng: SplitMix64,
     next_seq: u64,
     in_flight: HashMap<u64, Instant>,
+    /// The progress last reported.
+    reported: Option<u64>,
     report: BotReport,
 }
 
@@ -101,9 +115,12 @@ impl Bot {
             config,
             world,
             follower: None,
+            playout: None,
+            wait_until: None,
             checkpoint_interval: u64::MAX,
             next_seq: 0,
             in_flight: HashMap::new(),
+            reported: None,
             report,
         }
     }
@@ -133,7 +150,19 @@ impl Bot {
 
     async fn play_to_target(&mut self) -> Result<(), BotError> {
         while self.executed() < self.config.target_step {
-            let Some(event) = self.events.recv().await else {
+            let next = match self.wait_until {
+                Some(at) => tokio::select! {
+                    event = self.events.recv() => Some(event),
+                    () = tokio::time::sleep_until(at.into()) => None,
+                },
+                None => Some(self.events.recv().await),
+            };
+            let Some(event) = next else {
+                // The next step fell due.
+                self.advance().await?;
+                continue;
+            };
+            let Some(event) = event else {
                 return Err(BotError::Closed("event channel ended".into()));
             };
             match event {
@@ -143,13 +172,28 @@ impl Bot {
                         None => self.follower = Some(TurnFollower::new(&start)),
                     }
                     self.checkpoint_interval = u64::from(start.checkpoint_interval);
-                    self.client.report_progress(self.executed()).await?;
+                    if self.config.paced {
+                        self.playout = Some(Playout::new(
+                            start.steps_per_second,
+                            PLAYOUT_MARGIN,
+                            PLAYOUT_MEMORY,
+                        ));
+                    }
+                    // A new stream always hears where this replica stands.
+                    let executed = self.executed();
+                    self.reported = Some(executed);
+                    self.client.report_progress(executed).await?;
                 }
                 ClientEvent::Turn(turn) => {
-                    self.follower
-                        .as_mut()
-                        .ok_or(BotError::NoStream)?
-                        .accept(turn)?;
+                    let follower = self.follower.as_mut().ok_or(BotError::NoStream)?;
+                    follower.accept(turn)?;
+                    if let Some(playout) = &mut self.playout {
+                        playout.on_turn(
+                            follower.sealed_through(),
+                            follower.speed(),
+                            Instant::now(),
+                        );
+                    }
                     self.advance().await?;
                 }
                 ClientEvent::IntentRejected { client_seq, .. } => {
@@ -165,13 +209,24 @@ impl Bot {
     }
 
     /// Does everything the received turns allow, stopping exactly at the
-    /// target step, then reports.
+    /// target step, then reports. A paced bot also stops at the first step
+    /// that is not due yet.
     async fn advance(&mut self) -> Result<(), BotError> {
         let me = self.report.player;
+        let now = Instant::now();
         let mut checkpoints = Vec::new();
         let mut commands = Vec::new();
+        self.wait_until = None;
         let follower = self.follower.as_mut().ok_or(BotError::NoStream)?;
         while follower.executed() < self.config.target_step {
+            if let (Some(playout), Some(step)) = (&mut self.playout, follower.next_step()) {
+                let due = playout.due(step, now).unwrap_or(now);
+                if due > now {
+                    self.wait_until = Some(due);
+                    break;
+                }
+                playout.played(step, due);
+            }
             let Some(action) = follower.next_action() else {
                 break;
             };
@@ -210,7 +265,10 @@ impl Bot {
             self.report.sent += 1;
             self.client.send_intent(seq, command.encode()).await?;
         }
-        self.client.report_progress(executed).await?;
+        if self.reported != Some(executed) {
+            self.reported = Some(executed);
+            self.client.report_progress(executed).await?;
+        }
         Ok(())
     }
 }

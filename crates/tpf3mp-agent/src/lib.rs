@@ -3,6 +3,7 @@
 //! link to the in-game hook builds on this (see `docs/ARCHITECTURE.md`).
 
 mod follower;
+mod playout;
 
 use std::{
     collections::HashMap,
@@ -30,6 +31,7 @@ use tpf3mp_proto::{
 };
 
 pub use follower::{Action, FollowError, TurnFollower};
+pub use playout::Playout;
 
 /// How long a request may wait for its response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

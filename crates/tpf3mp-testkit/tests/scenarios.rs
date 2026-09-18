@@ -76,6 +76,7 @@ fn bots(count: u64, target_step: u64, act_every: u64) -> Vec<BotConfig> {
             target_step,
             act_every: act_every + index,
             drift_at: None,
+            paced: false,
         })
         .collect()
 }
@@ -128,6 +129,48 @@ async fn eight_bots_agree_over_a_lossy_high_latency_link() {
     // The input delay (250 ms) plus one-way latency and the tick; loss adds
     // retransmissions to the tail.
     assert!(p50 < 600, "median latency {p50} ms");
+    drop(netem);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paced_players_feel_their_round_trip_plus_a_small_buffer() {
+    let server = TestServer::start().await;
+    // 150 ms round trips with jitter.
+    let netem = Netem::start(
+        server.address,
+        Impairment {
+            latency: Duration::from_millis(75),
+            jitter: Duration::from_millis(15),
+            loss_per_million: 0,
+        },
+        11,
+    )
+    .await
+    .unwrap();
+    let settings = RoomSettings {
+        steps_per_second: 20,
+        input_delay_ms: 60,
+        checkpoint_interval: 20,
+    };
+    let mut plan_bots = bots(4, 200, 3);
+    for bot in &mut plan_bots {
+        bot.paced = true;
+    }
+    let mut plan = server.plan(netem.address(), settings, plan_bots);
+    // At 2x the bots also rebase their playout when the speed changes.
+    plan.speed = Speed(200);
+    let reports = play_room(plan).await.unwrap();
+
+    assert_all_agree(&reports);
+    assert!(reports.iter().all(|report| report.diverged.is_empty()));
+    let [p50, p95, p99, max] = latency_summary(&reports).unwrap();
+    eprintln!(
+        "paced intent-to-apply latency over 150 ms RTT: p50 {p50} ms, p95 {p95} ms, p99 {p99} ms, max {max} ms"
+    );
+    // A player feels the round trip plus their own jitter buffer, not the
+    // room's input delay.
+    assert!(p50 < 350, "median latency {p50} ms");
     drop(netem);
     server.stop().await;
 }

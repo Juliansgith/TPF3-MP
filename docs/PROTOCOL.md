@@ -86,8 +86,9 @@ events for `sealed_through + 1` at once, without running a step.
 **Pacing.**
 - **The server owns the clock.** It advances an ideal step count at
   `steps_per_second × speed`.
-- **Frontier.** It seals up to that count plus a **lead** that hides network
-  latency (the room's input delay).
+- **Frontier.** It seals up to that count plus a small **lead** (the room's
+  input delay setting). Clients buffer on their own (see "Playout" below),
+  so the lead does not decide what players feel.
 - **Nobody runs ahead.** The frontier never goes further than a bounded
   window past the slowest active member's reported progress. A slow machine
   therefore slows the room instead of forking from it.
@@ -107,6 +108,29 @@ events for `sealed_through + 1` at once, without running a step.
   This way one frozen game, or a client that stops reporting, cannot stop a
   room for good. The member rejoins the pacing set by catching up; nobody is
   kicked. Pausing restarts every member's stall timer.
+
+**Playout.** A game does not run steps the moment they are sealed. It plays
+at the room's pace behind a jitter buffer of its own
+(`tpf3mp_agent::Playout`):
+
+- **Schedule.** Each step plays a small margin after the latest arrival of
+  the frontier seen recently, carried forward at the room's pace.
+- **Poor links.** A late turn, from jitter or a retransmission after loss,
+  grows the buffer for a while. Afterwards the client converges back by
+  playing 5% faster.
+- **Catching up.** A client more than a second behind its schedule plays at
+  once. This is how it catches up after reconnecting.
+- **Pausing.** A client plays on to the frontier, which the pause freezes.
+  Every client therefore pauses at the same step, and events sent while
+  paused apply at once.
+- **Speed changes.** Steps already sealed keep playing evenly from the last
+  one played.
+
+What players feel on their own commands is their round trip, plus their own
+buffer, plus the wait for the next turn. It is not the room's input delay,
+and not anyone else's link: a poor connection only delays its owner. Paced
+bots over 150 ms round trips with jitter feel a median of about 220 ms,
+whether the input delay is 60 or 500 ms.
 
 ## Game messages from the client
 
