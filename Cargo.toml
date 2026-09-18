@@ -14,6 +14,7 @@ publish = false
 tpf3mp-proto = { path = "crates/tpf3mp-proto" }
 tpf3mp-net = { path = "crates/tpf3mp-net" }
 tpf3mp-agent = { path = "crates/tpf3mp-agent" }
+tpf3mp-server = { path = "crates/tpf3mp-server" }
 
 anyhow = "1.0.104"
 base64 = "0.23.1"
