@@ -1,0 +1,11 @@
+# Clippy reads the nearest clippy.toml only, so the workspace settings are
+# repeated here.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "iteration order differs between runs; use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order differs between runs; use BTreeSet" },
+  { path = "std::time::Instant", reason = "canonical code must not read clocks; use simulation steps" },
+  { path = "std::time::SystemTime", reason = "canonical code must not read clocks; use simulation steps" },
+]

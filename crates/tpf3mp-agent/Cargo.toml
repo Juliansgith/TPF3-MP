@@ -1,0 +1,22 @@
+[package]
+name = "tpf3mp-agent"
+description = "The TPF3-MP client daemon that runs next to the game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+quinn.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tpf3mp-net.workspace = true
+tpf3mp-proto.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
