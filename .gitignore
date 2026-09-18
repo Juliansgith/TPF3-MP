@@ -9,3 +9,6 @@
 
 # Agent worktrees created by Claude Code.
 /.claude/worktrees/
+
+# Python environments for the recon tools (docs/DAY_ONE.md).
+/.venv/
