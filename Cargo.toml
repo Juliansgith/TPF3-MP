@@ -31,6 +31,18 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1.0.9"
 
+# tpf3mp-snapshot
+tpf3mp-snapshot = { path = "crates/tpf3mp-snapshot" }
+blake3 = "1.8.7"
+fastcdc = "5.0.0"
+# Without default features proptest does not pull in rusty-fork and tempfile.
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+tempfile = "3.27.0"
+# Without default features zstd leaves out the dictionary builder and the
+# decoders for pre-1.0 frame formats. Chunks arrive from untrusted peers, and
+# the legacy decoders would only widen what they can reach.
+zstd = { version = "0.14.0", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"

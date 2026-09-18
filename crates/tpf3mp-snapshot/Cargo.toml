@@ -1,0 +1,24 @@
+[package]
+name = "tpf3mp-snapshot"
+description = "Content-addressed, deduplicated storage and transfer planning for TPF3-MP world saves"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3.workspace = true
+fastcdc.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
