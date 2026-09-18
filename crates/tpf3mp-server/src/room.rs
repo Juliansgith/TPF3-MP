@@ -3,7 +3,7 @@
 //! [`RoomHandle`]. The turn invariants it upholds are in `docs/PROTOCOL.md`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -51,6 +51,9 @@ const CHECKPOINT_DEADLINE: Duration = Duration::from_secs(30);
 const DECIDED_ROUNDS_KEPT: usize = 8;
 /// Undecided rounds at once; no client can make the server hold more.
 const MAX_OPEN_ROUNDS: usize = 64;
+/// Turns kept in memory for resuming: an hour at the default tick. A player
+/// away longer needs a world snapshot instead.
+const RESUME_WINDOW: usize = 36_000;
 
 /// The channels to one connection of a member.
 #[derive(Clone)]
@@ -241,7 +244,7 @@ enum Pace {
 
 enum Phase {
     Lobby,
-    Running(Game),
+    Running(Box<Game>),
 }
 
 struct Game {
@@ -254,9 +257,11 @@ struct Game {
     next_turn: u64,
     next_event: u64,
     pending: Vec<Event>,
-    /// Every turn so far, encoded, for members who resume. Bounded by
-    /// snapshots in a later milestone.
-    log: Vec<LoggedTurn>,
+    /// The most recent turns, encoded, for members who resume: at most
+    /// [`RESUME_WINDOW`] of them, starting with turn `log_first_turn`.
+    log: VecDeque<LoggedTurn>,
+    log_first_turn: u64,
+    resume_window: usize,
     last_tick: Instant,
     /// Checkpoint rounds by step.
     rounds: BTreeMap<u64, Round>,
@@ -392,7 +397,7 @@ impl Room {
                     EventBody::Command { .. } => {}
                 }
             }
-            game.log.push(LoggedTurn {
+            game.remember(LoggedTurn {
                 first_event,
                 frame: Arc::from(frame.as_slice()),
             });
@@ -441,7 +446,7 @@ impl Room {
                 password_tag: start.password_tag,
             },
             members,
-            phase: Phase::Running(game),
+            phase: Phase::Running(Box::new(game)),
             ruleset,
             tick,
             metrics,
@@ -743,7 +748,7 @@ impl Room {
                     .is_ok();
             }
         }
-        self.phase = Phase::Running(game);
+        self.phase = Phase::Running(Box::new(game));
         self.open_log();
         info!(room = %self.id, players = self.members.len(), "game started");
         metrics::increment(&self.metrics.games_started);
@@ -1130,7 +1135,9 @@ impl Game {
             next_turn: 1,
             next_event: 1,
             pending: Vec::new(),
-            log: Vec::new(),
+            log: VecDeque::new(),
+            log_first_turn: 1,
+            resume_window: RESUME_WINDOW,
             last_tick: Instant::now(),
             rounds: BTreeMap::new(),
         }
@@ -1198,7 +1205,7 @@ impl Game {
                 events,
             };
             let frame: Arc<[u8]> = encode_frame(&TurnMessage::Turn(turn), TURN_MAX_FRAME)?.into();
-            self.log.push(LoggedTurn {
+            self.remember(LoggedTurn {
                 first_event,
                 frame: Arc::clone(&frame),
             });
@@ -1210,8 +1217,19 @@ impl Game {
         Ok(frames)
     }
 
+    /// Keeps a sealed turn for resuming, dropping the oldest beyond the
+    /// window.
+    fn remember(&mut self, turn: LoggedTurn) {
+        self.log.push_back(turn);
+        if self.log.len() > self.resume_window {
+            self.log.pop_front();
+            self.log_first_turn += 1;
+        }
+    }
+
     /// The turn feed for a member resuming after `after_turn` (or from the
-    /// first turn).
+    /// first turn). Resuming before the window, or after a turn that does
+    /// not exist yet, is refused.
     fn resume_feed(
         &self,
         room: RoomId,
@@ -1219,11 +1237,12 @@ impl Game {
         after_turn: Option<u64>,
     ) -> Result<TurnFeed, RequestError> {
         let from = after_turn.map_or(1, |turn| turn.saturating_add(1));
-        if from > self.next_turn {
+        if from > self.next_turn || from < self.log_first_turn {
             return Err(RequestError::ResumeUnavailable);
         }
-        let skip = usize::try_from(from - 1).map_err(|_| RequestError::ResumeUnavailable)?;
-        let backlog = self.log.get(skip..).unwrap_or_default();
+        let skip = usize::try_from(from - self.log_first_turn)
+            .map_err(|_| RequestError::ResumeUnavailable)?;
+        let backlog: Vec<&LoggedTurn> = self.log.range(skip..).collect();
         // The first event the resumed stream will carry: from the backlog,
         // else from the events waiting for the next turn.
         let next_event = backlog.first().map_or_else(
@@ -1286,6 +1305,36 @@ impl TokenBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resuming_is_limited_to_the_window() {
+        let room = RoomId(FixedBytes([0; 16]));
+        let settings = RoomSettings::DEFAULT;
+        let mut game = Game::new(settings);
+        game.resume_window = 3;
+        for frontier in 1..=5 {
+            // Five empty turns, numbered 1 to 5; the window keeps 3 to 5.
+            game.seal(frontier).unwrap();
+        }
+        let feed = |after| game.resume_feed(room, settings, after);
+        assert!(matches!(feed(None), Err(RequestError::ResumeUnavailable)));
+        assert!(matches!(
+            feed(Some(1)),
+            Err(RequestError::ResumeUnavailable)
+        ));
+        let Ok(TurnFeed::Open { start, backlog }) = feed(Some(2)) else {
+            panic!("the window starts at turn 3");
+        };
+        assert_eq!((start.next_turn, backlog.len()), (3, 3));
+        let Ok(TurnFeed::Open { start, backlog }) = feed(Some(5)) else {
+            panic!("resuming at the head needs no backlog");
+        };
+        assert_eq!((start.next_turn, backlog.len()), (6, 0));
+        assert!(matches!(
+            feed(Some(6)),
+            Err(RequestError::ResumeUnavailable)
+        ));
+    }
 
     #[test]
     fn token_bucket_allows_a_burst_then_the_rate() {
