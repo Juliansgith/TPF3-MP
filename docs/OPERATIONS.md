@@ -1,0 +1,111 @@
+# Operations
+
+How to run `tpf3mp-server` on a Linux host, starting with the German server
+that already runs `tf2mp-relay`. The deployment mirrors the relay's
+hardened container profile.
+
+## What the server needs
+
+- **UDP port 29470** open to the internet: players connect with QUIC.
+  Nothing else needs to be public.
+- **A TLS certificate** for a hostname that points at the server, such as
+  `tpf3mp.<ip>.sslip.io`. Agents verify it against public certificate
+  authorities, exactly as a browser would.
+- **A data volume** for the invite key (`/data/invite.key`). Back it up:
+  losing it invalidates every invite.
+
+## First deployment
+
+1. Point a hostname at the server, and open the port:
+   `ufw allow 29470/udp`.
+2. Get a certificate for that hostname (see [Certificates](#certificates)).
+   Place `fullchain.pem` and `privkey.pem` in `deploy/certs/`, readable by
+   UID 65532, the image's non-root user:
+   ```sh
+   sudo chown 65532:65532 deploy/certs/*.pem
+   sudo chmod 0440 deploy/certs/*.pem
+   ```
+3. Build and start the server:
+   ```sh
+   cd deploy && docker compose up -d --build
+   ```
+4. Check it from any machine:
+   ```sh
+   tpf3mp-agent connect tpf3mp.example.org:29470
+   ```
+   This prints the server version, a session ID and the round trip.
+
+## Certificates
+
+The server reads its certificate at start. After a renewal, restart it:
+`docker compose restart`. Two options:
+
+- **certbot.** Use `certbot certonly --standalone -d <host>` while port 80
+  is free, or `--webroot` behind the existing reverse proxy. Add a deploy
+  hook that copies the renewed files into `deploy/certs/`, fixes their owner
+  and restarts the container.
+- **Reuse the existing Caddy.** Add the hostname to the Caddyfile so Caddy
+  obtains the certificate, then copy it from Caddy's storage
+  (`certificates/acme-v02.api.letsencrypt.org-directory/<host>/`) with a
+  small scheduled job. Caddy's files are root-only, so a copy with the right
+  owner is required; do not mount them directly.
+
+For local development, `--dev-self-signed <file>` writes a throwaway
+certificate that agents pin with `--pin-cert <file>`.
+
+## Monitoring
+
+- **Metrics.** `http://127.0.0.1:9470/metrics` serves Prometheus text on the
+  host: sessions and rooms now, plus counters for handshakes refused,
+  protocol violations, turns sealed, events ordered, intents refused,
+  divergences and slow consumers.
+- **Health.** `/healthz` returns `ok`.
+- **Logs.** Logs go to stdout (`docker compose logs -f`) and never contain
+  IP addresses or invite tokens. `RUST_LOG=debug` adds per-connection
+  refusals; `RUST_LOG=tpf3mp_server=debug,quinn=warn` narrows it.
+
+A rise in `divergences_total` means replicas disagree with verdicts: look
+at the platforms involved. A rise in `slow_consumers_total` means clients
+cannot keep up with their turn streams.
+
+## Upgrades
+
+Every player must run the server's protocol version. The handshake tells
+players on another version which side to update. To upgrade:
+
+```sh
+git pull && cd deploy && docker compose up -d --build
+```
+
+The old container gets SIGTERM and closes every session with
+`SHUTTING_DOWN`. **Rooms are held in memory until room persistence lands,
+so an upgrade ends running games.** Announce restarts to players.
+
+## Capacity
+
+Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and
+400 bot clients in the same process:
+
+- 50 rooms of 8 players;
+- 1,000 steps at 50 steps per second;
+- 229,000 events applied across replicas;
+- no divergence;
+- p99 command latency 112 ms on loopback.
+
+Repeat against the real host after deploying:
+
+```sh
+cargo run --release -p tpf3mp-testkit --bin tpf3mp-loadtest -- \
+    --server tpf3mp.example.org:29470 --rooms 20 --bots 8
+```
+
+## Security notes
+
+- The container runs as a non-root user with a read-only root filesystem,
+  every Linux capability dropped, `no-new-privileges`, and limits on PIDs,
+  memory and CPU. It mounts only its certificates (read-only) and its own
+  data volume.
+- The admin endpoint has no authentication. The compose file publishes it
+  on the host's loopback only.
+- Rotate the invite key only deliberately: every existing invite stops
+  working.

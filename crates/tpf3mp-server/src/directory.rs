@@ -13,6 +13,7 @@ use tpf3mp_proto::{
 };
 
 use crate::{
+    metrics::{self, Metrics},
     room::{NewMember, ROOM_QUEUE, Room, RoomHandle, RoomSecrets, RoomSpec},
     ruleset::RulesetFactory,
 };
@@ -23,6 +24,7 @@ pub(crate) struct Directory {
     key: hmac::Key,
     ruleset: RulesetFactory,
     tick: Duration,
+    metrics: Arc<Metrics>,
 }
 
 impl Directory {
@@ -31,6 +33,7 @@ impl Directory {
         max_rooms: usize,
         ruleset: RulesetFactory,
         tick: Duration,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             rooms: Mutex::default(),
@@ -38,6 +41,7 @@ impl Directory {
             key: hmac::Key::new(hmac::HMAC_SHA256, secret),
             ruleset,
             tick,
+            metrics,
         }
     }
 
@@ -78,6 +82,7 @@ impl Directory {
                 secrets,
                 ruleset: (self.ruleset)(),
                 tick: self.tick,
+                metrics: Arc::clone(&self.metrics),
             },
             owner,
         );
@@ -86,6 +91,7 @@ impl Directory {
         let handle = RoomHandle::new(commands);
         rooms.insert(id, handle.clone());
         drop(rooms);
+        metrics::increment(&self.metrics.rooms_created);
         tokio::spawn(room.run(receiver, Arc::clone(self)));
         Ok((handle, Invite { room: id, token }, view))
     }

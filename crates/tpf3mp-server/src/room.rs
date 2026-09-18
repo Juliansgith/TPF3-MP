@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     directory::Directory,
+    metrics::{self, Metrics},
     pacing::Pacer,
     ruleset::Ruleset,
     verdict::{self, Report, Verdict},
@@ -277,6 +278,7 @@ pub(crate) struct Room {
     phase: Phase,
     ruleset: Box<dyn Ruleset>,
     tick: Duration,
+    metrics: Arc<Metrics>,
     closed: bool,
 }
 
@@ -288,6 +290,7 @@ pub(crate) struct RoomSpec {
     pub(crate) secrets: RoomSecrets,
     pub(crate) ruleset: Box<dyn Ruleset>,
     pub(crate) tick: Duration,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl Room {
@@ -303,6 +306,7 @@ impl Room {
             phase: Phase::Lobby,
             ruleset: spec.ruleset,
             tick: spec.tick,
+            metrics: spec.metrics,
             closed: false,
         };
         room.members.push(Member::new(owner));
@@ -593,6 +597,7 @@ impl Room {
         }
         self.phase = Phase::Running(game);
         info!(room = %self.id, players = self.members.len(), "game started");
+        metrics::increment(&self.metrics.games_started);
         Ok(())
     }
 
@@ -636,6 +641,7 @@ impl Room {
             }
         };
         if let Some(reason) = rejection {
+            metrics::increment(&self.metrics.intents_refused);
             self.push(index, ServerMessage::IntentRejected { client_seq, reason });
         }
     }
@@ -771,6 +777,7 @@ impl Room {
     fn announce_divergence(&mut self, step: u64, notices: Vec<(PlayerId, Vec<u16>)>) {
         for (player, lanes) in notices {
             warn!(room = %self.id, %player, step, ?lanes, "replica diverged from the verdict");
+            metrics::increment(&self.metrics.divergences);
             if let Some(index) = self.members.iter().position(|m| m.player == player) {
                 self.push(index, ServerMessage::Diverged { step, lanes });
             }
@@ -794,8 +801,13 @@ impl Room {
         {
             return;
         }
+        let ordered = game.pending.len() as u64;
         let frames = match game.seal(frontier) {
-            Ok(frames) => frames,
+            Ok(frames) => {
+                metrics::add(&self.metrics.events_ordered, ordered);
+                metrics::add(&self.metrics.turns_sealed, frames.len() as u64);
+                frames
+            }
             Err(error) => {
                 // Unreachable with the payload budget; fail closed if it
                 // happens rather than send a partial log.
@@ -840,6 +852,7 @@ impl Room {
         if let Some(link) = member.link.take() {
             if slow {
                 debug!(room = %self.id, player = %member.player, "disconnecting a slow consumer");
+                metrics::increment(&self.metrics.slow_consumers);
                 link.connection
                     .close(close::SLOW_CONSUMER, b"not reading fast enough");
             }

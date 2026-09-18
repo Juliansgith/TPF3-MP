@@ -24,13 +24,25 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
 
 ## Status
 
-**Milestone M0: foundations.**
+**Milestone M1: the core netcode, tested without the game.**
 
-- **Done:** workspace and CI on Windows, Linux and macOS; the wire protocol's
-  version preamble and framing; a QUIC/TLS 1.3 server and client that
-  complete a handshake; determinism guardrails for the canonical rules.
-- **Next, M1:** rooms, the sequencer and turn seals, the canonical economy
-  port, and a test kit with a toy game, bots and a network emulator.
+- **Protocol.** QUIC with TLS 1.3, per-install Ed25519 identities proven
+  against the TLS session, and a version preamble frozen for good.
+- **Rooms.** HMAC-tagged invites and optional passwords, a lobby with
+  readiness and content fingerprints, owner hand-over.
+- **Sequencer.** Hard lockstep turns. A server-owned clock holds for players
+  who are loading or slow. Pause, speed, exact resume after a reconnect.
+- **Protection.** Checkpoint verdicts that single out a diverged replica,
+  rate limits, bounded queues, and eviction of slow consumers.
+- **Test kit.** A toy game whose canonical rules run on the server, bots
+  that play it through the real client, a lossy-network emulator and a load
+  tester. 8 bots over a 150 ms, 2%-loss link agree on every lane, and 400
+  bots in 50 rooms run without a divergence.
+- **Operations.** Prometheus metrics, a hardened container image and a
+  deployment runbook.
+
+**In progress:** porting the TPF2MP economy, a snapshot store for hot-join
+and rebasing, the in-game hook and IPC, the release-day RE kit.
 
 ## Layout
 
@@ -38,10 +50,12 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
 |---|---|
 | `crates/tpf3mp-proto` | Wire messages, framing and limits. |
 | `crates/tpf3mp-canon` | Canonical rules. Integer arithmetic only, enforced by lints. |
-| `crates/tpf3mp-net` | QUIC endpoints, TLS configuration, framed stream I/O. |
-| `crates/tpf3mp-server` | The dedicated server. |
-| `crates/tpf3mp-agent` | The client daemon that runs next to the game. |
-| `docs/` | Architecture, decisions, release-day plan. |
+| `crates/tpf3mp-net` | QUIC endpoints, TLS configuration, identities, framed stream I/O. |
+| `crates/tpf3mp-server` | The dedicated server: rooms, sequencer, verdicts, metrics. |
+| `crates/tpf3mp-agent` | The client library and CLI that run next to the game. |
+| `crates/tpf3mp-testkit` | Toy game, bots, network emulator, load tester. |
+| `deploy/` | Container image and compose file. |
+| `docs/` | Architecture, protocol, decisions, operations, release-day plan. |
 
 ## Development
 
@@ -61,7 +75,21 @@ cargo run -p tpf3mp-agent -- connect 127.0.0.1:29470 --pin-cert runtime/dev-cert
 ```
 
 In production, the server takes a real certificate (`--cert`, `--key`), and
-agents verify it against the public certificate authorities.
+agents verify it against the public certificate authorities. See
+[docs/OPERATIONS.md](docs/OPERATIONS.md) for deployment.
+
+Try a room by hand with two agents:
+
+```sh
+cargo run -p tpf3mp-agent -- host 127.0.0.1:29470 --pin-cert runtime/dev-cert.der --name ann
+cargo run -p tpf3mp-agent -- join 127.0.0.1:29470 <invite> --pin-cert runtime/dev-cert.der --name bob
+```
+
+Load-test a server with bots:
+
+```sh
+cargo run --release -p tpf3mp-testkit --bin tpf3mp-loadtest -- --rooms 50 --bots 8
+```
 
 ## License
 

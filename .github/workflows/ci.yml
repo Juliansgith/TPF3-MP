@@ -26,3 +26,25 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  image:
+    name: server image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the server image
+        run: docker buildx build --file deploy/Dockerfile --tag tpf3mp-server:ci --load .
+      - name: The image starts and serves the admin endpoint
+        run: |
+          mkdir -p /tmp/tpf3mp && chmod 0777 /tmp/tpf3mp
+          docker run -d --name tpf3mp --read-only --cap-drop ALL \
+            -p 127.0.0.1:9470:9470 -v /tmp/tpf3mp:/data tpf3mp-server:ci \
+            --listen 0.0.0.0:29470 --dev-self-signed /data/dev.der \
+            --secret-file /data/invite.key --admin-listen 0.0.0.0:9470
+          for attempt in $(seq 1 20); do
+            curl -sf http://127.0.0.1:9470/healthz && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9470/metrics | grep tpf3mp_sessions
+          docker logs tpf3mp

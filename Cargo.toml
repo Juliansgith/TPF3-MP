@@ -31,7 +31,7 @@ ring = "0.17.14"
 rustls ={ version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync", "fs"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync", "fs", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1.0.9"

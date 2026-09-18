@@ -1,8 +1,10 @@
 //! The TPF3-MP dedicated server: handshake and identity, rooms, and the
 //! turn sequencer. The protocol is specified in `docs/PROTOCOL.md`.
 
+mod admin;
 mod connection;
 mod directory;
+mod metrics;
 mod pacing;
 mod room;
 mod ruleset;
@@ -15,8 +17,14 @@ use tokio::sync::Semaphore;
 use tpf3mp_net::{ServerIdentity, TlsError, close};
 use tpf3mp_proto::Text;
 
-use crate::directory::Directory;
-pub use crate::ruleset::{AcceptAll, Ruleset, RulesetFactory};
+pub use crate::{
+    admin::serve_admin,
+    ruleset::{AcceptAll, Ruleset, RulesetFactory},
+};
+use crate::{
+    directory::Directory,
+    metrics::{Gauges, Metrics},
+};
 
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -79,9 +87,11 @@ pub enum ServerError {
 /// State shared by every connection.
 pub(crate) struct Shared {
     pub(crate) sessions: Arc<Semaphore>,
+    pub(crate) max_sessions: usize,
     pub(crate) handshake_timeout: Duration,
     pub(crate) directory: Arc<Directory>,
     pub(crate) server_version: Text<64>,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 pub struct Server {
@@ -93,17 +103,21 @@ impl Server {
     pub fn bind(config: ServerConfig) -> Result<Self, ServerError> {
         let quic = tpf3mp_net::server_config(config.identity)?;
         let endpoint = quinn::Endpoint::server(quic, config.listen)?;
+        let metrics = Arc::new(Metrics::default());
         let shared = Arc::new(Shared {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
+            max_sessions: config.max_sessions,
             handshake_timeout: config.handshake_timeout,
             directory: Arc::new(Directory::new(
                 &config.secret,
                 config.max_rooms,
                 config.ruleset,
                 config.tick,
+                Arc::clone(&metrics),
             )),
             server_version: Text::new(env!("CARGO_PKG_VERSION"))
                 .expect("the crate version is short printable text"),
+            metrics,
         });
         Ok(Self { endpoint, shared })
     }
@@ -146,5 +160,17 @@ pub struct ServerStats {
 impl ServerStats {
     pub fn rooms(&self) -> usize {
         self.shared.directory.len()
+    }
+
+    pub fn sessions(&self) -> usize {
+        self.shared.max_sessions - self.shared.sessions.available_permits()
+    }
+
+    /// Every counter and gauge in the Prometheus text format.
+    pub fn render_metrics(&self) -> String {
+        self.shared.metrics.render(&Gauges {
+            sessions: self.sessions(),
+            rooms: self.rooms(),
+        })
     }
 }

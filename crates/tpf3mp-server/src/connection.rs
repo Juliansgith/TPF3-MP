@@ -24,7 +24,7 @@ use tpf3mp_proto::{
 use tracing::{debug, info};
 
 use crate::{
-    Shared,
+    Shared, metrics,
     room::{MemberLink, NewMember, Reply, RoomCommand, RoomHandle, TurnFeed},
 };
 
@@ -55,11 +55,13 @@ pub(crate) async fn serve(incoming: quinn::Incoming, shared: Arc<Shared>) {
             Ok(Ok(admitted)) => admitted,
             Ok(Err(refusal)) => {
                 debug!(connection = connection_id, %refusal, "handshake refused");
+                metrics::increment(&shared.metrics.handshakes_refused);
                 refusal.close(&connection);
                 return;
             }
             Err(_) => {
                 debug!(connection = connection_id, "handshake timed out");
+                metrics::increment(&shared.metrics.handshakes_refused);
                 connection.close(close::HANDSHAKE_TIMEOUT, b"handshake timed out");
                 return;
             }
@@ -79,6 +81,7 @@ pub(crate) async fn serve(incoming: quinn::Incoming, shared: Arc<Shared>) {
         platform = ?hello.platform,
         "session started"
     );
+    metrics::increment(&shared.metrics.sessions_opened);
     Client::new(connection.clone(), shared, hello)
         .run(send, recv)
         .await;
@@ -238,6 +241,7 @@ impl Client {
         let turn_writer = tokio::spawn(write_turns(self.connection.clone(), turns));
         if let Err(violation) = self.serve(&mut recv).await {
             debug!(player = %self.player, %violation, "closing a client that broke the protocol");
+            metrics::increment(&self.shared.metrics.protocol_violations);
             self.connection
                 .close(close::PROTOCOL_VIOLATION, b"protocol violation");
         }
