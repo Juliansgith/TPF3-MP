@@ -1,0 +1,70 @@
+# TPF3-MP script_api_dump -- state: engine
+# Read-only probe. Written once per Lua state. All values measured at runtime.
+
+## Sandbox
+_VERSION = Lua 5.2
+globals: io=table os=table require=function package=table debug=table load=function loadstring=nil collectgarbage=function
+dialect markers: unpack=nil table.unpack=function bit32=table goto(compiles)=yes
+  os = table { time:function, clock:function, date:function, getenv:function, setenv:nil, remove:function, rename:function, tmpname:function, difftime:function, execute:function, exit:function, setlocale:function }
+  io = table { open:function, lines:function, read:function, write:function, close:function, type:function, input:function, output:function, popen:function, tmpfile:function }
+require('missing') -> error(expected): module 'probe/does_not_exist_probe' not found: 	no field package.preload['probe/does_not_exist_probe'] 	no file 'C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\lua\probe/does_not_exist_probe.l
+package.path = C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\lua\?.lua;C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\lua\?\init.lua;C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\?.lua;C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\?\init.lua;.\?.lua
+package.cpath = C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\?.dll;C:\Users\Sepgi\AppData\Local\Programs\Python\Python312\loadall.dll;.\?.dll
+
+## Number formatting
+string.format('%.17g', 0.1)      = 0.10000000000000001
+string.format('%.17g', 1/3)      = 0.33333333333333331
+string.format('%.17g', 2^53)     = 9007199254740992
+tie rounding %.0f: 0.5=0 1.5=2 2.5=2 3.5=4 (half-even => 0,2,2,4)
+integer div behaviour: 7/2=3.5  math.floor(7/2)=3  5%3=2
+
+## math.random
+NOTE: RNG state is per-VM. These document behaviour, not a shared stream.
+math.random() x5 (unseeded)              = 0.001251, 0.563585, 0.193304, 0.808741, 0.585009
+after randomseed(1): math.random() x5    = 0.563585, 0.193304, 0.808741, 0.585009, 0.479873
+after randomseed(1): math.random(6) x10  = 4, 2, 5, 4, 3, 3, 6, 5, 5, 2
+
+## pairs() order for string keys
+NOTE: Lua makes no ordering guarantee for pairs(); this records what THIS
+build does. Lockstep code must never depend on it (sort keys instead).
+run 1: mike,november,alpha,zebra,echo,oscar,delta,charlie,bravo,yankee
+stable across 5 constructions in this state: true
+
+## pairs() order for string keys
+NOTE: Lua makes no ordering guarantee for pairs(); this records what THIS
+build does. Lockstep code must never depend on it (sort keys instead).
+run 1: mike,november,alpha,zebra,echo,oscar,delta,charlie,bravo,yankee
+stable across 5 constructions in this state: true
+
+## api.* tree (depth 3)
+api : table(2 keys)
+  engine : table(5 keys)
+    entityExists : fn
+    forEachEntityWithComponent : fn
+    getComponent : fn
+    system : table(3 keys)
+      simPersonSystem : table
+      streetSystem : table
+      townBuildingSystem : table
+    util : table(1 keys)
+      getPlayer : fn
+  type : table(1 keys)
+    ComponentType : table(8 keys)
+      ACCOUNT : str
+      BASE_EDGE : str
+      BASE_NODE : str
+      CONSTRUCTION : str
+      PLAYER : str
+      SIM_PERSON : str
+      TOWN : str
+      TRANSPORT_VEHICLE : str
+
+## game.interface.* tree (depth 3)
+game.interface : table(3 keys)
+  getEntities : fn
+  getEntity : fn
+  getGameTime : fn
+
+## api.cmd.make.* factories
+api.cmd.make is absent
+

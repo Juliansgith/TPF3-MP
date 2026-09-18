@@ -1,0 +1,14 @@
+﻿ELF x86_64:
+  PASS arch is x86_64
+  PASS found the __PRETTY_FUNCTION__ string
+  PASS named GameSim::Step via rip-relative reference
+  PASS attributed to gamesim.cpp
+ELF arm64:
+  PASS arch is aarch64
+  PASS named GameSim::Step via ADRP+ADD reference
+Mach-O arm64:
+  PASS parsed as Mach-O aarch64
+  PASS survey has the macOS code-signature section
+  PASS survey emits the codesign command when entitlements are unreadable
+
+SELFTEST PASSED: ELF x86_64 / ELF arm64 / Mach-O arm64 paths OK

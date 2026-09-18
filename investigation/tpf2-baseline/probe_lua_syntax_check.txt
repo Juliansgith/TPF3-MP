@@ -1,0 +1,7 @@
+﻿OK    C:\Users\Sepgi\Desktop\Transport fever modding\TPF3-MP\.claude\worktrees\agent-afdfe756f9164a8c0\tools\probe\determinism_probe\mod.lua (5.2)  [5.1 ok]
+OK    C:\Users\Sepgi\Desktop\Transport fever modding\TPF3-MP\.claude\worktrees\agent-afdfe756f9164a8c0\tools\probe\determinism_probe\res\config\game_script\determinism_probe.lua (5.2)  [5.1 ok]
+OK    C:\Users\Sepgi\Desktop\Transport fever modding\TPF3-MP\.claude\worktrees\agent-afdfe756f9164a8c0\tools\probe\determinism_probe\res\scripts\probe\stablehash.lua (5.2)  [5.1 ok]
+OK    C:\Users\Sepgi\Desktop\Transport fever modding\TPF3-MP\.claude\worktrees\agent-afdfe756f9164a8c0\tools\probe\script_api_dump\mod.lua (5.2)  [5.1 ok]
+OK    C:\Users\Sepgi\Desktop\Transport fever modding\TPF3-MP\.claude\worktrees\agent-afdfe756f9164a8c0\tools\probe\script_api_dump\res\config\game_script\script_api_dump.lua (5.2)  [5.1 ok]
+
+PASS: 5 file(s) checked under Lua 5.2
