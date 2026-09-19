@@ -719,7 +719,6 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
 /// disables its own keep-alive and still holds the slot past the 30 s idle
 /// timeout.
 #[tokio::test]
-#[ignore = "security PoC: fails until idle sessions are evicted; takes 40 s"]
 async fn an_idle_session_does_not_hold_a_slot_forever() {
     let server = RunningServer::start(|config| config.max_sessions = 1).await;
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();

@@ -11,7 +11,10 @@ use std::{
 
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::{
+    sync::{OwnedSemaphorePermit, mpsc},
+    time::Instant,
+};
 use tpf3mp_net::{
     NetError, close, read_message, read_preamble, verify_proof, write_frame, write_message,
     write_preamble,
@@ -24,7 +27,9 @@ use tpf3mp_proto::{
 use tracing::{debug, info};
 
 use crate::{
-    Shared, metrics,
+    Shared,
+    admission::{self, Handshake},
+    metrics,
     room::{MemberLink, NewMember, Reply, RoomCommand, RoomHandle, TurnFeed},
 };
 
@@ -39,7 +44,7 @@ const TURN_QUEUE: usize = 1024;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) async fn serve(incoming: quinn::Incoming, shared: Arc<Shared>) {
+pub(crate) async fn serve(incoming: quinn::Incoming, ticket: Handshake, shared: Arc<Shared>) {
     let connection = match incoming.await {
         Ok(connection) => connection,
         Err(error) => {
@@ -49,27 +54,31 @@ pub(crate) async fn serve(incoming: quinn::Incoming, shared: Arc<Shared>) {
     };
     // Addresses stay out of the logs; the stable ID correlates log lines.
     let connection_id = connection.stable_id();
-    let admitted =
-        match tokio::time::timeout(shared.handshake_timeout, handshake(&connection, &shared)).await
-        {
-            Ok(Ok(admitted)) => admitted,
-            Ok(Err(refusal)) => {
-                debug!(connection = connection_id, %refusal, "handshake refused");
-                metrics::increment(&shared.metrics.handshakes_refused);
-                refusal.close(&connection);
-                return;
-            }
-            Err(_) => {
-                debug!(connection = connection_id, "handshake timed out");
-                metrics::increment(&shared.metrics.handshakes_refused);
-                connection.close(close::HANDSHAKE_TIMEOUT, b"handshake timed out");
-                return;
-            }
-        };
+    let admitted = match tokio::time::timeout(
+        shared.handshake_timeout,
+        handshake(&connection, ticket, &shared),
+    )
+    .await
+    {
+        Ok(Ok(admitted)) => admitted,
+        Ok(Err(refusal)) => {
+            debug!(connection = connection_id, %refusal, "handshake refused");
+            metrics::increment(&shared.metrics.handshakes_refused);
+            refusal.close(&connection);
+            return;
+        }
+        Err(_) => {
+            debug!(connection = connection_id, "handshake timed out");
+            metrics::increment(&shared.metrics.handshakes_refused);
+            connection.close(close::HANDSHAKE_TIMEOUT, b"handshake timed out");
+            return;
+        }
+    };
     let Admitted {
         hello,
         session_id,
         slot,
+        address_share,
         send,
         recv,
     } = admitted;
@@ -85,8 +94,12 @@ pub(crate) async fn serve(incoming: quinn::Incoming, shared: Arc<Shared>) {
     Client::new(connection.clone(), shared, hello)
         .run(send, recv)
         .await;
+    // The client may end its control stream and keep the connection; the
+    // session is over either way.
+    connection.close(close::NORMAL, b"session ended");
     let reason = connection.closed().await;
     info!(session = %session_id, %reason, "session ended");
+    drop(address_share);
     drop(slot);
 }
 
@@ -94,6 +107,7 @@ struct Admitted {
     hello: Hello,
     session_id: SessionId,
     slot: OwnedSemaphorePermit,
+    address_share: admission::Session,
     send: SendStream,
     recv: RecvStream,
 }
@@ -105,6 +119,8 @@ enum Refusal {
     VersionMismatch(u32),
     #[error("no free session slot")]
     ServerFull,
+    #[error("the address holds its share of sessions")]
+    TooManyConnections,
     #[error("the identity proof did not verify")]
     BadProof,
     #[error("the client broke the protocol: {0}")]
@@ -120,6 +136,7 @@ impl Refusal {
         let (code, reason): (quinn::VarInt, &[u8]) = match self {
             Self::VersionMismatch(_) => (close::VERSION_MISMATCH, b"protocol version mismatch"),
             Self::ServerFull => (close::REJECTED, b"server full"),
+            Self::TooManyConnections => (close::REJECTED, b"too many connections"),
             Self::BadProof => (close::REJECTED, b"identity not verified"),
             Self::Violation(_) | Self::UnexpectedMessage => {
                 (close::PROTOCOL_VIOLATION, b"protocol violation")
@@ -130,7 +147,11 @@ impl Refusal {
     }
 }
 
-async fn handshake(connection: &quinn::Connection, shared: &Shared) -> Result<Admitted, Refusal> {
+async fn handshake(
+    connection: &quinn::Connection,
+    ticket: Handshake,
+    shared: &Shared,
+) -> Result<Admitted, Refusal> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let client_protocol = read_preamble(&mut recv).await?;
     // Always answer with our version, so the client can say which side is old.
@@ -150,6 +171,10 @@ async fn handshake(connection: &quinn::Connection, shared: &Shared) -> Result<Ad
         reject(&mut send, RejectReason::ServerFull).await?;
         return Err(Refusal::ServerFull);
     };
+    let Some(address_share) = ticket.into_session() else {
+        reject(&mut send, RejectReason::TooManyConnections).await?;
+        return Err(Refusal::TooManyConnections);
+    };
     let session_id = SessionId(random());
     let welcome = ServerMessage::Welcome(Welcome {
         server_version: shared.server_version.clone(),
@@ -160,6 +185,7 @@ async fn handshake(connection: &quinn::Connection, shared: &Shared) -> Result<Ad
         hello,
         session_id,
         slot,
+        address_share,
         send,
         recv,
     })
@@ -256,8 +282,27 @@ impl Client {
     }
 
     async fn serve(&mut self, recv: &mut RecvStream) -> Result<(), Violation> {
+        let mut roomless_since = None;
         loop {
-            let message = match read_message::<ClientMessage>(recv, CONTROL_MAX_FRAME).await {
+            let read = read_message::<ClientMessage>(recv, CONTROL_MAX_FRAME);
+            let read = if self.room.is_some() {
+                roomless_since = None;
+                read.await
+            } else {
+                // A session outside any room holds a slot for nothing, so it
+                // gets a deadline that requests do not extend.
+                let since = *roomless_since.get_or_insert_with(Instant::now);
+                match tokio::time::timeout_at(since + self.shared.roomless_timeout, read).await {
+                    Ok(read) => read,
+                    Err(_) => {
+                        debug!(player = %self.player, "closing a session idle outside any room");
+                        metrics::increment(&self.shared.metrics.idle_sessions_closed);
+                        self.connection.close(close::IDLE, b"idle outside a room");
+                        return Ok(());
+                    }
+                }
+            };
+            let message = match read {
                 Ok(message) => message,
                 Err(error) if error.is_disconnect() => return Ok(()),
                 Err(error) => return Err(Violation::Stream(error)),

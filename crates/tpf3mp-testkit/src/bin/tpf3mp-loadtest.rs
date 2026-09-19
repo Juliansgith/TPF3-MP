@@ -167,6 +167,10 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, LocalServe
     let mut config = ServerConfig::new("127.0.0.1:0".parse()?, identity);
     config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
     config.max_sessions = 100_000;
+    // Every bot connects from loopback, one address.
+    config.max_sessions_per_address = 100_000;
+    config.max_handshakes = 100_000;
+    config.max_handshakes_per_address = 100_000;
     let server = Server::bind(config)?;
     let mut address = server.local_addr()?;
     let task = tokio::spawn(server.run(std::future::pending()));

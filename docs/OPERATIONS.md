@@ -113,12 +113,18 @@ Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and
 - no divergence;
 - p99 command latency 112 ms on loopback.
 
-Repeat against the real host after deploying:
+Repeat against the real host after deploying. Every bot connects from the
+machine running the load test, so first raise that address's limits on the
+server, for example with `--max-sessions-per-address 1000
+--max-handshakes-per-address 1000`, and restore them afterwards:
 
 ```sh
 cargo run --release -p tpf3mp-testkit --bin tpf3mp-loadtest -- \
-    --server tpf3mp.example.org:29470 --rooms 20 --bots 8
+    --server tpf3mp.example.org:29470 --rooms 20 --bots 8 --paced
 ```
+
+`--paced` makes the bots play at the room's pace behind a jitter buffer, as
+games do, so the latencies it reports are the ones players would feel.
 
 ## Security notes
 
@@ -128,5 +134,14 @@ cargo run --release -p tpf3mp-testkit --bin tpf3mp-loadtest -- \
   data volume.
 - The admin endpoint has no authentication. The compose file publishes it
   on the host's loopback only.
+- One network address holds at most 8 sessions and 4 handshakes in progress
+  (`--max-sessions-per-address`, `--max-handshakes-per-address`). An IPv6
+  /64 counts as one address. A household or LAN party with more players
+  behind one address needs a higher limit.
+- Once half of the 256 handshake slots are busy, new clients must prove
+  their address with a QUIC retry, so spoofed packets cost nothing. The
+  `retries_sent` and `connections_refused` counters show when this happens.
+- A session that stays outside any room for 10 minutes is closed
+  (`idle_sessions_closed`).
 - Rotate the invite key only deliberately: every existing invite stops
   working.

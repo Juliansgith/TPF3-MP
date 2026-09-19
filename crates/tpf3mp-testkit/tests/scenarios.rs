@@ -33,6 +33,9 @@ impl TestServer {
         let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
         config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
         config.tick = Duration::from_millis(25);
+        // Every bot connects from loopback, one address.
+        config.max_sessions_per_address = 1000;
+        config.max_handshakes_per_address = 1000;
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();

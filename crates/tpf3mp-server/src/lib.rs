@@ -2,6 +2,7 @@
 //! turn sequencer. The protocol is specified in `docs/PROTOCOL.md`.
 
 mod admin;
+mod admission;
 mod connection;
 mod directory;
 mod metrics;
@@ -23,6 +24,7 @@ pub use crate::{
     ruleset::{AcceptAll, Ruleset, RulesetFactory},
 };
 use crate::{
+    admission::{Admission, Decision, Origin},
     directory::{Directory, DirectoryConfig},
     metrics::{Gauges, Metrics},
     room::{RoomEnv, Timeouts},
@@ -33,9 +35,21 @@ pub struct ServerConfig {
     pub identity: ServerIdentity,
     /// Sessions served at once. Clients beyond this receive `Reject(ServerFull)`.
     pub max_sessions: usize,
+    /// Sessions one address may hold (an IPv6 /64 counts as one address).
+    /// Clients beyond this receive `Reject(TooManyConnections)`.
+    pub max_sessions_per_address: usize,
+    /// Handshakes in progress at once. From half of this on, clients must
+    /// prove their address with a QUIC retry first; beyond it, connection
+    /// attempts are refused.
+    pub max_handshakes: usize,
+    /// Handshakes in progress from one address.
+    pub max_handshakes_per_address: usize,
     /// Time from connecting to a completed handshake. Slower clients are
     /// closed with `HANDSHAKE_TIMEOUT`, so idle sockets cannot pin resources.
     pub handshake_timeout: Duration,
+    /// A session that stays outside any room this long is closed with
+    /// `IDLE`, so idle connections cannot hold session slots.
+    pub roomless_timeout: Duration,
     /// Rooms hosted at once.
     pub max_rooms: usize,
     /// Key for the HMAC tags of invites and room passwords. An invite stays
@@ -66,7 +80,13 @@ impl ServerConfig {
             listen,
             identity,
             max_sessions: 4096,
+            // A household or a LAN party behind one address.
+            max_sessions_per_address: 8,
+            max_handshakes: 256,
+            max_handshakes_per_address: 4,
             handshake_timeout: Duration::from_secs(10),
+            // Time to browse invites and set up a game, not to hold a slot.
+            roomless_timeout: Duration::from_secs(600),
             max_rooms: 10_000,
             secret,
             ruleset: Arc::new(|| Box::new(AcceptAll)),
@@ -87,7 +107,14 @@ impl fmt::Debug for ServerConfig {
         f.debug_struct("ServerConfig")
             .field("listen", &self.listen)
             .field("max_sessions", &self.max_sessions)
+            .field("max_sessions_per_address", &self.max_sessions_per_address)
+            .field("max_handshakes", &self.max_handshakes)
+            .field(
+                "max_handshakes_per_address",
+                &self.max_handshakes_per_address,
+            )
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("roomless_timeout", &self.roomless_timeout)
             .field("max_rooms", &self.max_rooms)
             .field("tick", &self.tick)
             .field("data_dir", &self.data_dir)
@@ -107,7 +134,9 @@ pub enum ServerError {
 pub(crate) struct Shared {
     pub(crate) sessions: Arc<Semaphore>,
     pub(crate) max_sessions: usize,
+    pub(crate) admission: Arc<Admission>,
     pub(crate) handshake_timeout: Duration,
+    pub(crate) roomless_timeout: Duration,
     pub(crate) directory: Arc<Directory>,
     pub(crate) server_version: Text<64>,
     pub(crate) metrics: Arc<Metrics>,
@@ -144,7 +173,13 @@ impl Server {
         let shared = Arc::new(Shared {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             max_sessions: config.max_sessions,
+            admission: Admission::new(admission::Limits {
+                handshakes: config.max_handshakes.max(1),
+                handshakes_per_address: config.max_handshakes_per_address.max(1),
+                sessions_per_address: config.max_sessions_per_address.max(1),
+            }),
             handshake_timeout: config.handshake_timeout,
+            roomless_timeout: config.roomless_timeout,
             directory,
             server_version: Text::new(env!("CARGO_PKG_VERSION"))
                 .expect("the crate version is short printable text"),
@@ -173,13 +208,41 @@ impl Server {
                 () = &mut shutdown => break,
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else { break };
-                    tokio::spawn(connection::serve(incoming, Arc::clone(&self.shared)));
+                    self.admit(incoming);
                 }
             }
         }
         self.endpoint
             .close(close::SHUTTING_DOWN, b"server shutting down");
         self.endpoint.wait_idle().await;
+    }
+
+    fn admit(&self, incoming: quinn::Incoming) {
+        let origin = Origin::of(incoming.remote_address().ip());
+        let decision = self.shared.admission.on_attempt(
+            origin,
+            incoming.remote_address_validated(),
+            incoming.may_retry(),
+        );
+        match decision {
+            Decision::Accept(handshake) => {
+                tokio::spawn(connection::serve(
+                    incoming,
+                    handshake,
+                    Arc::clone(&self.shared),
+                ));
+            }
+            Decision::Retry => {
+                metrics::increment(&self.shared.metrics.retries_sent);
+                if incoming.retry().is_err() {
+                    tracing::debug!("could not ask a peer to retry");
+                }
+            }
+            Decision::Refuse => {
+                metrics::increment(&self.shared.metrics.connections_refused);
+                incoming.refuse();
+            }
+        }
     }
 }
 

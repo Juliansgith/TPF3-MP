@@ -59,6 +59,15 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     max_sessions: usize,
 
+    /// Sessions one network address may hold; an IPv6 /64 counts as one.
+    /// Raise it, with the next flag, to load-test from a single machine.
+    #[arg(long, default_value_t = 8)]
+    max_sessions_per_address: usize,
+
+    /// Handshakes one network address may have in progress at once.
+    #[arg(long, default_value_t = 4)]
+    max_handshakes_per_address: usize,
+
     /// Rooms hosted at once.
     #[arg(long, default_value_t = 10_000)]
     max_rooms: usize,
@@ -93,6 +102,8 @@ async fn main() -> Result<()> {
 
     let mut config = ServerConfig::new(args.listen, identity);
     config.max_sessions = args.max_sessions;
+    config.max_sessions_per_address = args.max_sessions_per_address;
+    config.max_handshakes_per_address = args.max_handshakes_per_address;
     config.max_rooms = args.max_rooms;
     config.data_dir = args.data_dir.clone();
     match &args.secret_file {

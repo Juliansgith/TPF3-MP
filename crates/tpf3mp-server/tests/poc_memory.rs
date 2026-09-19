@@ -115,18 +115,16 @@ fn persistent(dir: &Path, secret: [u8; 32]) -> impl FnOnce(&mut ServerConfig) {
     }
 }
 
-/// FINDING: the server's QUIC transport keeps quinn's defaults for receive
-/// buffers: 1.25 MB per stream, no connection-wide cap, and a 1.25 MB
-/// datagram buffer, with 8 bidirectional and 8 unidirectional streams
-/// allowed. The server never accepts unidirectional streams, never reads a
-/// second bidirectional stream and never reads datagrams, yet quinn buffers
-/// everything a peer sends on them until the connection closes, which the
-/// server's own keep-alive postpones forever. Any peer with a throwaway key
-/// pins about 20 MB per connection; `mem_limit: 2g` in `deploy/compose.yaml`
-/// is gone after about 100 connections (of the 4096 `max_sessions`).
+/// The counting allocator sees the whole process, so these tests take turns.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Review finding H3: with quinn's default receive buffers, a peer with a
+/// throwaway key pinned about 21 MiB per connection in streams and datagrams
+/// the server never reads. The server now grants a client its one control
+/// stream and nothing else, with small receive windows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "security PoC (demonstration, passes while the finding exists)"]
-async fn poc_unread_streams_pin_server_memory_per_connection() {
+async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
+    let _serial = SERIAL.lock().await;
     let server = RunningServer::start(|_| {}).await;
     {
         // Warm up allocations a first connection makes once.
@@ -155,66 +153,27 @@ async fn poc_unread_streams_pin_server_memory_per_connection() {
         .await
         .unwrap();
 
-    // quinn's default stream receive window: the most each stream accepts
-    // before the application reads.
-    const WINDOW: usize = 1_250_000;
-    let mut streams = Vec::new();
-    let mut receivers = Vec::new();
-    {
-        let chunk = vec![0x5a; WINDOW];
-        for _ in 0..8 {
-            let mut stream = connection.open_uni().await.unwrap();
-            stream.write_all(&chunk).await.unwrap();
-            stream.finish().unwrap();
-            streams.push(stream);
-        }
-        for _ in 0..7 {
-            let (mut stream, receiver) = connection.open_bi().await.unwrap();
-            stream.write_all(&chunk).await.unwrap();
-            stream.finish().unwrap();
-            streams.push(stream);
-            receivers.push(receiver);
-        }
-    }
-    // Every byte is acknowledged: the server holds it, unread.
-    for stream in &mut streams {
-        assert_eq!(stream.stopped().await.unwrap(), None);
-    }
-    let after_streams = live();
-    // Datagrams: quinn keeps up to 1.25 MB of them for a reader that never
-    // comes.
-    let size = connection.max_datagram_size().unwrap();
-    let mut sent = 0;
-    while sent < WINDOW {
-        connection
-            .send_datagram_wait(vec![0x5a; size].into())
+    let refused = Duration::from_millis(500);
+    assert!(
+        tokio::time::timeout(refused, connection.open_uni())
             .await
-            .unwrap();
-        sent += size;
-    }
+            .is_err(),
+        "no unidirectional streams"
+    );
+    assert!(
+        tokio::time::timeout(refused, connection.open_bi())
+            .await
+            .is_err(),
+        "no second bidirectional stream"
+    );
+    assert_eq!(connection.max_datagram_size(), None, "no datagrams");
     settle().await;
     let held = live().saturating_sub(before);
-    let from_streams = after_streams.saturating_sub(before);
 
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
-    settle().await;
-    let after_close = live().saturating_sub(before);
     server.shut_down().await;
-
-    println!(
-        "one connection pins {:.1} MiB in the server ({:.1} MiB from 15 unread streams, the \
-         rest from unread datagrams); {:.1} MiB after it closes. 100 such connections: {:.1} GiB",
-        mib(held as f64),
-        mib(from_streams as f64),
-        mib(after_close as f64),
-        mib(held as f64) * 100.0 / 1024.0,
-    );
-    assert!(held > 15 * 1024 * 1024, "held only {held} bytes");
-    assert!(
-        after_close < held / 4,
-        "the memory belonged to the connection"
-    );
+    assert!(held < 2 * 1024 * 1024, "one connection held {held} bytes");
 }
 
 /// FINDING: a room keeps every sealed turn in memory (`Game::log`) and on
@@ -227,6 +186,7 @@ async fn poc_unread_streams_pin_server_memory_per_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "security PoC (demonstration, passes while the finding exists)"]
 async fn poc_one_player_grows_server_memory_and_disk_without_bound() {
+    let _serial = SERIAL.lock().await;
     let dir = data_dir("growth");
     let secret = [9; 32];
     let server = RunningServer::start(persistent(&dir, secret)).await;

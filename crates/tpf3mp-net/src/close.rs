@@ -22,3 +22,5 @@ pub const SHUTTING_DOWN: VarInt = VarInt::from_u32(5);
 pub const SLOW_CONSUMER: VarInt = VarInt::from_u32(6);
 /// The same player connected again; this older connection was replaced.
 pub const REPLACED: VarInt = VarInt::from_u32(7);
+/// The session stayed outside any room for too long.
+pub const IDLE: VarInt = VarInt::from_u32(8);

@@ -18,6 +18,9 @@ pub(crate) struct Metrics {
     pub(crate) divergences: AtomicU64,
     pub(crate) slow_consumers: AtomicU64,
     pub(crate) stalls: AtomicU64,
+    pub(crate) connections_refused: AtomicU64,
+    pub(crate) retries_sent: AtomicU64,
+    pub(crate) idle_sessions_closed: AtomicU64,
 }
 
 /// Values measured at scrape time rather than counted.
@@ -36,7 +39,7 @@ pub(crate) fn add(counter: &AtomicU64, amount: u64) {
 
 impl Metrics {
     pub(crate) fn render(&self, gauges: &Gauges) -> String {
-        let counters: [(&str, &str, &AtomicU64); 11] = [
+        let counters: [(&str, &str, &AtomicU64); 14] = [
             (
                 "sessions_opened",
                 "Sessions that completed the handshake.",
@@ -79,6 +82,21 @@ impl Metrics {
                 "stalls",
                 "Members that stopped advancing and no longer hold their room.",
                 &self.stalls,
+            ),
+            (
+                "connections_refused",
+                "Connection attempts refused for too many handshakes in progress.",
+                &self.connections_refused,
+            ),
+            (
+                "retries_sent",
+                "Connection attempts asked to prove their address first, under load.",
+                &self.retries_sent,
+            ),
+            (
+                "idle_sessions_closed",
+                "Sessions closed for staying outside any room too long.",
+                &self.idle_sessions_closed,
             ),
         ];
         let mut out = String::new();

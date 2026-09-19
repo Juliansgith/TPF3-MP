@@ -10,11 +10,18 @@ use tpf3mp_proto::ALPN;
 
 /// A connection with no traffic, not even keep-alives, is dropped after this.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Clients send keep-alives to hold their NAT binding open. The server sends
+/// none, so a client that goes silent times out.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
-/// Streams each side may have open at once. The protocol needs a handful
-/// (control, turns, intents, bulk); anything beyond that is refused by QUIC
-/// flow control instead of costing server memory.
-const MAX_STREAMS: u32 = 8;
+/// How much unread data a client may send the server on its stream, and on
+/// the whole connection. The server reads its control stream as frames
+/// arrive, so these bound what a connection can make it hold without
+/// slowing honest clients.
+const SERVER_STREAM_WINDOW: u32 = 256 * 1024;
+const SERVER_CONNECTION_WINDOW: u32 = 512 * 1024;
+/// Turn streams the server may have open to a client at once. There is one
+/// per game the client enters; the rest leave room for one that is ending.
+const TURN_STREAMS: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -94,7 +101,7 @@ pub fn server_config(identity: ServerIdentity) -> Result<quinn::ServerConfig, Tl
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = QuicServerConfig::try_from(tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    config.transport_config(Arc::new(transport_config()));
+    config.transport_config(Arc::new(server_transport()));
     Ok(config)
 }
 
@@ -111,7 +118,7 @@ pub fn client_config(trust: ServerTrust) -> Result<quinn::ClientConfig, TlsError
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = QuicClientConfig::try_from(tls)?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
-    config.transport_config(Arc::new(transport_config()));
+    config.transport_config(Arc::new(client_transport()));
     Ok(config)
 }
 
@@ -119,14 +126,35 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn transport_config() -> quinn::TransportConfig {
-    let mut transport = quinn::TransportConfig::default();
+/// What a client may make the server hold. A client opens exactly one
+/// stream, the control stream, and sends no datagrams; anything else would
+/// only sit in the server's buffers unread.
+fn server_transport() -> quinn::TransportConfig {
+    let mut transport = base_transport();
     transport
-        .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("30 s is a valid QUIC idle timeout"),
-        ))
+        .max_concurrent_bidi_streams(1u32.into())
+        .max_concurrent_uni_streams(0u32.into())
+        .stream_receive_window(SERVER_STREAM_WINDOW.into())
+        .receive_window(SERVER_CONNECTION_WINDOW.into())
+        .datagram_receive_buffer_size(None);
+    transport
+}
+
+/// The server opens turn streams and nothing else.
+fn client_transport() -> quinn::TransportConfig {
+    let mut transport = base_transport();
+    transport
         .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
-        .max_concurrent_bidi_streams(MAX_STREAMS.into())
-        .max_concurrent_uni_streams(MAX_STREAMS.into());
+        .max_concurrent_bidi_streams(0u32.into())
+        .max_concurrent_uni_streams(TURN_STREAMS.into())
+        .datagram_receive_buffer_size(None);
+    transport
+}
+
+fn base_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("30 s is a valid QUIC idle timeout"),
+    ));
     transport
 }

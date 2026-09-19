@@ -245,6 +245,115 @@ async fn silent_client_is_dropped_after_the_handshake_timeout() {
 }
 
 #[tokio::test]
+async fn an_address_holds_only_its_share_of_sessions() {
+    let server = RunningServer::start(|config| config.max_sessions_per_address = 2).await;
+    let (first, _a) = connect(server.options(new_identity(), "ann"))
+        .await
+        .unwrap();
+    let (_second, _b) = connect(server.options(new_identity(), "bob"))
+        .await
+        .unwrap();
+    let error = connect(server.options(new_identity(), "eve"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ConnectError::Rejected(RejectReason::TooManyConnections)
+        ),
+        "{error}"
+    );
+    first.close().await;
+    // The share frees once the server has processed the close.
+    let deadline = Instant::now() + common::WAIT;
+    loop {
+        match connect(server.options(new_identity(), "eve")).await {
+            Ok((third, _events)) => {
+                third.close().await;
+                break;
+            }
+            Err(ConnectError::Rejected(RejectReason::TooManyConnections))
+                if Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("connect failed: {error}"),
+        }
+    }
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn an_address_has_only_so_many_handshakes_in_progress() {
+    let server = RunningServer::start(|config| config.max_handshakes_per_address = 1).await;
+    // Connected, but the handshake never goes further.
+    let (_endpoint, _pending) = server.raw_connection().await;
+    let error = connect(server.options(new_identity(), "ann"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConnectError::Connection(_)), "{error}");
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn under_load_a_client_proves_its_address_and_still_gets_in() {
+    let server = RunningServer::start(|config| config.max_handshakes = 2).await;
+    // One handshake in progress is half the capacity.
+    let (_endpoint, _pending) = server.raw_connection().await;
+    let (client, _events) = connect(server.options(new_identity(), "ann"))
+        .await
+        .unwrap();
+    let metrics = server.stats.render_metrics();
+    assert!(
+        metrics.contains("tpf3mp_retries_sent_total 1\n"),
+        "{metrics}"
+    );
+    client.close().await;
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn a_session_idle_outside_any_room_is_closed() {
+    let server = RunningServer::start(|config| {
+        config.roomless_timeout = Duration::from_millis(300);
+    })
+    .await;
+    let mut idle = server.client("idle").await;
+    let host = server.client("host").await;
+    host.client
+        .create_room(common::room("kept", common::FAST))
+        .await
+        .unwrap();
+    let reason = idle.closed().await;
+    assert_eq!(application_close_code(&reason), Some(close::IDLE));
+    // A member of a room is not idle.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    host.client.set_ready(true).await.unwrap();
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn the_server_ends_a_session_whose_control_stream_ended() {
+    let server = RunningServer::start(|_| {}).await;
+    let identity = new_identity();
+    let (_endpoint, connection) = server.raw_connection().await;
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
+    read_preamble(&mut recv).await.unwrap();
+    let hello = ClientMessage::Hello(hello(&identity, &identity, &connection));
+    write_message(&mut send, &hello, CONTROL_MAX_FRAME)
+        .await
+        .unwrap();
+    let _welcome = read_message::<ServerMessage>(&mut recv, CONTROL_MAX_FRAME)
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    let reason = closed_within(&connection).await;
+    assert_eq!(application_close_code(&reason), Some(close::NORMAL));
+    server.shut_down().await;
+}
+
+#[tokio::test]
 async fn shutdown_closes_open_sessions() {
     let server = RunningServer::start(|_| {}).await;
     let mut ann = server.client("ann").await;

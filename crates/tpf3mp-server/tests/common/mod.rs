@@ -42,6 +42,9 @@ impl RunningServer {
         let trust = ServerTrust::Pinned(identity.leaf().clone());
         let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
         config.tick = Duration::from_millis(20);
+        // Every test client connects from loopback, one address.
+        config.max_sessions_per_address = 1000;
+        config.max_handshakes_per_address = 1000;
         configure(&mut config);
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();

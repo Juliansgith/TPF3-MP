@@ -173,6 +173,18 @@ the stream continues its log exactly (`TurnFollower::restart`).
 - **Bounded buffers.** Outbound queues are bounded per client. A client that
   cannot keep up with its turn stream is disconnected; it never makes the
   server buffer without limit or stall other players.
+- **Streams.** A client opens exactly one stream, its control stream, and
+  sends no datagrams; QUIC flow control refuses anything more. The server's
+  receive windows are small: 256 KiB per stream, 512 KiB per connection.
+- **Per-address limits.** One address, with an IPv6 /64 counting as one,
+  holds at most 8 sessions (more are rejected with `TooManyConnections`)
+  and has at most 4 handshakes in progress. Once half of the server's
+  handshake capacity is in use, new clients must first prove their address
+  with a QUIC retry.
+- **Idle sessions.** Clients send keep-alives every 5 s and the server sends
+  none, so a connection silent for 30 s ends. A session that stays outside
+  any room for 10 minutes is closed with `IDLE`, and one whose control
+  stream ends is closed with `NORMAL`.
 - **Protocol violations** close the connection with `PROTOCOL_VIOLATION`:
   - malformed or oversized frames;
   - a first message that is not `Hello`, or a second `Hello`;

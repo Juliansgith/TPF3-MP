@@ -79,6 +79,8 @@ pub enum RejectReason {
     ServerFull,
     /// The identity proof did not verify.
     BadProof,
+    /// The client's network address already holds its share of sessions.
+    TooManyConnections,
 }
 
 impl fmt::Display for RejectReason {
@@ -86,6 +88,9 @@ impl fmt::Display for RejectReason {
         f.write_str(match self {
             Self::ServerFull => "the server is full; try again later",
             Self::BadProof => "the server could not verify this client's identity",
+            Self::TooManyConnections => {
+                "too many players are connected from this network; close another game first"
+            }
         })
     }
 }
