@@ -43,14 +43,17 @@ with [docs/PLAYING.md](docs/PLAYING.md); server operators with
   feels their own round trip plus a small buffer. Paced bots over 150 ms
   round trips see a median of about 220 ms, and a poor link delays only its
   owner.
-- **Protection.** An adversarial security review found no critical issues.
-  Every finding it made is fixed and guarded by a test:
-  - per-address limits on sessions, handshakes and rooms;
+- **Protection.** Four adversarial security reviews (the server, snapshot
+  transfer, tunnels and log compaction, and the player's side) found no
+  critical issue. Every finding is fixed and guarded by a test:
+  - per-address limits on sessions, handshakes, rooms and tunnels;
   - QUIC retries under load;
-  - budgets for turns, payload bytes and logs;
+  - budgets for turns, payload bytes, logs and uploads;
   - crash recovery that never damages a log or resumes a client onto
     turns it did not see;
-  - checkpoint verdicts one member cannot switch off.
+  - checkpoint verdicts one member cannot switch off;
+  - bounded memory for a client whose server or game misbehaves;
+  - decoders fuzzed with corrupted messages of every kind a peer sends.
 - **Economy.** TPF2MP's economy core ported to integer arithmetic. All
   46,048 of TPF2MP's parity vectors replay identically against the original
   Lua.
@@ -77,12 +80,16 @@ with [docs/PLAYING.md](docs/PLAYING.md); server operators with
   follow the game: fetching the world, loading, playing. It works the same
   on Windows, Linux and macOS, serves the loopback interface only, and
   answers only the page that holds its secret token.
-- **Operations.** Prometheus metrics, a hardened container image and a
-  deployment runbook.
+- **Operations.** Prometheus metrics with alerting rules, a hardened
+  container image, a deployment runbook, and measured capacity: a busy room
+  costs the server about a three-hundredth of a core. CI builds the release
+  packages on all three platforms.
+- **Players.** A guide to playing, in [docs/PLAYING.md](docs/PLAYING.md).
 
 **Waiting for the game:** the TPF3-specific hook (build profile, detours,
-the real `Game`), and the release-day measurements in
-[docs/DAY_ONE.md](docs/DAY_ONE.md).
+the real `Game`), the check of received saves, the server's rules for
+TPF3's commands, and the release-day measurements in
+[docs/DAY_ONE.md](docs/DAY_ONE.md). HOOKS.md lists what remains.
 
 ## Layout
 
