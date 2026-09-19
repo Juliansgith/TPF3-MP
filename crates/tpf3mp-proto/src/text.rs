@@ -24,6 +24,24 @@ impl<const MAX: usize> Text<MAX> {
         Self::try_from(value.into())
     }
 
+    /// Makes text of anything: control characters become spaces, and text
+    /// past `MAX` bytes is cut at a character boundary. For error messages
+    /// and log lines, which may carry either.
+    pub fn lossy(value: &str) -> Self {
+        let mut text: String = value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if text.len() > MAX {
+            let mut end = MAX;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        Self(text)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -82,5 +100,15 @@ mod tests {
         for value in ["line\nbreak", "tab\t", "esc\u{1b}[31m", "nul\0"] {
             assert_eq!(Text::<64>::new(value), Err(TextError::ControlCharacter));
         }
+    }
+
+    #[test]
+    fn lossy_text_is_always_valid() {
+        assert_eq!(Text::<16>::lossy("line\nbreak").as_str(), "line break");
+        // "ü" is two bytes; the cut falls inside it and moves before it.
+        assert_eq!(Text::<2>::lossy("Jü").as_str(), "J");
+        let long = Text::<8>::lossy("abcdefghijk");
+        assert_eq!(long.as_str(), "abcdefgh");
+        assert!(Text::<8>::new(long.as_str()).is_ok());
     }
 }

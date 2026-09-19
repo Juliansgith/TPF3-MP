@@ -227,6 +227,52 @@ the payload may wrap around the end of the buffer.
   that sees `session` change knows the rings were reset and drops anything in
   flight, then re-syncs from the new generation.
 
+## The bridge: what travels over the link
+
+`tpf3mp-bridge` defines the messages, postcard-encoded, one per ring frame,
+at most 60 KiB each. It has no async runtime or network code, so the hook can
+link it. The agent's side is `tpf3mp_agent::bridge`.
+
+- **From the agent (`ToHook`):**
+  - `Hello`: always first.
+  - `Begin`: a game starts; load the world.
+  - `Apply(event)`: apply this event before its step.
+  - `Release { through }`: steps up to and including this one may run.
+  - `Speed`: the room's speed, for display only.
+  - `Diverged`, `Refused`: tell the player.
+  - `End`: the session is over.
+- **From the hook (`ToAgent`):**
+  - `Hello`: always first, with the game build.
+  - `Loaded { next_step }`: the world is ready.
+  - `Command { payload }`: the player acted; the room orders it.
+  - `Ran { step }`: the game ran this step.
+  - `Checkpoint { step, lanes }`: digests at a checkpoint.
+  - `Log`: a line for the agent's log.
+- **The step gate.** The game asks the hook's `Gate` before every step. Until
+  the step is released, the hook reads messages and applies each event the
+  gate hands over, so an event for step `s` is applied after step `s - 1`
+  and before step `s`, never mid-step.
+- **Ordering.** The agent sends every event for step `s` after the release of
+  step `s - 1` and before the release of step `s`. It only merges releases
+  of consecutive steps with no event between them. The hook stops reading
+  once its next step is released. The gate refuses anything that breaks
+  this: an event for another step, an event after its step's release, or a
+  release that goes back. The hook must then stop following and say so.
+- **Pacing.** The agent releases steps on its jitter-buffered schedule
+  (`Playout`). The game runs a released step at its own speed and waits at
+  the gate for the next one. It reports each step it ran; the agent reports
+  progress to the server from that, at most every 20 ms.
+- **Liveness.** The hook must beat its heartbeat from a thread of its own,
+  since the game thread blocks while loading. The agent gives up on a hook
+  whose heartbeat stands still for 60 s.
+
+`tpf3mp_testkit::fake_hook` is a complete hook for the toy game: the real
+link, the real gate, and a world that steps only when released. The
+`games_behind_the_bridge_and_gate_agree` scenario runs three of them in
+one room end to end. On release day, the game-specific part of the hook
+does what the fake hook does with the toy world, applying commands and
+running steps through the real game.
+
 ## Release-day procedure: adding a target for a new build
 
 1. **Archive the build.** Record the executable SHA-256, file size and PE

@@ -277,7 +277,7 @@ impl Bot {
 /// Picks a plausible command from what this replica believes it owns. The
 /// replica can lag the server's canonical ledger, so some commands will be
 /// refused, which is part of what the bots exercise.
-fn choose(rng: &mut SplitMix64, ledger: &Ledger, me: &PlayerId) -> ToyCommand {
+pub(crate) fn choose(rng: &mut SplitMix64, ledger: &Ledger, me: &PlayerId) -> ToyCommand {
     let tracks = ledger.tracks_of(me);
     let trains = ledger.trains_of(me);
     let pick = |rng: &mut SplitMix64, items: &[u32]| {

@@ -15,8 +15,11 @@ dirs.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tpf3mp-bridge.workspace = true
+tpf3mp-ipc.workspace = true
 tpf3mp-net.workspace = true
 tpf3mp-proto.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

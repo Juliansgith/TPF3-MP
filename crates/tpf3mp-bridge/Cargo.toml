@@ -1,0 +1,18 @@
+[package]
+name = "tpf3mp-bridge"
+description = "Messages and the step gate between the TPF3-MP agent and the in-game hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tpf3mp-proto.workspace = true
+
+[lints]
+workspace = true

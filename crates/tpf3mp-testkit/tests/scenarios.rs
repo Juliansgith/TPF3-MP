@@ -13,7 +13,9 @@ use tpf3mp_server::{Server, ServerConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
-    scenario::{RoomPlan, latency_summary, play_room},
+    scenario::{
+        BridgedPlan, BridgedPlayer, RoomPlan, latency_summary, play_bridged_room, play_room,
+    },
     toy::{ToyRules, lane},
 };
 
@@ -176,6 +178,49 @@ async fn paced_players_feel_their_round_trip_plus_a_small_buffer() {
     // room's input delay.
     assert!(p50 < 350, "median latency {p50} ms");
     drop(netem);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn games_behind_the_bridge_and_gate_agree() {
+    let server = TestServer::start().await;
+    let settings = RoomSettings {
+        steps_per_second: 100,
+        input_delay_ms: 60,
+        checkpoint_interval: 20,
+    };
+    let players = (0..3)
+        .map(|index| BridgedPlayer {
+            name: format!("game{index}"),
+            seed: index,
+            world_seed: 42,
+            act_every: 7 + index,
+            target_step: 300,
+        })
+        .collect();
+    let reports = play_bridged_room(BridgedPlan {
+        server: server.address,
+        server_name: "localhost".into(),
+        trust: server.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(60),
+    })
+    .await
+    .unwrap();
+
+    let reference = &reports[0];
+    for report in &reports[1..] {
+        assert_eq!(report.lanes, reference.lanes, "the worlds agree");
+        assert_eq!(report.applied, reference.applied);
+    }
+    for report in &reports {
+        assert_eq!(report.ran, 300);
+        assert!(!report.ended);
+        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
+    }
+    let commands: u64 = reports.iter().map(|report| report.commands).sum();
+    assert!(commands > 60, "the players were busy: {commands} commands");
     server.stop().await;
 }
 

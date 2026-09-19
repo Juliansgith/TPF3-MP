@@ -1466,9 +1466,22 @@ dependencies = [
  "quinn",
  "thiserror",
  "tokio",
+ "tpf3mp-bridge",
+ "tpf3mp-ipc",
  "tpf3mp-net",
  "tpf3mp-proto",
+ "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tpf3mp-bridge"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "thiserror",
+ "tpf3mp-proto",
 ]
 
 [[package]]
@@ -1591,6 +1604,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tpf3mp-agent",
+ "tpf3mp-bridge",
+ "tpf3mp-ipc",
  "tpf3mp-net",
  "tpf3mp-proto",
  "tpf3mp-server",

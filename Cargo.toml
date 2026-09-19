@@ -18,6 +18,7 @@ tpf3mp-server = { path = "crates/tpf3mp-server" }
 tpf3mp-hookcore = { path = "crates/tpf3mp-hookcore" }
 tpf3mp-ipc = { path = "crates/tpf3mp-ipc" }
 tpf3mp-snapshot = { path = "crates/tpf3mp-snapshot" }
+tpf3mp-bridge = { path = "crates/tpf3mp-bridge" }
 
 anyhow = "1.0.104"
 base64 = "0.23.1"

@@ -2,6 +2,7 @@
 //! and exposes rooms and the turn stream to the game side. The shared-memory
 //! link to the in-game hook builds on this (see `docs/ARCHITECTURE.md`).
 
+pub mod bridge;
 mod follower;
 mod playout;
 

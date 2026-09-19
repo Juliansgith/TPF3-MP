@@ -4,6 +4,7 @@
 //! server and client stack the way the game will.
 
 pub mod bot;
+pub mod fake_hook;
 pub mod netem;
 pub mod rng;
 pub mod scenario;
