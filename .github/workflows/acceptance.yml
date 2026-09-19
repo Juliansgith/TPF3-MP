@@ -1,0 +1,65 @@
+name: acceptance
+
+# The checks a change passes on `acceptance` before it may reach `main`
+# (see AGENTS.md). The ci workflow runs on every push too; these add load,
+# bad networks, tunnels, persistence under load and a soak, with optimized
+# builds as players and servers run them.
+on:
+  push:
+    branches: [acceptance]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load:
+    name: load (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: acceptance
+      - run: cargo build --release --locked -p tpf3mp-testkit --bin tpf3mp-loadtest
+      # Each run fails if any bot fails or any replica diverges.
+      - name: Rooms of bots at the room's pace
+        shell: bash
+        run: ./target/release/tpf3mp-loadtest --rooms 10 --bots 8 --steps 1500 --paced
+      - name: A bad network (latency, jitter, loss)
+        shell: bash
+        run: >
+          ./target/release/tpf3mp-loadtest --rooms 4 --bots 4 --steps 1000 --paced
+          --latency-ms 60 --jitter-ms 20 --loss-percent 2
+      - name: Every bot through the WebSocket tunnel
+        shell: bash
+        run: ./target/release/tpf3mp-loadtest --rooms 4 --bots 4 --steps 1000 --paced --tunneled
+      - name: Logged and compacted under load
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/tpf3mp-loadtest --rooms 8 --bots 4 --steps 1500 \
+            --data-dir "$RUNNER_TEMP/tpf3mp-rooms" --compact-log-kib 8 | tee load.txt
+          # The run must actually have compacted logs to test compaction.
+          ! grep -q "server: 0 logs compacted" load.txt
+
+  soak:
+    name: soak (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: acceptance
+      - run: cargo build --release --locked -p tpf3mp-testkit --bin tpf3mp-loadtest
+      # 15 minutes of play at 50 steps a second.
+      - run: ./target/release/tpf3mp-loadtest --rooms 20 --bots 4 --steps 45000 --paced

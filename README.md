@@ -112,6 +112,10 @@ TPF3's commands, and the release-day measurements in
 
 ## Development
 
+How changes move from a feature branch through `dev` and `acceptance` to
+`main`, where releases are drafted, is in [AGENTS.md](AGENTS.md). Read it
+before contributing.
+
 Requires Rust. The toolchain is pinned in `rust-toolchain.toml` and installed
 automatically by rustup.
 
