@@ -293,3 +293,42 @@ async fn starting_requires_the_owner_readiness_and_matching_content() {
     );
     server.shut_down().await;
 }
+
+#[tokio::test]
+async fn chat_reaches_everyone_in_the_room_at_a_measured_pace() {
+    let server = RunningServer::start(|_| {}).await;
+    let mut ann = server.client("ann").await;
+    let mut bob = server.client("bob").await;
+    let outsider = server.client("eve").await;
+    let (invite, _) = ann.client.create_room(room("table", FAST)).await.unwrap();
+    bob.client.join_room(join(&invite)).await.unwrap();
+    let said = Text::new("gg, rail is free").unwrap();
+    let speaker = ann.client.player();
+    ann.client.chat(said.clone()).await.unwrap();
+    // Both hear it, the sender too, so everyone sees one conversation.
+    for listener in [&mut ann, &mut bob] {
+        let (from, text) = listener
+            .wait_for(|event| match event {
+                ClientEvent::Chat { from, text } => Some((from, text)),
+                _ => None,
+            })
+            .await;
+        assert_eq!((from, text), (speaker, said.clone()));
+    }
+    // Someone in no room has nobody to talk to.
+    assert_eq!(
+        outsider.client.chat(said.clone()).await.unwrap_err(),
+        ClientError::Refused(RequestError::NotInRoom)
+    );
+    // A burst of five, then one a second.
+    let mut refused = 0;
+    for _ in 0..8 {
+        if bob.client.chat(said.clone()).await
+            == Err(ClientError::Refused(RequestError::RateLimited))
+        {
+            refused += 1;
+        }
+    }
+    assert!(refused >= 2, "{refused} of 8 refused");
+    server.shut_down().await;
+}

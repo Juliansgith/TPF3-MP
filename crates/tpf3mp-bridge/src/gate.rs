@@ -1,7 +1,7 @@
 //! The hook's side of the step gate.
 
 use thiserror::Error;
-use tpf3mp_proto::{Event, IntentRejection, Speed, Text};
+use tpf3mp_proto::{ChatText, Event, IntentRejection, Speed, Text};
 
 use crate::{MAX_PATH, ToHook};
 
@@ -52,6 +52,8 @@ pub enum Gated {
         file: Option<Text<MAX_PATH>>,
         next_step: u64,
     },
+    /// Show a chat message.
+    Chat { from: Text<32>, text: ChatText },
     /// Nothing to do but check [`Gate::may_run`] again.
     Nothing,
 }
@@ -151,6 +153,7 @@ impl Gate {
                 self.loading = true;
                 Ok(Gated::Load { file, next_step })
             }
+            ToHook::Chat { from, text } => Ok(Gated::Chat { from, text }),
             ToHook::Hello { .. } => Err(GateError::Unexpected("a hello")),
             ToHook::Begin { .. } => Err(GateError::Unexpected("the start of a game")),
         }

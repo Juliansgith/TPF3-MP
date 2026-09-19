@@ -4,6 +4,7 @@
 
 pub mod bridge;
 mod follower;
+pub mod launcher;
 mod playout;
 pub mod transfer;
 
@@ -26,7 +27,7 @@ use tpf3mp_net::{
     read_preamble, write_message, write_preamble,
 };
 use tpf3mp_proto::{
-    CONTROL_MAX_FRAME, ClientMessage, ContentFingerprint, CreateRoom, GameMessage, Hello,
+    CONTROL_MAX_FRAME, ChatText, ClientMessage, ContentFingerprint, CreateRoom, GameMessage, Hello,
     IntentRejection, Invite, JoinRoom, LaneDigest, PROTOCOL_VERSION, Payload, Platform, PlayerId,
     RejectReason, Request, RequestError, Response, RoomView, SavedWorld, ServerMessage, SnapshotId,
     Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, Welcome,
@@ -153,6 +154,11 @@ pub enum ClientEvent {
         event: u64,
         snapshot: SnapshotId,
     },
+    /// A member of the room said something.
+    Chat {
+        from: PlayerId,
+        text: ChatText,
+    },
     /// The connection ended.
     Closed(quinn::ConnectionError),
 }
@@ -198,10 +204,24 @@ pub struct Client {
     connection: quinn::Connection,
     welcome: Welcome,
     player: PlayerId,
+    requests: Requests,
+}
+
+/// Sends requests on a client's control stream and matches the responses.
+/// Cheap to clone, so work that must not wait on a round trip can hand
+/// requests to a task of their own.
+#[derive(Clone)]
+pub struct Requests {
     outgoing: mpsc::Sender<ClientMessage>,
     pending: Pending,
     reader_done: Arc<AtomicBool>,
-    next_request: AtomicU32,
+    next_request: Arc<AtomicU32>,
+}
+
+impl fmt::Debug for Requests {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Requests").finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for Client {
@@ -277,10 +297,12 @@ async fn connect_within(options: ConnectOptions) -> Result<(Client, Events), Con
             connection,
             welcome,
             player: options.identity.player(),
-            outgoing,
-            pending,
-            reader_done,
-            next_request: AtomicU32::new(1),
+            requests: Requests {
+                outgoing,
+                pending,
+                reader_done,
+                next_request: Arc::new(AtomicU32::new(1)),
+            },
         },
         Events {
             receiver: events_rx,
@@ -348,33 +370,12 @@ impl Client {
 
     /// Sends a request and waits for its response.
     pub async fn request(&self, request: Request) -> Result<Response, ClientError> {
-        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let (reply, answer) = oneshot::channel();
-        self.pending_map().insert(id, reply);
-        // The reader marks itself done before failing every pending request,
-        // so a request registered after that is caught here.
-        if self.reader_done.load(Ordering::SeqCst) {
-            self.pending_map().remove(&id);
-            return Err(ClientError::Disconnected);
-        }
-        if self
-            .outgoing
-            .send(ClientMessage::Request { id, request })
-            .await
-            .is_err()
-        {
-            self.pending_map().remove(&id);
-            return Err(ClientError::Disconnected);
-        }
-        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
-            Ok(Ok(Ok(response))) => Ok(response),
-            Ok(Ok(Err(error))) => Err(ClientError::Refused(error)),
-            Ok(Err(_)) => Err(ClientError::Disconnected),
-            Err(_) => {
-                self.pending_map().remove(&id);
-                Err(ClientError::Timeout)
-            }
-        }
+        self.requests.request(request).await
+    }
+
+    /// A handle that sends requests on this client's connection.
+    pub fn requests(&self) -> Requests {
+        self.requests.clone()
     }
 
     pub async fn create_room(&self, create: CreateRoom) -> Result<(Invite, RoomView), ClientError> {
@@ -416,11 +417,13 @@ impl Client {
         self.done(Request::Kick(player)).await
     }
 
+    /// Says something to everyone in the room.
+    pub async fn chat(&self, text: ChatText) -> Result<(), ClientError> {
+        self.done(Request::Chat(text)).await
+    }
+
     async fn done(&self, request: Request) -> Result<(), ClientError> {
-        match self.request(request).await? {
-            Response::Done => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
+        self.requests.done(request).await
     }
 
     pub async fn send_intent(&self, client_seq: u64, payload: Payload) -> Result<(), ClientError> {
@@ -467,7 +470,8 @@ impl Client {
     }
 
     async fn send(&self, message: GameMessage) -> Result<(), ClientError> {
-        self.outgoing
+        self.requests
+            .outgoing
             .send(ClientMessage::Game(message))
             .await
             .map_err(|_| ClientError::Disconnected)
@@ -477,6 +481,47 @@ impl Client {
     pub async fn close(self) {
         self.connection.close(close::NORMAL, b"client leaving");
         self.endpoint.wait_idle().await;
+    }
+}
+
+impl Requests {
+    /// Sends a request and waits for its response.
+    pub async fn request(&self, request: Request) -> Result<Response, ClientError> {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        self.pending_map().insert(id, reply);
+        // The reader marks itself done before failing every pending request,
+        // so a request registered after that is caught here.
+        if self.reader_done.load(Ordering::SeqCst) {
+            self.pending_map().remove(&id);
+            return Err(ClientError::Disconnected);
+        }
+        if self
+            .outgoing
+            .send(ClientMessage::Request { id, request })
+            .await
+            .is_err()
+        {
+            self.pending_map().remove(&id);
+            return Err(ClientError::Disconnected);
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Err(error))) => Err(ClientError::Refused(error)),
+            Ok(Err(_)) => Err(ClientError::Disconnected),
+            Err(_) => {
+                self.pending_map().remove(&id);
+                Err(ClientError::Timeout)
+            }
+        }
+    }
+
+    /// Sends a request whose only answer is that it was done.
+    pub async fn done(&self, request: Request) -> Result<(), ClientError> {
+        match self.request(request).await? {
+            Response::Done => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     fn pending_map(
@@ -541,6 +586,7 @@ async fn read_control(
             ServerMessage::Diverged { step, lanes } => ClientEvent::Diverged { step, lanes },
             ServerMessage::Kicked => ClientEvent::Kicked,
             ServerMessage::Upload { event, snapshot } => ClientEvent::Upload { event, snapshot },
+            ServerMessage::Chat { from, text } => ClientEvent::Chat { from, text },
             ServerMessage::Welcome(_) | ServerMessage::Reject(_) => {
                 connection.close(close::PROTOCOL_VIOLATION, b"unexpected handshake message");
                 break;

@@ -56,7 +56,15 @@ pub enum ServerMessage {
         event: u64,
         snapshot: SnapshotId,
     },
+    /// A member of the room said something.
+    Chat {
+        from: PlayerId,
+        text: ChatText,
+    },
 }
+
+/// One chat message: a line of text, no longer than a short paragraph.
+pub type ChatText = Text<280>;
 
 /// The client's first message after the preamble.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +124,8 @@ pub enum Request {
     /// The owner removes a player from the room for good, for example one
     /// whose game froze.
     Kick(PlayerId),
+    /// Says something to everyone in the room.
+    Chat(ChatText),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

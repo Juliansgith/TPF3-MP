@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPF3-MP</title>
+<style>
+  :root {
+    --bg: #111418; --panel: #1a1f25; --line: #2a313a; --text: #e6e9ec;
+    --muted: #8b949e; --accent: #4fa3ff; --good: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .5px; white-space: nowrap; }
+  main { max-width: 880px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+            padding: 14px 16px; }
+  section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .8px;
+               color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .grow { flex: 1 1 180px; }
+  input, select { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 7px 9px; font: inherit; min-width: 0; }
+  button { background: var(--accent); color: #051021; border: 0; border-radius: 6px;
+           padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+  button:disabled { opacity: .45; cursor: default; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line);
+           color: var(--muted); }
+  .badge.connected { color: var(--good); border-color: var(--good); }
+  .badge.connecting { color: var(--warn); border-color: var(--warn); }
+  .muted { color: var(--muted); }
+  .error { color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  .bar { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--accent); width: 0; }
+  #chat-log { height: 160px; overflow-y: auto; padding: 6px; background: var(--bg);
+              border-radius: 6px; border: 1px solid var(--line); margin-bottom: 8px; }
+  #chat-log div { margin: 2px 0; word-wrap: break-word; }
+  #notices div { color: var(--muted); font-size: 13px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TPF3-MP</h1>
+  <span id="connection" class="badge">disconnected</span>
+  <span id="identity" class="muted"></span>
+  <span class="grow"></span>
+  <span id="server-version" class="muted"></span>
+</header>
+<main>
+  <div id="error" class="error hidden"></div>
+
+  <section id="connect">
+    <h2>Server</h2>
+    <div class="row">
+      <input id="server" class="grow" placeholder="server:29470" autocomplete="off">
+      <input id="name" class="grow" placeholder="your name" maxlength="32" autocomplete="off">
+      <button id="connect-button">Connect</button>
+    </div>
+  </section>
+
+  <section id="lobby" class="hidden">
+    <h2>Rooms</h2>
+    <div class="row" style="margin-bottom: 10px">
+      <input id="room-name" class="grow" placeholder="room name" maxlength="48">
+      <select id="max-players" title="players">
+        <option>2</option><option>3</option><option selected>4</option><option>6</option>
+        <option>8</option><option>12</option><option>16</option>
+      </select>
+      <input id="create-password" class="grow" placeholder="password (optional)" maxlength="64">
+      <button id="create-button">Create room</button>
+    </div>
+    <div class="row">
+      <input id="invite" class="grow" placeholder="paste an invite" autocomplete="off">
+      <input id="join-password" class="grow" placeholder="password (if any)" maxlength="64">
+      <button id="join-button">Join room</button>
+    </div>
+    <div class="row" style="margin-top: 10px">
+      <button id="disconnect-button" class="secondary">Disconnect</button>
+    </div>
+  </section>
+
+  <section id="room" class="hidden">
+    <h2 id="room-title">Room</h2>
+    <div class="row" style="margin-bottom: 10px">
+      <input id="room-invite" class="grow" readonly title="send this to your friends">
+      <button id="copy-button" class="secondary">Copy invite</button>
+    </div>
+    <table>
+      <thead><tr><th>Player</th><th>Platform</th><th>Ready</th><th></th></tr></thead>
+      <tbody id="members"></tbody>
+    </table>
+    <div class="row" style="margin-top: 12px">
+      <button id="ready-button">Ready</button>
+      <button id="start-button" class="hidden">Start game</button>
+      <select id="speed" class="hidden" title="speed">
+        <option value="0">Paused</option><option value="100">1×</option>
+        <option value="200">2×</option><option value="400">4×</option>
+        <option value="800">8×</option><option value="1600">16×</option>
+      </select>
+      <span class="grow"></span>
+      <button id="leave-button" class="danger">Leave room</button>
+    </div>
+  </section>
+
+  <section id="game" class="hidden">
+    <h2>Game</h2>
+    <div id="game-state" class="muted"></div>
+    <div id="fetch" class="bar hidden" style="margin-top: 8px"><div id="fetch-fill"></div></div>
+  </section>
+
+  <section id="chat" class="hidden">
+    <h2>Chat</h2>
+    <div id="chat-log"></div>
+    <div class="row">
+      <input id="chat-text" class="grow" maxlength="280" placeholder="say something" autocomplete="off">
+      <button id="chat-button" class="secondary">Send</button>
+    </div>
+  </section>
+
+  <section id="notices-section" class="hidden">
+    <h2>Notices</h2>
+    <div id="notices"></div>
+  </section>
+</main>
+<script>
+"use strict";
+const token = decodeURIComponent(location.hash.slice(1));
+const $ = (id) => document.getElementById(id);
+let state = null;
+let shownChat = -1;
+let shownNotices = -1;
+
+function show(id, visible) { $(id).classList.toggle("hidden", !visible); }
+
+function text(element, value) {
+  if (element.textContent !== value) element.textContent = value;
+}
+
+async function act(action) {
+  try {
+    const response = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Launcher-Token": token },
+      body: JSON.stringify(action),
+    });
+    const answer = await response.json();
+    if (answer.error) showError(answer.error); else showError(null);
+  } catch (error) {
+    showError("the launcher is not running");
+  }
+  refresh();
+}
+
+function showError(message) {
+  text($("error"), message || "");
+  show("error", !!message);
+}
+
+function cell(row, value) {
+  const td = document.createElement("td");
+  td.textContent = value;
+  row.appendChild(td);
+  return td;
+}
+
+function render(s) {
+  state = s;
+  const badge = $("connection");
+  text(badge, s.connection);
+  badge.className = "badge " + s.connection;
+  text($("identity"), s.player ? s.name + " (" + s.player + ")" : s.name);
+  text($("server-version"), s.server_version ? "server " + s.server_version : "");
+  if (s.error) showError(s.error);
+  if (!$("server").value && s.server) $("server").value = s.server;
+  if (!$("name").value && s.name) $("name").value = s.name;
+
+  const connected = s.connection === "connected";
+  show("connect", !connected && !s.room);
+  show("lobby", connected && !s.room);
+  show("room", !!s.room);
+  show("game", !!s.room);
+  show("chat", !!s.room);
+
+  if (s.room) {
+    const room = s.room;
+    text($("room-title"), room.name + " · " + (room.phase === "lobby" ? "lobby" : "game running"));
+    if ($("room-invite").value !== (room.invite || "")) $("room-invite").value = room.invite || "";
+    const body = $("members");
+    body.replaceChildren();
+    let youReady = false;
+    for (const member of room.members) {
+      const row = document.createElement("tr");
+      cell(row, member.name + (member.owner ? " ★" : "") + (member.you ? " (you)" : "")
+        + (member.connected ? "" : " · away"));
+      cell(row, member.platform);
+      cell(row, room.phase === "lobby" ? (member.ready ? "✓" : "–") : "");
+      const actions = cell(row, "");
+      if (room.you_own && !member.you) {
+        const kick = document.createElement("button");
+        kick.className = "danger";
+        kick.textContent = "Remove";
+        kick.onclick = () => {
+          if (confirm("Remove " + member.name + " from the room for good?")) {
+            act({ action: "kick", player: member.id });
+          }
+        };
+        actions.appendChild(kick);
+      }
+      if (member.you) youReady = member.ready;
+      body.appendChild(row);
+    }
+    const lobby = room.phase === "lobby";
+    show("ready-button", lobby);
+    text($("ready-button"), youReady ? "Not ready" : "Ready");
+    $("ready-button").dataset.ready = youReady ? "1" : "";
+    show("start-button", lobby && room.you_own);
+    $("start-button").disabled = !room.members.every((m) => m.ready);
+    show("speed", !lobby && room.you_own);
+    if (document.activeElement !== $("speed")) $("speed").value = String(s.game.speed);
+  }
+
+  const game = s.game;
+  let line;
+  if (!game.attached) {
+    line = "Waiting for the game: start Transport Fever 3 with the TPF3-MP mod.";
+  } else if (game.world === "fetching") {
+    line = "Receiving the room's world…";
+  } else if (game.world === "loading") {
+    line = "The game is loading the world.";
+  } else if (game.world === "playing") {
+    line = "Playing" + (game.step != null ? ", step " + game.step : "")
+      + (game.speed === 0 ? " (paused)" : " at " + game.speed / 100 + "×") + ".";
+  } else {
+    line = "The game is connected (" + game.attached + "). The world loads when the room starts.";
+  }
+  text($("game-state"), line);
+  show("fetch", game.world === "fetching");
+  if (game.world === "fetching" && game.total > 0) {
+    $("fetch-fill").style.width = Math.min(100, (100 * game.bytes) / game.total).toFixed(1) + "%";
+  }
+
+  if (s.chat.length !== shownChat) {
+    shownChat = s.chat.length;
+    const log = $("chat-log");
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    log.replaceChildren();
+    for (const line of s.chat) {
+      const div = document.createElement("div");
+      const who = document.createElement("strong");
+      who.textContent = line.from + ": ";
+      div.appendChild(who);
+      div.appendChild(document.createTextNode(line.text));
+      log.appendChild(div);
+    }
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+  if (s.notices.length !== shownNotices) {
+    shownNotices = s.notices.length;
+    const list = $("notices");
+    list.replaceChildren();
+    for (const notice of s.notices.slice(-8)) {
+      const div = document.createElement("div");
+      div.textContent = notice;
+      list.appendChild(div);
+    }
+    show("notices-section", s.notices.length > 0);
+  }
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("/api/state", { headers: { "X-Launcher-Token": token } });
+    if (response.status === 401) {
+      showError("Open the launcher from the link the agent printed; this page lacks its key.");
+      return;
+    }
+    render(await response.json());
+  } catch (error) {
+    showError("the launcher is not running");
+  }
+}
+
+$("connect-button").onclick = () =>
+  act({ action: "connect", server: $("server").value, name: $("name").value });
+$("disconnect-button").onclick = () => act({ action: "disconnect" });
+$("create-button").onclick = () => act({
+  action: "create", room: $("room-name").value || "TPF3-MP room",
+  max_players: Number($("max-players").value), password: $("create-password").value || null,
+});
+$("join-button").onclick = () =>
+  act({ action: "join", invite: $("invite").value, password: $("join-password").value || null });
+$("ready-button").onclick = () =>
+  act({ action: "ready", ready: !$("ready-button").dataset.ready });
+$("start-button").onclick = () => act({ action: "start" });
+$("speed").onchange = () => act({ action: "speed", percent: Number($("speed").value) });
+$("leave-button").onclick = () => act({ action: "leave" });
+$("copy-button").onclick = () => {
+  const invite = $("room-invite").value;
+  if (navigator.clipboard) navigator.clipboard.writeText(invite);
+  else { $("room-invite").select(); document.execCommand("copy"); }
+};
+function sendChat() {
+  const value = $("chat-text").value;
+  if (!value.trim()) return;
+  $("chat-text").value = "";
+  act({ action: "chat", text: value });
+}
+$("chat-button").onclick = sendChat;
+$("chat-text").onkeydown = (event) => { if (event.key === "Enter") sendChat(); };
+
+refresh();
+setInterval(refresh, 500);
+</script>
+</body>
+</html>

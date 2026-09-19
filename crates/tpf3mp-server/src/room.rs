@@ -18,7 +18,7 @@ use tokio::{
 };
 use tpf3mp_net::{bulk, close};
 use tpf3mp_proto::{
-    ContentFingerprint, Event, EventBody, FRAME_HEADER_LEN, FixedBytes, IntentRejection,
+    ChatText, ContentFingerprint, Event, EventBody, FRAME_HEADER_LEN, FixedBytes, IntentRejection,
     LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError, Resume, RoomId, RoomPhase,
     RoomSettings, RoomView, SavedWorld, ServerMessage, SnapshotId, Speed, TURN_MAX_FRAME, Text,
     Turn, TurnMessage, TurnStart, WorldOffer, decode_frame, encode_frame,
@@ -51,6 +51,10 @@ const MAX_AHEAD: Duration = Duration::from_secs(2);
 /// Intents per second a player may send, and the burst allowed on top.
 const INTENTS_PER_SECOND: u32 = 20;
 const INTENT_BURST: u32 = 40;
+/// Chat messages a player may send per second, and the burst on top. Every
+/// message goes to every member.
+const CHATS_PER_SECOND: u32 = 1;
+const CHAT_BURST: u32 = 5;
 /// Intent payload bytes per second a player may send, and the burst allowed
 /// on top. A build command is a few hundred bytes; this leaves room for
 /// large ones without letting one player grow a room's log quickly.
@@ -158,6 +162,11 @@ pub(crate) enum RoomCommand {
     /// example after a kick.
     IsMember {
         player: PlayerId,
+        reply: Reply,
+    },
+    Chat {
+        player: PlayerId,
+        text: ChatText,
         reply: Reply,
     },
     Intent {
@@ -372,6 +381,7 @@ struct Member {
     advanced: Instant,
     intents: TokenBucket,
     payload_bytes: TokenBucket,
+    chats: TokenBucket,
     /// What this member must receive before it can follow the game.
     needs: Needs,
     /// The snapshot this member's connection may fetch.
@@ -706,6 +716,7 @@ impl Room {
                 advanced: Instant::now(),
                 intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
                 payload_bytes: TokenBucket::new(PAYLOAD_BYTES_PER_SECOND, PAYLOAD_BURST),
+                chats: TokenBucket::new(CHATS_PER_SECOND, CHAT_BURST),
                 needs: Needs::Nothing,
                 offered: None,
                 rebased: None,
@@ -895,6 +906,13 @@ impl Room {
                 reply,
             } => {
                 let _ = reply.send(self.kick(player, target));
+            }
+            RoomCommand::Chat {
+                player,
+                text,
+                reply,
+            } => {
+                let _ = reply.send(self.chat(player, text));
             }
             RoomCommand::IsMember { player, reply } => {
                 let member = self.members.iter().any(|m| m.player == player);
@@ -1105,6 +1123,30 @@ impl Room {
             );
         }
         self.after_departure(player);
+        Ok(())
+    }
+
+    /// Passes a member's message to everyone in the room, the sender too, so
+    /// every member sees the same conversation.
+    fn chat(&mut self, player: PlayerId, text: ChatText) -> Result<(), RequestError> {
+        let now = Instant::now();
+        let member = self
+            .members
+            .iter_mut()
+            .find(|member| member.player == player)
+            .ok_or(RequestError::NotInRoom)?;
+        if !member.chats.take(now, 1) {
+            return Err(RequestError::RateLimited);
+        }
+        for index in 0..self.members.len() {
+            self.push(
+                index,
+                ServerMessage::Chat {
+                    from: player,
+                    text: text.clone(),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -2106,6 +2148,7 @@ impl Member {
             advanced: Instant::now(),
             intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
             payload_bytes: TokenBucket::new(PAYLOAD_BYTES_PER_SECOND, PAYLOAD_BURST),
+            chats: TokenBucket::new(CHATS_PER_SECOND, CHAT_BURST),
             needs: Needs::Nothing,
             offered: None,
             rebased: None,
@@ -2611,6 +2654,7 @@ mod tests {
             advanced: Instant::now(),
             intents: TokenBucket::new(1, 1),
             payload_bytes: TokenBucket::new(1, 1),
+            chats: TokenBucket::new(1, 1),
             needs: Needs::Nothing,
             offered: None,
             rebased: None,

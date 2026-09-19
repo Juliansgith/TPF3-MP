@@ -488,6 +488,14 @@ impl Client {
                 })
                 .await
             }
+            Request::Chat(text) => {
+                self.in_room(|player, reply| RoomCommand::Chat {
+                    player,
+                    text,
+                    reply,
+                })
+                .await
+            }
         }
     }
 

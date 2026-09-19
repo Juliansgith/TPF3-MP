@@ -6,6 +6,7 @@ use tpf3mp_agent::{
     Client, ClientEvent, ConnectOptions, Events, Worlds,
     bridge::{self, Bridge, BridgeOptions, Rejoin},
     connect,
+    launcher::{Launcher, LauncherConfig},
 };
 use tpf3mp_net::{CertificateDer, Identity, ServerTrust};
 use tpf3mp_proto::{
@@ -44,6 +45,9 @@ enum Command {
         #[arg(long)]
         start_with: Option<usize>,
     },
+    /// Open the launcher: a page in your browser from which you connect,
+    /// create or join rooms, get ready, chat and play.
+    Launcher(LauncherArgs),
     /// Join a room with an invite and follow it until Ctrl-C.
     Join {
         #[command(flatten)]
@@ -103,6 +107,50 @@ impl Game {
         Worlds::open(&dir, self.worlds_gib << 30)
             .with_context(|| format!("opening the worlds in {}", dir.display()))
     }
+}
+
+#[derive(Debug, ClapArgs)]
+struct LauncherArgs {
+    /// Where the page is served. Loopback only.
+    #[arg(long, default_value = "127.0.0.1:47470")]
+    listen: SocketAddr,
+
+    /// The server the page offers first, as host:port.
+    #[arg(long)]
+    server: Option<String>,
+
+    /// Trust exactly this DER certificate instead of public certificate
+    /// authorities (for development servers).
+    #[arg(long)]
+    pin_cert: Option<PathBuf>,
+
+    /// The name the page offers first.
+    #[arg(long, default_value = "player")]
+    name: String,
+
+    /// Identity key file. Created on first use.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// The shared-memory link the game's hook opens.
+    #[arg(long, default_value = tpf3mp_bridge::DEFAULT_LINK)]
+    game_link: String,
+
+    /// What this player's game runs (build and mods).
+    #[arg(long, default_value = "tpf3")]
+    content: String,
+
+    /// Where worlds are kept. Defaults to the per-user data directory.
+    #[arg(long)]
+    worlds: Option<PathBuf>,
+
+    /// Space worlds may take, in GiB.
+    #[arg(long, default_value_t = 8)]
+    worlds_gib: u64,
+
+    /// Only print the page's address; do not open a browser.
+    #[arg(long)]
+    no_open: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -177,6 +225,7 @@ async fn main() -> Result<()> {
             };
             play(client, events, &game, rejoin).await?;
         }
+        Command::Launcher(args) => launch(args).await?,
         Command::Join {
             server,
             game,
@@ -212,6 +261,64 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Serves the launcher until Ctrl-C.
+async fn launch(args: LauncherArgs) -> Result<()> {
+    let trust = match &args.pin_cert {
+        Some(path) => ServerTrust::Pinned(CertificateDer::from(
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+        )),
+        None => ServerTrust::WebPki,
+    };
+    let identity = Arc::new(Identity::load_or_create(&identity_path(
+        args.identity.as_ref(),
+    )?)?);
+    let game = Game {
+        game_link: Some(args.game_link.clone()),
+        content: args.content.clone(),
+        worlds: args.worlds.clone(),
+        worlds_gib: args.worlds_gib,
+    };
+    let launcher = Launcher::start(LauncherConfig {
+        listen: args.listen,
+        server: args.server,
+        trust,
+        identity,
+        name: args.name,
+        content: game.fingerprint()?,
+        link: args.game_link.clone(),
+        worlds: game.open_worlds(&args.game_link)?,
+        room_settings: RoomSettings::DEFAULT,
+    })
+    .await
+    .with_context(|| format!("serving the launcher on {}", args.listen))?;
+    println!("TPF3-MP launcher: {}", launcher.url());
+    println!("Keep this window open while you play. Ctrl-C stops the launcher.");
+    if !args.no_open {
+        open_browser(launcher.url());
+    }
+    tokio::select! {
+        () = launcher.wait() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    Ok(())
+}
+
+/// Opens `url` in the default browser, as far as the system allows.
+fn open_browser(url: &str) {
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    if command.arg(url).spawn().is_err() {
+        println!("Open the address above in your browser.");
+    }
 }
 
 /// How long the agent keeps trying to rejoin a room after losing the
@@ -291,16 +398,22 @@ async fn options(server: &Server) -> Result<ConnectOptions> {
         )),
         None => ServerTrust::WebPki,
     };
-    let identity_path = match &server.identity {
-        Some(path) => path.clone(),
-        None => dirs::data_local_dir()
-            .context("no per-user data directory; pass --identity")?
-            .join("TPF3-MP")
-            .join("identity.key"),
-    };
-    let identity = Arc::new(Identity::load_or_create(&identity_path)?);
+    let identity = Arc::new(Identity::load_or_create(&identity_path(
+        server.identity.as_ref(),
+    )?)?);
     let name = Text::new(server.name.clone()).context("player name")?;
     Ok(ConnectOptions::new(address, host, trust, identity, name))
+}
+
+/// The identity key file: the one given, or the per-user default.
+fn identity_path(given: Option<&PathBuf>) -> Result<PathBuf> {
+    match given {
+        Some(path) => Ok(path.clone()),
+        None => Ok(dirs::data_local_dir()
+            .context("no per-user data directory; pass --identity")?
+            .join("TPF3-MP")
+            .join("identity.key")),
+    }
 }
 
 fn print_room(room: &RoomView) {

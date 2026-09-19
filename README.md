@@ -66,6 +66,11 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
   a 150 ms, 2%-loss link agree on every lane, and 400 bots in 50 rooms run
   without a divergence. Fake games join running rooms, get rebased after a
   drift and ride out a server restart, and end in the same world.
+- **Launcher.** `tpf3mp-agent launcher` opens a page in the player's
+  browser to connect, create or join a room, get ready, start, chat, and
+  follow the game: fetching the world, loading, playing. It works the same
+  on Windows, Linux and macOS, serves the loopback interface only, and
+  answers only the page that holds its secret token.
 - **Operations.** Prometheus metrics, a hardened container image and a
   deployment runbook.
 
@@ -113,6 +118,12 @@ cargo run -p tpf3mp-agent -- connect 127.0.0.1:29470 --pin-cert runtime/dev-cert
 In production, the server takes a real certificate (`--cert`, `--key`), and
 agents verify it against the public certificate authorities. See
 [docs/OPERATIONS.md](docs/OPERATIONS.md) for deployment.
+
+Or use the launcher, which opens a page in your browser:
+
+```sh
+cargo run -p tpf3mp-agent -- launcher --server 127.0.0.1:29470 --pin-cert runtime/dev-cert.der --name ann
+```
 
 Try a room by hand with two agents:
 

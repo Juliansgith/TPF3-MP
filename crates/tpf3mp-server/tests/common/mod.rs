@@ -11,7 +11,7 @@ use tpf3mp_agent::{Action, Client, ClientEvent, ConnectOptions, Events, TurnFoll
 use tpf3mp_net::{Identity, ServerIdentity, ServerTrust, client_config};
 use tpf3mp_proto::{
     ContentFingerprint, CreateRoom, Event, FixedBytes, IntentRejection, Invite, JoinRoom,
-    LaneDigest, RoomSettings, RoomView, Text, TurnStart,
+    LaneDigest, PlayerId, RoomSettings, RoomView, Text, TurnStart,
 };
 use tpf3mp_server::{Server, ServerConfig, ServerStats};
 
@@ -208,6 +208,8 @@ pub struct Player {
     pub room: Option<RoomView>,
     pub closed: bool,
     pub kicked: bool,
+    /// Chat heard, in order: who, and what.
+    pub chat: Vec<(PlayerId, String)>,
     /// Whether this player reports progress; a player that never does holds
     /// the room at the load gate.
     pub reports_progress: bool,
@@ -227,6 +229,7 @@ impl Player {
             room: None,
             closed: false,
             kicked: false,
+            chat: Vec::new(),
             reports_progress: true,
             lanes: None,
         }
@@ -285,6 +288,7 @@ impl Player {
             }
             ClientEvent::Diverged { step, lanes } => self.diverged.push((step, lanes)),
             ClientEvent::Upload { .. } => {}
+            ClientEvent::Chat { from, text } => self.chat.push((from, text.as_str().to_owned())),
             ClientEvent::Kicked => self.kicked = true,
             ClientEvent::Closed(_) => self.closed = true,
         }

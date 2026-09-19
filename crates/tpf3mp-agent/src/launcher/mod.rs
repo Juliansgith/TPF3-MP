@@ -1,0 +1,497 @@
+//! The launcher: a page in the player's browser from which they connect,
+//! create or join a room, get ready, chat and play, with this agent doing
+//! the work. It is the launcher backend of `docs/ARCHITECTURE.md`; an
+//! in-game interface can drive the same actions later.
+//!
+//! The page is served on the loopback interface only. Every API request
+//! carries a secret token that only the launched page knows, and requests
+//! for any host but the loopback address are refused, so neither other web
+//! pages nor DNS rebinding can drive it.
+
+mod api;
+mod http;
+
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
+
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
+use tpf3mp_net::{Identity, ServerTrust};
+use tpf3mp_proto::{
+    ContentFingerprint, CreateRoom, Invite, JoinRoom, RoomPhase, RoomSettings, Text,
+};
+use tracing::{info, warn};
+
+pub use self::api::Action;
+use self::api::View;
+use crate::{
+    Client, ClientEvent, ConnectOptions, Events, Worlds,
+    bridge::{self, Bridge, BridgeEnd, BridgeOptions, Control, Rejoin, SharedStatus, Status},
+    connect,
+};
+
+/// How long the launcher keeps trying to rejoin a room after losing the
+/// server.
+const REJOIN_PATIENCE: Duration = Duration::from_secs(300);
+/// Actions queued from the page before it waits.
+const ACTION_QUEUE: usize = 32;
+
+/// What a launcher needs.
+#[derive(Debug, Clone)]
+pub struct LauncherConfig {
+    /// Where the page is served: a loopback address.
+    pub listen: SocketAddr,
+    /// The server the page offers first, as `host:port`.
+    pub server: Option<String>,
+    /// How to trust servers.
+    pub trust: ServerTrust,
+    pub identity: Arc<Identity>,
+    /// The name the page offers first.
+    pub name: String,
+    /// What this player's game runs.
+    pub content: ContentFingerprint,
+    /// The shared-memory link the game's hook opens.
+    pub link: String,
+    pub worlds: Worlds,
+    /// The settings of rooms this player creates.
+    pub room_settings: RoomSettings,
+}
+
+/// A running launcher.
+pub struct Launcher {
+    url: String,
+    task: JoinHandle<()>,
+}
+
+impl Launcher {
+    /// Starts serving the page and returns once it is reachable.
+    pub async fn start(config: LauncherConfig) -> std::io::Result<Self> {
+        if !config.listen.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the launcher serves the loopback interface only",
+            ));
+        }
+        let listener = TcpListener::bind(config.listen).await?;
+        let address = listener.local_addr()?;
+        let token = random_token();
+        let (actions, actions_rx) = mpsc::channel(ACTION_QUEUE);
+        let shared = Arc::new(Shared {
+            token: token.clone(),
+            address,
+            view: Mutex::new(View {
+                server: config.server.clone(),
+                name: config.name.clone(),
+                player: Some(config.identity.player()),
+                ..View::default()
+            }),
+            status: SharedStatus::default(),
+            actions,
+        });
+        let control = tokio::spawn(control(Arc::clone(&shared), config, actions_rx));
+        let serve = tokio::spawn(http::serve(listener, Arc::clone(&shared)));
+        let task = tokio::spawn(async move {
+            let _ = tokio::join!(control, serve);
+        });
+        Ok(Self {
+            url: format!("http://{address}/#{token}"),
+            task,
+        })
+    }
+
+    /// The page's address, with the token it needs.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Runs until the task ends, which it does only if both halves stop.
+    pub async fn wait(mut self) {
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl Drop for Launcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// What the page's requests and the controller share.
+pub(crate) struct Shared {
+    token: String,
+    address: SocketAddr,
+    view: Mutex<View>,
+    status: SharedStatus,
+    actions: mpsc::Sender<(Action, oneshot::Sender<Result<(), String>>)>,
+}
+
+impl Shared {
+    fn view(&self) -> std::sync::MutexGuard<'_, View> {
+        self.view.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn status(&self) -> std::sync::MutexGuard<'_, Status> {
+        self.status.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A connection not in any room.
+struct Connected {
+    client: Client,
+    events: Events,
+    options: ConnectOptions,
+}
+
+/// A room session, run by a bridge.
+struct Session {
+    controls: mpsc::Sender<Control>,
+    task: JoinHandle<Result<BridgeEnd, bridge::BridgeFault>>,
+    options: ConnectOptions,
+}
+
+/// Carries out the page's actions, one at a time, and keeps the view.
+async fn control(
+    shared: Arc<Shared>,
+    config: LauncherConfig,
+    mut actions: mpsc::Receiver<(Action, oneshot::Sender<Result<(), String>>)>,
+) {
+    let mut connected: Option<Connected> = None;
+    let mut session: Option<Session> = None;
+    loop {
+        tokio::select! {
+            action = actions.recv() => {
+                let Some((action, reply)) = action else {
+                    return;
+                };
+                let result = act(&shared, &config, action, &mut connected, &mut session).await;
+                if let Err(error) = &result {
+                    shared.view().error = Some(error.clone());
+                }
+                let _ = reply.send(result);
+            }
+            ended = session_end(&mut session) => {
+                let finished = session.take();
+                let message = match ended {
+                    Ok(end) => format!("the game session ended: {}", describe(&end)),
+                    Err(fault) => format!("the game session failed: {fault}"),
+                };
+                info!(%message);
+                shared.status().notice(message);
+                {
+                    let mut view = shared.view();
+                    view.invite = None;
+                    view.in_room = false;
+                }
+                // Back to the server, ready for the next room.
+                if let Some(finished) = finished {
+                    connected = reconnect(&shared, finished.options).await;
+                }
+            }
+            event = next_event(&mut connected) => match event {
+                Some(ClientEvent::Closed(reason)) => {
+                    connected = None;
+                    let mut view = shared.view();
+                    view.connected = false;
+                    view.error = Some(format!("disconnected: {reason}"));
+                }
+                // Outside a room there is nothing else to hear.
+                Some(_) => {}
+                None => {
+                    connected = None;
+                    shared.view().connected = false;
+                }
+            },
+        }
+    }
+}
+
+/// One action from the page.
+async fn act(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    action: Action,
+    connected: &mut Option<Connected>,
+    session: &mut Option<Session>,
+) -> Result<(), String> {
+    match action {
+        Action::Connect { server, name } => {
+            if session.is_some() {
+                return Err("leave the room first".into());
+            }
+            let name = Text::new(name.trim()).map_err(|_| "that name is too long".to_owned())?;
+            if name.as_str().is_empty() {
+                return Err("choose a name".into());
+            }
+            let options = connect_options(config, &server, name).await?;
+            *connected = None;
+            {
+                let mut view = shared.view();
+                view.connecting = true;
+                view.server = Some(server.clone());
+            }
+            let result = connect(options.clone()).await;
+            let mut view = shared.view();
+            view.connecting = false;
+            let (client, events) = result.map_err(|error| error.to_string())?;
+            view.connected = true;
+            view.error = None;
+            view.name = options.name.as_str().to_owned();
+            view.server_version = Some(client.welcome().server_version.as_str().to_owned());
+            drop(view);
+            *connected = Some(Connected {
+                client,
+                events,
+                options,
+            });
+            Ok(())
+        }
+        Action::Disconnect => {
+            if let Some(session) = session.take() {
+                let _ = session.controls.send(Control::Leave).await;
+                let _ = session.task.await;
+            }
+            if let Some(connected) = connected.take() {
+                connected.client.close().await;
+            }
+            let mut view = shared.view();
+            view.connected = false;
+            view.in_room = false;
+            view.invite = None;
+            Ok(())
+        }
+        Action::Create {
+            room,
+            max_players,
+            password,
+        } => {
+            let current = connected.as_ref().ok_or("connect to a server first")?;
+            let create = CreateRoom {
+                name: Text::new(room.trim())
+                    .map_err(|_| "that room name is too long".to_owned())?,
+                max_players,
+                password: password_text(password)?,
+                settings: config.room_settings,
+            };
+            let (invite, _room) = current
+                .client
+                .create_room(create.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            current
+                .client
+                .declare_content(config.content)
+                .await
+                .map_err(|error| error.to_string())?;
+            begin_session(shared, config, connected, session, invite, create.password)
+        }
+        Action::Join { invite, password } => {
+            let current = connected.as_ref().ok_or("connect to a server first")?;
+            let invite: Invite = invite
+                .trim()
+                .parse()
+                .map_err(|_| "that is not an invite".to_owned())?;
+            let password = password_text(password)?;
+            let room = current
+                .client
+                .join_room(JoinRoom {
+                    invite: invite.clone(),
+                    password: password.clone(),
+                    resume: None,
+                    content: Some(config.content),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            if room.phase == RoomPhase::Lobby {
+                current
+                    .client
+                    .declare_content(config.content)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            shared.status().room = Some(room);
+            begin_session(shared, config, connected, session, invite, password)
+        }
+        Action::Ready { ready } => forward(session, Control::Ready(ready)).await,
+        Action::Start => forward(session, Control::Start).await,
+        Action::Speed { percent } => {
+            if percent > tpf3mp_proto::Speed::MAX.0 {
+                return Err("that speed is too fast".into());
+            }
+            forward(session, Control::Speed(tpf3mp_proto::Speed(percent))).await
+        }
+        Action::Kick { player } => {
+            let player = api::parse_player(&player).ok_or("that is not a player")?;
+            forward(session, Control::Kick(player)).await
+        }
+        Action::Chat { text } => {
+            let text = Text::new(text.trim()).map_err(|_| "that message is too long".to_owned())?;
+            if text.as_str().is_empty() {
+                return Ok(());
+            }
+            forward(session, Control::Chat(text)).await
+        }
+        Action::Leave => forward(session, Control::Leave).await,
+    }
+}
+
+/// Hands the connection to a bridge, which runs the room from its lobby to
+/// the end of its game, and plays it through the game's hook.
+fn begin_session(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    connected: &mut Option<Connected>,
+    session: &mut Option<Session>,
+    invite: Invite,
+    password: Option<Text<64>>,
+) -> Result<(), String> {
+    let Connected {
+        client,
+        events,
+        options,
+    } = connected.take().ok_or("not connected")?;
+    let link = tpf3mp_ipc::Link::create(
+        &tpf3mp_ipc::Config::new(&config.link),
+        tpf3mp_ipc::Role::Agent,
+    )
+    .map_err(|error| format!("cannot open the link to the game: {error}"))?;
+    let (controls, controls_rx) = mpsc::channel(ACTION_QUEUE);
+    // A fresh status for the new session, with the room already known.
+    {
+        let mut status = shared.status();
+        let room = status.room.take();
+        *status = Status {
+            room,
+            ..Status::default()
+        };
+    }
+    let bridge_options = BridgeOptions {
+        worlds: Some(config.worlds.clone()),
+        status: Some(Arc::clone(&shared.status)),
+        ..BridgeOptions::default()
+    };
+    let rejoin = Rejoin {
+        options: options.clone(),
+        invite: invite.clone(),
+        password,
+        content: Some(config.content),
+        give_up_after: REJOIN_PATIENCE,
+    };
+    let task = tokio::spawn(async move {
+        let mut bridge = Bridge::new(link, bridge_options).with_controls(controls_rx);
+        bridge::play(&mut bridge, client, events, &rejoin).await
+    });
+    {
+        let mut view = shared.view();
+        view.invite = Some(invite.to_string());
+        view.in_room = true;
+        view.error = None;
+    }
+    *session = Some(Session {
+        controls,
+        task,
+        options,
+    });
+    Ok(())
+}
+
+async fn forward(session: &Option<Session>, control: Control) -> Result<(), String> {
+    let session = session.as_ref().ok_or("join a room first")?;
+    session
+        .controls
+        .send(control)
+        .await
+        .map_err(|_| "the room session has ended".to_owned())
+}
+
+/// Connects again after a room session, which took the old connection.
+async fn reconnect(shared: &Arc<Shared>, options: ConnectOptions) -> Option<Connected> {
+    match connect(options.clone()).await {
+        Ok((client, events)) => {
+            shared.view().connected = true;
+            Some(Connected {
+                client,
+                events,
+                options,
+            })
+        }
+        Err(error) => {
+            warn!(%error, "cannot reconnect after the session");
+            let mut view = shared.view();
+            view.connected = false;
+            view.error = Some(error.to_string());
+            None
+        }
+    }
+}
+
+async fn connect_options(
+    config: &LauncherConfig,
+    server: &str,
+    name: Text<32>,
+) -> Result<ConnectOptions, String> {
+    let server = server.trim();
+    let (host, _port) = server
+        .rsplit_once(':')
+        .ok_or("the server address must be host:port")?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let address = tokio::net::lookup_host(server)
+        .await
+        .map_err(|error| format!("cannot find {server}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{server} has no address"))?;
+    Ok(ConnectOptions::new(
+        address,
+        host,
+        config.trust.clone(),
+        Arc::clone(&config.identity),
+        name,
+    ))
+}
+
+fn password_text(password: Option<String>) -> Result<Option<Text<64>>, String> {
+    password
+        .filter(|password| !password.is_empty())
+        .map(|password| Text::new(password).map_err(|_| "that password is too long".to_owned()))
+        .transpose()
+}
+
+/// The end of the current session, or never without one.
+async fn session_end(session: &mut Option<Session>) -> Result<BridgeEnd, bridge::BridgeFault> {
+    match session {
+        Some(session) => match (&mut session.task).await {
+            Ok(ended) => ended,
+            Err(error) => Err(bridge::BridgeFault::Rejoin(error.to_string())),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// The next event of a connection not in a room, or never without one.
+async fn next_event(connected: &mut Option<Connected>) -> Option<ClientEvent> {
+    match connected {
+        Some(connected) => connected.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn describe(end: &BridgeEnd) -> String {
+    match end {
+        BridgeEnd::Closed(reason) => format!("the connection closed ({reason})"),
+        BridgeEnd::Kicked => "the owner removed you from the room".into(),
+        BridgeEnd::EventsEnded => "the connection ended".into(),
+        BridgeEnd::WorldUnavailable => "the world could not be fetched".into(),
+        BridgeEnd::Left => "you left the room".into(),
+    }
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the operating system's random source is available");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}

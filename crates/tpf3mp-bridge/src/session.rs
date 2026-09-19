@@ -14,7 +14,7 @@ use std::{
 
 use thiserror::Error;
 use tpf3mp_ipc::{IpcError, Link, Role, SendError};
-use tpf3mp_proto::{Event, EventBody, IntentRejection, LaneDigest, Payload, Speed, Text};
+use tpf3mp_proto::{ChatText, Event, EventBody, IntentRejection, LaneDigest, Payload, Speed, Text};
 
 use crate::{
     BRIDGE_VERSION, BridgeError, Gate, GateError, Gated, MAX_MESSAGE, ToAgent, ToHook,
@@ -57,6 +57,11 @@ pub enum Notice {
     },
     /// The session is over.
     Ended(Text<128>),
+    /// A member of the room said something.
+    Chat {
+        from: Text<32>,
+        text: ChatText,
+    },
 }
 
 /// What the game does about its next step.
@@ -164,21 +169,25 @@ impl Session {
     /// Waits for the room to begin a game. The first thing the gate then
     /// says is which world to load ([`StepGate::Load`]).
     pub fn wait_for_begin(&mut self) -> Result<Begin, SessionError> {
-        match self.recv_blocking()? {
-            ToHook::Begin {
-                steps_per_second,
-                checkpoint_interval,
-                saves,
-            } => {
-                self.checkpoint_interval = u64::from(checkpoint_interval).max(1);
-                self.saves = PathBuf::from(saves.as_str());
-                Ok(Begin {
+        loop {
+            match self.recv_blocking()? {
+                ToHook::Begin {
                     steps_per_second,
                     checkpoint_interval,
-                    saves: self.saves.clone(),
-                })
+                    saves,
+                } => {
+                    self.checkpoint_interval = u64::from(checkpoint_interval).max(1);
+                    self.saves = PathBuf::from(saves.as_str());
+                    return Ok(Begin {
+                        steps_per_second,
+                        checkpoint_interval,
+                        saves: self.saves.clone(),
+                    });
+                }
+                // Talk in the lobby is for the front end.
+                ToHook::Chat { .. } => {}
+                _ => return Err(SessionError::Unexpected("something before the game began")),
             }
-            _ => Err(SessionError::Unexpected("something before the game began")),
         }
     }
 
@@ -256,6 +265,11 @@ impl Session {
         Ok(number)
     }
 
+    /// Says something to the room for the player.
+    pub fn chat(&mut self, text: ChatText) -> Result<(), SessionError> {
+        self.send(&ToAgent::Chat { text })
+    }
+
     /// The step the game runs next.
     pub fn next_step(&self) -> u64 {
         self.gate.next_step()
@@ -291,6 +305,7 @@ impl Session {
                 game.notice(Notice::Refused { command, reason });
             }
             Gated::Ended(reason) => game.notice(Notice::Ended(reason)),
+            Gated::Chat { from, text } => game.notice(Notice::Chat { from, text }),
             Gated::Nothing => {}
         }
         Ok(())

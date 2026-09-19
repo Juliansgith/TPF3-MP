@@ -13,6 +13,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -23,8 +24,8 @@ use tpf3mp_bridge::{
 };
 use tpf3mp_net::close;
 use tpf3mp_proto::{
-    ContentFingerprint, Invite, JoinRoom, LaneDigest, RequestError, Resume, SavedWorld, SnapshotId,
-    Speed, Text, WorldOffer,
+    ChatText, ContentFingerprint, Invite, JoinRoom, LaneDigest, PlayerId, Request, RequestError,
+    Resume, RoomView, SavedWorld, SnapshotId, Speed, Text, WorldOffer,
 };
 use tpf3mp_snapshot::ManifestId;
 use tracing::{debug, info, warn};
@@ -95,6 +96,9 @@ pub struct BridgeOptions {
     /// Where worlds are kept. Without it, saves are reported as failed and
     /// a world the room offers cannot be loaded.
     pub worlds: Option<Worlds>,
+    /// What a front end shows of the session, kept up to date by the
+    /// bridge.
+    pub status: Option<SharedStatus>,
 }
 
 impl Default for BridgeOptions {
@@ -107,8 +111,86 @@ impl Default for BridgeOptions {
             load_timeout: Duration::from_secs(600),
             progress_every: Duration::from_millis(20),
             worlds: None,
+            status: None,
         }
     }
+}
+
+/// What a front end asks of the room session a bridge runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    Ready(bool),
+    Start,
+    Speed(Speed),
+    Kick(PlayerId),
+    Chat(ChatText),
+    /// Leave the room, which ends the session.
+    Leave,
+}
+
+/// Chat lines and notices a status keeps.
+const STATUS_HISTORY: usize = 100;
+
+/// What a front end shows of the room session a bridge runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    /// The room as last announced.
+    pub room: Option<RoomView>,
+    /// The game's build, once its hook attached.
+    pub game: Option<String>,
+    pub world: WorldStatus,
+    /// The last step the game ran.
+    pub step: Option<u64>,
+    pub speed: Speed,
+    /// The latest chat, oldest first.
+    pub chat: VecDeque<(PlayerId, ChatText)>,
+    /// What the player should know, oldest first: divergences, refusals,
+    /// rejoins.
+    pub notices: VecDeque<String>,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            room: None,
+            game: None,
+            world: WorldStatus::None,
+            step: None,
+            speed: Speed::NORMAL,
+            chat: VecDeque::new(),
+            notices: VecDeque::new(),
+        }
+    }
+}
+
+impl Status {
+    pub fn notice(&mut self, notice: impl Into<String>) {
+        push_bounded(&mut self.notices, notice.into());
+    }
+}
+
+/// Where the game's world stands, for display.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorldStatus {
+    /// No game has begun.
+    #[default]
+    None,
+    /// Fetching the world to load: bytes present of the whole.
+    Fetching { bytes: u64, total: u64 },
+    /// The game is loading its world.
+    Loading,
+    /// The game plays the room's world.
+    Playing,
+}
+
+/// A status shared between a bridge and a front end.
+pub type SharedStatus = Arc<Mutex<Status>>;
+
+fn push_bounded<T>(list: &mut VecDeque<T>, item: T) {
+    if list.len() == STATUS_HISTORY {
+        list.pop_front();
+    }
+    list.push_back(item);
 }
 
 #[derive(Debug, Error)]
@@ -146,6 +228,8 @@ pub enum BridgeEnd {
     EventsEnded,
     /// The world to load could not be fetched. Rejoining gets a new offer.
     WorldUnavailable,
+    /// The player left the room.
+    Left,
 }
 
 /// Where the game's world stands with respect to the turn stream.
@@ -221,6 +305,8 @@ pub struct Bridge<L> {
     saved: VecDeque<ManifestId>,
     /// The world last received.
     received: Option<ManifestId>,
+    /// What a front end asks of the session.
+    controls: Option<mpsc::Receiver<Control>>,
 }
 
 impl<L: HookLink> Bridge<L> {
@@ -251,6 +337,21 @@ impl<L: HookLink> Bridge<L> {
             fetch: None,
             saved: VecDeque::new(),
             received: None,
+            controls: None,
+        }
+    }
+
+    /// Takes a front end's requests (ready, start, speed, chat, leave) from
+    /// `controls` while the session runs.
+    pub fn with_controls(mut self, controls: mpsc::Receiver<Control>) -> Self {
+        self.controls = Some(controls);
+        self
+    }
+
+    /// Updates the front end's view of the session, if it has one.
+    fn status(&self, update: impl FnOnce(&mut Status)) {
+        if let Some(status) = &self.options.status {
+            update(&mut status.lock().unwrap_or_else(PoisonError::into_inner));
         }
     }
 
@@ -290,6 +391,11 @@ impl<L: HookLink> Bridge<L> {
                 }
                 Some(done) = self.done_rx.recv() => {
                     if let Some(end) = self.on_done(done, client).await? {
+                        return Ok(end);
+                    }
+                }
+                Some(control) = next_control(&mut self.controls) => {
+                    if let Some(end) = self.on_control(control, client).await {
                         return Ok(end);
                     }
                 }
@@ -358,6 +464,7 @@ impl<L: HookLink> Bridge<L> {
                     check_version(version)?;
                     info!(%build, "the game's hook attached");
                     self.hook_ready = true;
+                    self.status(|status| status.game = Some(build.as_str().to_owned()));
                     // The hello goes first, ahead of a game that began
                     // before the hook attached.
                     self.outbox.push_front(ToHook::Hello {
@@ -378,6 +485,7 @@ impl<L: HookLink> Bridge<L> {
                         });
                     }
                     self.world = World::Ready;
+                    self.status(|status| status.world = WorldStatus::Playing);
                     // Loaded counts as progress: the server holds the room
                     // until every member has loaded.
                     let progress = next_step.saturating_sub(1);
@@ -390,7 +498,10 @@ impl<L: HookLink> Bridge<L> {
                     client.send_intent(self.commands, payload).await?;
                     self.commands += 1;
                 }
-                ToAgent::Ran { step } if current => self.progress = Some(step),
+                ToAgent::Ran { step } if current => {
+                    self.progress = Some(step);
+                    self.status(|status| status.step = Some(step));
+                }
                 ToAgent::Checkpoint { step, lanes } if current => {
                     client.report_checkpoint(step, lanes).await?;
                 }
@@ -398,6 +509,7 @@ impl<L: HookLink> Bridge<L> {
                     self.saved_world(event, lanes, file, client).await?;
                 }
                 ToAgent::Ran { .. } | ToAgent::Checkpoint { .. } | ToAgent::Saved { .. } => {}
+                ToAgent::Chat { text } => self.request(client, Request::Chat(text)),
                 ToAgent::Log { message } => info!(hook = %message),
             }
         }
@@ -516,6 +628,8 @@ impl<L: HookLink> Bridge<L> {
                 if follower.speed() != self.speed {
                     self.speed = follower.speed();
                     self.outbox.push_back(ToHook::Speed(self.speed));
+                    let speed = self.speed;
+                    self.status(|status| status.speed = speed);
                 }
             }
             ClientEvent::IntentRejected { client_seq, reason } => {
@@ -523,12 +637,32 @@ impl<L: HookLink> Bridge<L> {
                     command: client_seq,
                     reason,
                 });
+                self.status(|status| {
+                    status.notice(format!("the room refused an action: {reason:?}"))
+                });
             }
             ClientEvent::Diverged { step, lanes } => {
+                self.status(|status| {
+                    status.notice(format!(
+                        "your world differed from the room's at step {step}; the room's replaces it"
+                    ));
+                });
                 self.outbox.push_back(ToHook::Diverged { step, lanes });
             }
             ClientEvent::Upload { event, snapshot } => self.upload(event, snapshot, client),
-            ClientEvent::RoomUpdate(_) => {}
+            ClientEvent::Chat { from, text } => {
+                // The game hears chat once its session began; the front end
+                // hears all of it.
+                if self.begun {
+                    let name = self.name_of(&from);
+                    self.outbox.push_back(ToHook::Chat {
+                        from: name,
+                        text: text.clone(),
+                    });
+                }
+                self.status(|status| push_bounded(&mut status.chat, (from, text)));
+            }
+            ClientEvent::RoomUpdate(room) => self.status(|status| status.room = Some(room)),
             ClientEvent::Kicked => return Ok(Some(BridgeEnd::Kicked)),
             ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
         }
@@ -615,10 +749,22 @@ impl<L: HookLink> Bridge<L> {
             attempt,
         };
         info!(snapshot = %offer.snapshot, bytes = offer.size, "fetching the world to load");
+        let total = offer.size;
+        self.status(|status| status.world = WorldStatus::Fetching { bytes: 0, total });
         let opener = client.bulk();
         let done = self.done_tx.clone();
+        let status = self.options.status.clone();
         let task = tokio::spawn(async move {
-            let result = transfer::fetch_world(&opener, &worlds, offer, |_| {})
+            let progress = |progress: tpf3mp_snapshot::Progress| {
+                if let Some(status) = &status {
+                    let mut status = status.lock().unwrap_or_else(PoisonError::into_inner);
+                    status.world = WorldStatus::Fetching {
+                        bytes: progress.bytes_present,
+                        total: progress.bytes_total,
+                    };
+                }
+            };
+            let result = transfer::fetch_world(&opener, &worlds, offer, progress)
                 .await
                 .map(|(file, manifest)| (file, manifest.id()))
                 .map_err(|error| error.to_string());
@@ -634,7 +780,59 @@ impl<L: HookLink> Bridge<L> {
         self.void_world();
         self.outbox.push_back(ToHook::Load { file, next_step });
         self.world = World::Loading { next_step };
+        self.status(|status| status.world = WorldStatus::Loading);
         Ok(())
+    }
+
+    /// Carries out a front end's request. Requests go out on a task of their
+    /// own, so a round trip never holds up the game; leaving ends the
+    /// session once the room has let the player go.
+    async fn on_control(&mut self, control: Control, client: &Client) -> Option<BridgeEnd> {
+        let request = match control {
+            Control::Ready(ready) => Request::SetReady(ready),
+            Control::Start => Request::StartGame,
+            Control::Speed(speed) => Request::SetSpeed(speed),
+            Control::Kick(player) => Request::Kick(player),
+            Control::Chat(text) => Request::Chat(text),
+            Control::Leave => {
+                if let Err(error) = client.leave_room().await {
+                    debug!(%error, "leaving the room failed; ending the session anyway");
+                }
+                return Some(BridgeEnd::Left);
+            }
+        };
+        self.request(client, request);
+        None
+    }
+
+    /// Sends a request on a task of its own; a refusal becomes a notice.
+    fn request(&self, client: &Client, request: Request) {
+        let requests = client.requests();
+        let status = self.options.status.clone();
+        tokio::spawn(async move {
+            if let Err(error) = requests.done(request).await
+                && let Some(status) = status
+            {
+                status
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .notice(error.to_string());
+            }
+        });
+    }
+
+    /// A member's name, as the room last announced it.
+    fn name_of(&self, player: &PlayerId) -> Text<32> {
+        let known = self.options.status.as_ref().and_then(|status| {
+            let status = status.lock().unwrap_or_else(PoisonError::into_inner);
+            let room = status.room.as_ref()?;
+            let member = room
+                .members
+                .iter()
+                .find(|member| member.player == *player)?;
+            Some(member.name.clone())
+        });
+        known.unwrap_or_else(|| Text::lossy(&player.to_string()))
     }
 
     /// Forgets what the game was sent for its current world and how far it
@@ -744,6 +942,7 @@ pub async fn play<L: HookLink>(
         match bridge.run(&client, &mut events).await {
             Ok(BridgeEnd::Closed(reason)) if worth_rejoining(&reason) => {
                 warn!(%reason, "lost the server; rejoining the room");
+                bridge.status(|status| status.notice("lost the server; rejoining the room"));
             }
             Ok(BridgeEnd::WorldUnavailable) => {
                 warn!("the world to load was not available; rejoining the room for another");
@@ -761,6 +960,7 @@ pub async fn play<L: HookLink>(
         match rejoin_room(bridge, rejoin).await {
             Ok((new_client, new_events)) => {
                 info!("rejoined the room");
+                bridge.status(|status| status.notice("rejoined the room"));
                 client = new_client;
                 events = new_events;
             }
@@ -833,6 +1033,14 @@ async fn rejoin_room<L: HookLink>(
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
         }
+    }
+}
+
+/// The next request of a front end, or never without one.
+async fn next_control(controls: &mut Option<mpsc::Receiver<Control>>) -> Option<Control> {
+    match controls {
+        Some(controls) => controls.recv().await,
+        None => std::future::pending().await,
     }
 }
 

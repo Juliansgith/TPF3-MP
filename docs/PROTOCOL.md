@@ -50,6 +50,10 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
 - **Closing.** A room closes when its last member leaves. A running game
   also closes when nobody has been connected to it for 10 minutes; until
   then, disconnected players keep their seats and can resume.
+- **Chat.** Any member can say something to the room (`Chat`, up to 280
+  bytes). Every member hears it, the sender too, so everyone sees one
+  conversation. A player may send one message a second, with a burst of
+  five.
 - **Kicking.** The owner can remove another player (`Kick`), for example
   one whose game froze. The player receives `Kicked` and leaves as if they
   had chosen to; in a running game every replica sees `PlayerLeft` at one

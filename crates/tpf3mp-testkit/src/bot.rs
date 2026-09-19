@@ -203,7 +203,9 @@ impl Bot {
                 }
                 ClientEvent::Diverged { step, lanes } => self.report.diverged.push((step, lanes)),
                 // Bots keep no worlds, so they never save one to upload.
-                ClientEvent::RoomUpdate(_) | ClientEvent::Upload { .. } => {}
+                ClientEvent::RoomUpdate(_)
+                | ClientEvent::Upload { .. }
+                | ClientEvent::Chat { .. } => {}
                 ClientEvent::Kicked => return Err(BotError::Closed("kicked from the room".into())),
                 ClientEvent::Closed(reason) => return Err(BotError::Closed(reason.to_string())),
             }

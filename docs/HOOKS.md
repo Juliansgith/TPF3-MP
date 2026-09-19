@@ -270,6 +270,8 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
   - `Release { through }`: steps up to and including this one may run.
   - `Speed`: the room's speed, for display only.
   - `Diverged`, `Refused`: tell the player.
+  - `Chat { from, text }`: a member of the room said something. Sent only
+    once the game has begun; talk in the lobby stays in the launcher.
   - `End`: the session is over.
 - **From the hook (`ToAgent`):**
   - `Hello`: always first, with the game build.
@@ -279,6 +281,8 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
   - `Checkpoint { step, lanes }`: digests at a checkpoint.
   - `Saved { event, lanes, file }`: the world as saved at a save event, and
     its digests there; no file if saving failed.
+  - `Chat { text }`: the player says something to the room
+    (`Session::chat`).
   - `Log`: a line for the agent's log.
 - **The step gate.** The game asks the hook's `Gate` before every step. Until
   the step is released, the hook reads messages and applies each event the

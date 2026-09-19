@@ -85,6 +85,11 @@ Everything is Rust. The hook and agent talk through a small shared-memory ABI,
 never the network protocol, so the hook stays small and independently
 testable.
 
+Players drive the agent from the launcher, a page it serves on the loopback
+interface (`tpf3mp-agent launcher`): connecting, rooms, readiness, chat and
+the game's progress. An in-game interface can use the same actions through
+the hook's Lua bindings once they exist.
+
 ## Authority and data flow
 
 1. **Intent.** A player acts in the stock UI. The hook captures the native

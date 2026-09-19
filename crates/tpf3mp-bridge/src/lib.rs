@@ -27,7 +27,7 @@ mod session;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tpf3mp_proto::{Event, IntentRejection, LaneDigest, Payload, Speed, Text};
+use tpf3mp_proto::{ChatText, Event, IntentRejection, LaneDigest, Payload, Speed, Text};
 
 pub use gate::{Gate, GateError, Gated};
 pub use session::{Begin, Game, Load, Notice, Session, SessionError, StepGate};
@@ -87,6 +87,8 @@ pub enum ToHook {
         file: Option<Text<MAX_PATH>>,
         next_step: u64,
     },
+    /// A member of the room said something; `from` is their name.
+    Chat { from: Text<32>, text: ChatText },
 }
 
 /// From the hook to the agent.
@@ -111,6 +113,8 @@ pub enum ToAgent {
         lanes: Vec<LaneDigest>,
         file: Option<Text<MAX_PATH>>,
     },
+    /// The player says something to the room.
+    Chat { text: ChatText },
 }
 
 #[derive(Debug, Error)]
