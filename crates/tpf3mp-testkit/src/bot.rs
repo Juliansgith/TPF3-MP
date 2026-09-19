@@ -203,6 +203,7 @@ impl Bot {
                 }
                 ClientEvent::Diverged { step, lanes } => self.report.diverged.push((step, lanes)),
                 ClientEvent::RoomUpdate(_) => {}
+                ClientEvent::Kicked => return Err(BotError::Closed("kicked from the room".into())),
                 ClientEvent::Closed(reason) => return Err(BotError::Closed(reason.to_string())),
             }
         }

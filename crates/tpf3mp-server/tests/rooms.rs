@@ -5,7 +5,7 @@
 mod common;
 
 use common::{FAST, RunningServer, content, join, room};
-use tpf3mp_agent::ClientError;
+use tpf3mp_agent::{ClientError, ClientEvent};
 use tpf3mp_proto::{
     CreateRoom, FixedBytes, Invite, JoinRoom, RequestError, RoomId, RoomPhase, RoomSettings, Text,
 };
@@ -210,6 +210,42 @@ async fn an_address_has_only_so_many_open_rooms() {
     ann.client.leave_room().await.unwrap();
     server.wait_for_rooms(0).await;
     bob.client.create_room(room("two", FAST)).await.unwrap();
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn the_owner_can_kick_a_player_for_good() {
+    let server = RunningServer::start(|_| {}).await;
+    let ann = server.client("ann").await;
+    let mut bob = server.client("bob").await;
+    let cat = server.client("cat").await;
+    let (invite, _) = ann.client.create_room(room("table", FAST)).await.unwrap();
+    bob.client.join_room(join(&invite)).await.unwrap();
+    cat.client.join_room(join(&invite)).await.unwrap();
+    let bob_id = bob.client.player();
+
+    assert_eq!(
+        cat.client.kick(bob_id).await.unwrap_err(),
+        ClientError::Refused(RequestError::NotOwner)
+    );
+    assert_eq!(
+        ann.client.kick(ann.client.player()).await.unwrap_err(),
+        ClientError::Refused(RequestError::CannotKickSelf)
+    );
+    ann.client.kick(bob_id).await.unwrap();
+    bob.wait_for(|event| matches!(event, ClientEvent::Kicked).then_some(()))
+        .await;
+    assert_eq!(
+        ann.client.kick(bob_id).await.unwrap_err(),
+        ClientError::Refused(RequestError::NoSuchPlayer)
+    );
+    // Bob cannot come back, even with the invite.
+    assert_eq!(
+        bob.client.join_room(join(&invite)).await.unwrap_err(),
+        ClientError::Refused(RequestError::BadInvite)
+    );
+    // He is free to make a room of his own.
+    bob.client.create_room(room("mine", FAST)).await.unwrap();
     server.shut_down().await;
 }
 

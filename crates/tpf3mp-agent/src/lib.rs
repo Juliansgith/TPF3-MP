@@ -143,6 +143,8 @@ pub enum ClientEvent {
     /// A turn stream began; turns that follow continue from it.
     TurnStream(TurnStart),
     Turn(Turn),
+    /// The room's owner removed this player, who cannot come back to it.
+    Kicked,
     /// The connection ended.
     Closed(quinn::ConnectionError),
 }
@@ -401,6 +403,11 @@ impl Client {
         self.done(Request::SetSpeed(speed)).await
     }
 
+    /// Removes a player from the room for good; only the owner may.
+    pub async fn kick(&self, player: PlayerId) -> Result<(), ClientError> {
+        self.done(Request::Kick(player)).await
+    }
+
     async fn done(&self, request: Request) -> Result<(), ClientError> {
         match self.request(request).await? {
             Response::Done => Ok(()),
@@ -501,6 +508,7 @@ async fn read_control(
                 ClientEvent::IntentRejected { client_seq, reason }
             }
             ServerMessage::Diverged { step, lanes } => ClientEvent::Diverged { step, lanes },
+            ServerMessage::Kicked => ClientEvent::Kicked,
             ServerMessage::Welcome(_) | ServerMessage::Reject(_) => {
                 connection.close(close::PROTOCOL_VIOLATION, b"unexpected handshake message");
                 break;

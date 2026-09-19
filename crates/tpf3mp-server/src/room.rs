@@ -139,6 +139,17 @@ pub(crate) enum RoomCommand {
         speed: Speed,
         reply: Reply,
     },
+    Kick {
+        player: PlayerId,
+        target: PlayerId,
+        reply: Reply,
+    },
+    /// Whether the player is still a member; `NotInRoom` if not, for
+    /// example after a kick.
+    IsMember {
+        player: PlayerId,
+        reply: Reply,
+    },
     Intent {
         player: PlayerId,
         client_seq: u64,
@@ -401,6 +412,8 @@ pub(crate) struct Room {
     /// Since when no member has been connected, while the game runs.
     unattended_since: Option<Instant>,
     password_guard: PasswordGuard,
+    /// Players the owner removed, who cannot join again.
+    banned: BTreeSet<PlayerId>,
     /// Counts this room against the address that created it until it
     /// closes. Restored rooms have none.
     _share: Option<RoomShare>,
@@ -471,6 +484,7 @@ impl Room {
             log: None,
             unattended_since: None,
             password_guard: PasswordGuard::new(),
+            banned: BTreeSet::new(),
             _share: Some(spec.share),
             closed: false,
         };
@@ -623,6 +637,7 @@ impl Room {
             // from here.
             unattended_since: None,
             password_guard: PasswordGuard::new(),
+            banned: BTreeSet::new(),
             _share: None,
             closed: false,
         }))
@@ -732,6 +747,21 @@ impl Room {
             } => {
                 let _ = reply.send(self.set_speed(player, speed));
             }
+            RoomCommand::Kick {
+                player,
+                target,
+                reply,
+            } => {
+                let _ = reply.send(self.kick(player, target));
+            }
+            RoomCommand::IsMember { player, reply } => {
+                let member = self.members.iter().any(|m| m.player == player);
+                let _ = reply.send(if member {
+                    Ok(())
+                } else {
+                    Err(RequestError::NotInRoom)
+                });
+            }
             RoomCommand::Intent {
                 player,
                 client_seq,
@@ -790,6 +820,9 @@ impl Room {
         resume: Option<Resume>,
     ) -> Result<RoomView, RequestError> {
         let now = Instant::now();
+        if self.banned.contains(&new.player) {
+            return Err(RequestError::BadInvite);
+        }
         let seated = self.members.iter().any(|m| m.player == new.player);
         match self.secrets.check(&self.id, token, password) {
             Admittance::Admitted if seated || self.password_guard.open(now) => {}
@@ -852,6 +885,26 @@ impl Room {
         }
         self.after_departure(player);
         Ok(())
+    }
+
+    /// The owner removes a player for good: the player is told, leaves as if
+    /// by choice, and cannot join this room again.
+    fn kick(&mut self, by: PlayerId, target: PlayerId) -> Result<(), RequestError> {
+        if by != self.owner {
+            return Err(RequestError::NotOwner);
+        }
+        if target == by {
+            return Err(RequestError::CannotKickSelf);
+        }
+        let index = self
+            .members
+            .iter()
+            .position(|member| member.player == target)
+            .ok_or(RequestError::NoSuchPlayer)?;
+        info!(room = %self.id, player = %target, "the owner removed a player");
+        self.push(index, ServerMessage::Kicked);
+        self.banned.insert(target);
+        self.leave(target)
     }
 
     fn disconnected(&mut self, player: PlayerId, link: u64) {

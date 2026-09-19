@@ -206,6 +206,7 @@ pub struct Player {
     pub diverged: Vec<(u64, Vec<u16>)>,
     pub room: Option<RoomView>,
     pub closed: bool,
+    pub kicked: bool,
     /// Whether this player reports progress; a player that never does holds
     /// the room at the load gate.
     pub reports_progress: bool,
@@ -224,6 +225,7 @@ impl Player {
             diverged: Vec::new(),
             room: None,
             closed: false,
+            kicked: false,
             reports_progress: true,
             lanes: None,
         }
@@ -281,6 +283,7 @@ impl Player {
                 self.rejections.push((client_seq, reason));
             }
             ClientEvent::Diverged { step, lanes } => self.diverged.push((step, lanes)),
+            ClientEvent::Kicked => self.kicked = true,
             ClientEvent::Closed(_) => self.closed = true,
         }
     }

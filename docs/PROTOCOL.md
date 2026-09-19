@@ -48,6 +48,10 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
 - **Closing.** A room closes when its last member leaves. A running game
   also closes when nobody has been connected to it for 10 minutes; until
   then, disconnected players keep their seats and can resume.
+- **Kicking.** The owner can remove another player (`Kick`), for example
+  one whose game froze. The player receives `Kicked` and leaves as if they
+  had chosen to; in a running game every replica sees `PlayerLeft` at one
+  step. A kicked player cannot join that room again.
 - **Invites.** The server answers with an **invite**,
   `TPF3MP1.<base64url(room id ‖ 256-bit token)>`. The server stores only an
   HMAC of the token under a server-side pepper and checks it in constant time.

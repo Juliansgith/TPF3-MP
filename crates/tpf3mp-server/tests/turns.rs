@@ -380,6 +380,31 @@ async fn a_reconnecting_player_resumes_exactly() {
 }
 
 #[tokio::test]
+async fn a_kicked_player_leaves_the_running_game() {
+    let server = RunningServer::start(|_| {}).await;
+    let clients = vec![server.client("ann").await, server.client("bob").await];
+    let (players, _) = start(clients, FAST).await;
+    let mut players = play_all(players, |p| p.executed >= 5).await;
+    let mut bob = players.pop().unwrap();
+    let mut ann = players.pop().unwrap();
+    let bob_id = bob.client().player();
+
+    ann.client().kick(bob_id).await.unwrap();
+    bob.play_until(|p| p.kicked).await;
+    // Every replica learns of it through the log, at one step.
+    ann.play_until(|p| {
+        p.applied.iter().any(
+            |event| matches!(&event.body, EventBody::PlayerLeft { player } if *player == bob_id),
+        )
+    })
+    .await;
+    // The room runs on without him.
+    let executed = ann.executed;
+    ann.play_until(|p| p.executed >= executed + 20).await;
+    server.shut_down().await;
+}
+
+#[tokio::test]
 async fn resuming_from_the_future_is_refused() {
     let server = RunningServer::start(|_| {}).await;
     let clients = vec![server.client("ann").await, server.client("bob").await];

@@ -117,6 +117,8 @@ pub enum BridgeFault {
 pub enum BridgeEnd {
     /// The connection to the server closed.
     Closed(quinn::ConnectionError),
+    /// The room's owner removed this player.
+    Kicked,
     /// The client's events ended.
     EventsEnded,
 }
@@ -355,6 +357,7 @@ impl<L: HookLink> Bridge<L> {
                 self.outbox.push_back(ToHook::Diverged { step, lanes });
             }
             ClientEvent::RoomUpdate(_) => {}
+            ClientEvent::Kicked => return Ok(Some(BridgeEnd::Kicked)),
             ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
         }
         Ok(None)

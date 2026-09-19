@@ -382,7 +382,7 @@ impl Client {
     async fn request(&mut self, request: Request) -> Result<Response, RequestError> {
         match request {
             Request::CreateRoom(create) => {
-                if self.room.is_some() {
+                if self.still_in_room().await {
                     return Err(RequestError::AlreadyInRoom);
                 }
                 let share = self
@@ -398,7 +398,7 @@ impl Client {
                 Ok(Response::RoomCreated { invite, room })
             }
             Request::JoinRoom(join) => {
-                if self.room.is_some() {
+                if self.still_in_room().await {
                     return Err(RequestError::AlreadyInRoom);
                 }
                 let handle = self
@@ -455,7 +455,33 @@ impl Client {
                 })
                 .await
             }
+            Request::Kick(target) => {
+                self.in_room(|player, reply| RoomCommand::Kick {
+                    player,
+                    target,
+                    reply,
+                })
+                .await
+            }
         }
+    }
+
+    /// Whether this client is still in the room it last entered. A kick or
+    /// a closed room leaves it without the connection being told, so the
+    /// room is asked.
+    async fn still_in_room(&mut self) -> bool {
+        let Some(handle) = &self.room else {
+            return false;
+        };
+        let player = self.player;
+        let member = handle
+            .request(|reply| RoomCommand::IsMember { player, reply })
+            .await
+            .is_ok();
+        if !member {
+            self.room = None;
+        }
+        member
     }
 
     async fn in_room(

@@ -47,6 +47,8 @@ pub enum ServerMessage {
         step: u64,
         lanes: Vec<u16>,
     },
+    /// The room's owner removed this player, who cannot come back to it.
+    Kicked,
 }
 
 /// The client's first message after the preamble.
@@ -104,6 +106,9 @@ pub enum Request {
     DeclareContent(ContentFingerprint),
     StartGame,
     SetSpeed(Speed),
+    /// The owner removes a player from the room for good, for example one
+    /// whose game froze.
+    Kick(PlayerId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +166,10 @@ pub enum RequestError {
     ResumeUnavailable,
     /// The connection sent requests faster than the server allows.
     RateLimited,
+    /// No such player is in the room.
+    NoSuchPlayer,
+    /// The owner cannot kick themselves; they can leave.
+    CannotKickSelf,
 }
 
 impl fmt::Display for RequestError {
@@ -179,6 +188,8 @@ impl fmt::Display for RequestError {
             Self::TooManyRooms => "the server cannot host more rooms",
             Self::ResumeUnavailable => "the game can no longer be resumed from that point",
             Self::RateLimited => "too many requests; try again in a moment",
+            Self::NoSuchPlayer => "no such player is in the room",
+            Self::CannotKickSelf => "the owner cannot kick themselves; leave the room instead",
         })
     }
 }
