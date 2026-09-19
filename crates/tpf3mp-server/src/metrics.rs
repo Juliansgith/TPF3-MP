@@ -28,6 +28,7 @@ pub(crate) struct Metrics {
     pub(crate) late_joins: AtomicU64,
     pub(crate) rebases: AtomicU64,
     pub(crate) snapshot_bytes_served: AtomicU64,
+    pub(crate) logs_compacted: AtomicU64,
 }
 
 /// Values measured at scrape time rather than counted.
@@ -46,7 +47,7 @@ pub(crate) fn add(counter: &AtomicU64, amount: u64) {
 
 impl Metrics {
     pub(crate) fn render(&self, gauges: &Gauges) -> String {
-        let counters: [(&str, &str, &AtomicU64); 21] = [
+        let counters: [(&str, &str, &AtomicU64); 22] = [
             (
                 "sessions_opened",
                 "Sessions that completed the handshake.",
@@ -139,6 +140,11 @@ impl Metrics {
                 "snapshot_bytes_served",
                 "Compressed snapshot bytes sent to players.",
                 &self.snapshot_bytes_served,
+            ),
+            (
+                "logs_compacted",
+                "Room logs rewritten to start from their game's current state.",
+                &self.logs_compacted,
             ),
         ];
         let mut out = String::new();

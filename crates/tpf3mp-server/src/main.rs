@@ -100,6 +100,11 @@ struct Args {
     /// wait for a world, in seconds.
     #[arg(long, default_value_t = 60)]
     save_gap_secs: u64,
+
+    /// Size in MiB past which a running game's log is compacted to start
+    /// from the game's current state.
+    #[arg(long, default_value_t = 64)]
+    compact_log_mib: u64,
 }
 
 #[tokio::main]
@@ -136,6 +141,7 @@ async fn main() -> Result<()> {
     config.max_rooms = args.max_rooms;
     config.max_rooms_per_address = args.max_rooms_per_address;
     config.data_dir = args.data_dir.clone();
+    config.compact_log_at = args.compact_log_mib.max(1).saturating_mul(1 << 20);
     let snapshot_dir = match (&args.snapshot_dir, &args.data_dir) {
         _ if args.no_snapshots => None,
         (Some(dir), _) => Some(dir.clone()),

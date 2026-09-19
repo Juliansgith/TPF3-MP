@@ -30,6 +30,21 @@ fn persistent(dir: &Path, secret: [u8; 32]) -> impl FnOnce(&mut ServerConfig) {
     }
 }
 
+/// Like [`persistent`], compacting logs past `compact_log_at` bytes if given.
+fn compacting(
+    dir: &Path,
+    secret: [u8; 32],
+    compact_log_at: Option<u64>,
+) -> impl FnOnce(&mut ServerConfig) {
+    let persist = persistent(dir, secret);
+    move |config: &mut ServerConfig| {
+        persist(config);
+        if let Some(at) = compact_log_at {
+            config.compact_log_at = at;
+        }
+    }
+}
+
 fn commands(player: &Player) -> usize {
     player
         .applied
@@ -91,10 +106,19 @@ async fn resume(server: &RunningServer, players: Vec<Player>, invite: &Invite) -
 
 #[tokio::test]
 async fn a_running_game_survives_a_server_restart() {
-    let dir = data_dir("restart");
-    let secret = [7; 32];
+    survive_a_restart("restart", [7; 32], None).await;
+}
 
-    let first = RunningServer::start(persistent(&dir, secret)).await;
+#[tokio::test]
+async fn a_game_restored_from_a_compacted_log_plays_on() {
+    // A tiny threshold compacts the log each time it doubles, so the
+    // restart restores from a base.
+    survive_a_restart("compacted", [9; 32], Some(256)).await;
+}
+
+async fn survive_a_restart(name: &str, secret: [u8; 32], compact_log_at: Option<u64>) {
+    let dir = data_dir(name);
+    let first = RunningServer::start(compacting(&dir, secret, compact_log_at)).await;
     let mut clients: Vec<TestClient> = vec![first.client("ann").await, first.client("bob").await];
     let mut seats: Vec<&mut TestClient> = clients.iter_mut().collect();
     let invite = seat(&mut seats, FAST).await;
@@ -106,10 +130,17 @@ async fn a_running_game_survives_a_server_restart() {
         .await
         .unwrap();
     let players = play_all(players, |p| commands(p) == 1 && p.executed >= 20).await;
+    if compact_log_at.is_some() {
+        let metrics = first.stats.render_metrics();
+        assert!(
+            !metrics.contains("tpf3mp_logs_compacted_total 0\n"),
+            "the log was compacted:\n{metrics}"
+        );
+    }
     first.shut_down().await;
 
     // A new server process on the same data directory and secret.
-    let second = RunningServer::start(persistent(&dir, secret)).await;
+    let second = RunningServer::start(compacting(&dir, secret, compact_log_at)).await;
     assert_eq!(second.stats.rooms(), 1, "the room was restored");
     let players = resume(&second, players, &invite).await;
     players[1]

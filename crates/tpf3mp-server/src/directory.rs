@@ -80,11 +80,24 @@ impl Directory {
         };
         // Only regular files: a planted link must not lead recovery, which
         // may cut a torn record, to some other file.
-        let mut paths: Vec<PathBuf> = entries
+        let files: Vec<PathBuf> = entries
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        let has_extension =
+            |path: &PathBuf, wanted: &str| path.extension().is_some_and(|ext| ext == wanted);
+        for partial in files
+            .iter()
+            .filter(|path| has_extension(path, "compacting"))
+        {
+            // A compaction the last process did not finish; the log it
+            // would have replaced is whole.
+            let _ = fs::remove_file(partial);
+        }
+        let mut paths: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|path| has_extension(path, "log"))
             .collect();
         paths.sort();
         let mut restored = 0;

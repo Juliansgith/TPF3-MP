@@ -9,7 +9,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
 use tpf3mp_net::{ServerIdentity, ServerTrust};
 use tpf3mp_proto::{RoomSettings, Speed};
-use tpf3mp_server::{Server, ServerConfig, SnapshotConfig};
+use tpf3mp_server::{Server, ServerConfig, ServerStats, SnapshotConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -22,6 +22,7 @@ use tpf3mp_testkit::{
 struct TestServer {
     address: SocketAddr,
     trust: ServerTrust,
+    stats: ServerStats,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -73,6 +74,9 @@ impl TestServer {
         }
         config.snapshots = snapshots;
         config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
+        // Compact logs every second or two of play, so restarts restore the
+        // canonical ledger from a compacted log's base.
+        config.compact_log_at = 1 << 10;
         config.tick = Duration::from_millis(25);
         // Every bot connects from loopback, one address.
         config.max_sessions_per_address = 1000;
@@ -80,6 +84,7 @@ impl TestServer {
         config.max_rooms_per_address = 1000;
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();
+        let stats = server.stats();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(server.run(async {
             let _ = stopped.await;
@@ -87,6 +92,7 @@ impl TestServer {
         Self {
             address,
             trust,
+            stats,
             stop: Some(stop),
             task,
         }
@@ -308,6 +314,11 @@ async fn games_ride_out_a_server_restart() {
     // Mid-game, the server is upgraded: it stops, and a new process takes
     // over the same address and data directory.
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let metrics = first.stats.render_metrics();
+    assert!(
+        !metrics.contains("tpf3mp_logs_compacted_total 0\n"),
+        "the restart restores from a compacted log:\n{metrics}"
+    );
     first.stop().await;
     let second = TestServer::start_with(address, identity, Some((dir.clone(), secret))).await;
 

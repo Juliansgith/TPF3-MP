@@ -32,7 +32,7 @@ use crate::{
     limit::TokenBucket,
     metrics::{self, Metrics},
     pacing::Pacer,
-    persist::{self, LogError, RoomLog, StartMember, StartRecord},
+    persist::{self, Base, LogError, RoomLog, StartMember, StartRecord},
     ruleset::Ruleset,
     snapshots::{
         self, Agreed, Candidates, Pointer, SAVE_DEADLINE, SavePoint, SaveReport, SaveRound, Saves,
@@ -468,7 +468,12 @@ struct Game {
     /// one begins at each recovery, after the last turn logged.
     histories: Vec<History>,
     saves: Saves,
+    /// Who sits at the table as the events say, in join order.
+    seated: Vec<Seat>,
 }
+
+/// A player at a game's table: who, under which name, on which platform.
+type Seat = (PlayerId, Text<32>, Platform);
 
 /// A stretch of a game's turns that clients can resume on.
 struct History {
@@ -520,6 +525,10 @@ pub(crate) struct Room {
     data_dir: Option<PathBuf>,
     timeouts: Timeouts,
     log: Option<RoomLog>,
+    /// The log's size at which it is compacted next.
+    compact_at: u64,
+    /// See [`RoomEnv::compact_log_at`].
+    compact_log_at: u64,
     /// Since when no member has been connected, while the game runs.
     unattended_since: Option<Instant>,
     password_guard: PasswordGuard,
@@ -545,6 +554,8 @@ pub(crate) struct RoomEnv {
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) timeouts: Timeouts,
     pub(crate) snapshots: Option<Arc<Snapshots>>,
+    /// A game's log is compacted once it grows past this many bytes.
+    pub(crate) compact_log_at: u64,
 }
 
 /// Why a room log could not be turned back into a room.
@@ -570,6 +581,10 @@ pub(crate) enum RecoverError {
     Continuity(usize),
     #[error("turn record {0} seals implausibly far")]
     Frontier(usize),
+    #[error("the log's base contradicts itself")]
+    Base,
+    #[error("the rules cannot take on the log's base: {0}")]
+    Rules(String),
 }
 
 pub(crate) struct RoomSpec {
@@ -600,6 +615,8 @@ impl Room {
             data_dir: spec.env.data_dir,
             timeouts: spec.env.timeouts,
             log: None,
+            compact_at: spec.env.compact_log_at,
+            compact_log_at: spec.env.compact_log_at,
             unattended_since: None,
             password_guard: PasswordGuard::new(),
             banned: BTreeSet::new(),
@@ -614,7 +631,9 @@ impl Room {
 
     /// Rebuilds a running room from its log: replays every turn through the
     /// ruleset and seats everyone who had not left, disconnected and ready to
-    /// resume. A log whose players had all left is deleted and gives `None`.
+    /// resume. A compacted log starts from its base instead, and replays
+    /// only the turns after it. A log whose players had all left is deleted
+    /// and gives `None`.
     pub(crate) fn recover(
         path: &Path,
         key: hmac::Key,
@@ -635,19 +654,44 @@ impl Room {
             return Err(RecoverError::Misnamed);
         }
         let mut game = Game::new(start.settings, start.history);
-        // Who sits at the table, in join order, and who was removed.
-        let mut seated: Vec<(PlayerId, Text<32>, Platform)> = Vec::new();
+        // Players the owner removed.
         let mut banned = BTreeSet::new();
+        let base = start.base.as_ref();
+        if let Some(base) = base {
+            if !game.rebase(base) || base.banned.len() > MAX_BANNED {
+                return Err(RecoverError::Base);
+            }
+            ruleset.restore(&base.rules).map_err(RecoverError::Rules)?;
+            banned.extend(base.banned.iter().copied());
+        }
+        // A compacted log's turns up to its base are only kept for players
+        // who resume: the base holds what they did.
+        let base_turn = base.map_or(0, |base| base.after_turn);
+        let mut based = base.is_none();
         let mut index = 0;
-        while let Some(frame) = reader.next_record()? {
+        loop {
+            if !based && game.next_turn > base_turn {
+                // The kept turns must end exactly where the base stands.
+                if !base.is_some_and(|base| game.meets(base)) {
+                    return Err(RecoverError::Continuity(index));
+                }
+                based = true;
+            }
+            let Some(frame) = reader.next_record()? else {
+                break;
+            };
             let turn = match frame
                 .get(FRAME_HEADER_LEN..)
                 .map(decode_frame::<TurnMessage>)
             {
                 Some(Ok(TurnMessage::Turn(turn))) => turn,
                 Some(Ok(TurnMessage::Start(marker))) => {
-                    // An earlier recovery began a new history here.
-                    if marker.next_turn != game.next_turn || marker.next_event != game.next_event {
+                    // An earlier recovery began a new history here. The
+                    // histories of the kept turns are in the base.
+                    if !based
+                        || marker.next_turn != game.next_turn
+                        || marker.next_event != game.next_event
+                    {
                         return Err(RecoverError::Continuity(index));
                     }
                     game.begin_history(marker.history);
@@ -671,23 +715,18 @@ impl Room {
                     return Err(RecoverError::Continuity(index));
                 }
                 game.next_event += 1;
+                if !based {
+                    continue;
+                }
                 ruleset.apply(event);
-                match &event.body {
-                    EventBody::PlayerLeft { player, kicked } => {
-                        seated.retain(|(seat, ..)| seat != player);
-                        if *kicked && banned.len() < MAX_BANNED {
-                            banned.insert(*player);
-                        }
-                    }
-                    EventBody::PlayerJoined {
-                        player,
-                        name,
-                        platform,
-                    } => {
-                        seated.retain(|(seat, ..)| seat != player);
-                        seated.push((*player, name.clone(), *platform));
-                    }
-                    EventBody::Command { .. } | EventBody::Save => {}
+                seat(&mut game.seated, event);
+                if let EventBody::PlayerLeft {
+                    player,
+                    kicked: true,
+                } = &event.body
+                    && banned.len() < MAX_BANNED
+                {
+                    banned.insert(*player);
                 }
             }
             game.remember(LoggedTurn {
@@ -701,12 +740,21 @@ impl Room {
             game.announced_speed = turn.speed;
             index += 1;
         }
+        if !based {
+            // The log ends among its kept turns.
+            return Err(RecoverError::Continuity(index));
+        }
         game.pacer.resume_at(game.sealed_through);
         // Every player started with the same content, and players who joined
         // later had to match it.
-        let content = start.members.first().and_then(|member| member.content);
-        let members: Vec<Member> = seated
-            .into_iter()
+        let content = match base {
+            Some(base) => base.content,
+            None => start.members.first().and_then(|member| member.content),
+        };
+        let members: Vec<Member> = game
+            .seated
+            .iter()
+            .cloned()
             .map(|(player, name, platform)| Member {
                 player,
                 name,
@@ -778,6 +826,8 @@ impl Room {
             data_dir: env.data_dir,
             timeouts: env.timeouts,
             log: Some(log),
+            compact_at: env.compact_log_at,
+            compact_log_at: env.compact_log_at,
             // Nobody is connected after a restart; the abandon timeout runs
             // from here.
             unattended_since: None,
@@ -1299,7 +1349,19 @@ impl Room {
         let Some(dir) = &self.data_dir else {
             return;
         };
-        let start = StartRecord {
+        let start = self.start_record(history, None);
+        match RoomLog::create(dir, &start) {
+            Ok(log) => self.log = Some(log),
+            Err(error) => {
+                error!(room = %self.id, %error, "cannot create the room log; the game will not survive a restart");
+            }
+        }
+    }
+
+    /// What the room's log starts with: the room, and for a compacted log
+    /// the game's state the log continues from.
+    fn start_record(&self, history: u64, base: Option<Base>) -> StartRecord {
+        StartRecord {
             version: persist::FORMAT_VERSION,
             history,
             id: self.id,
@@ -1319,11 +1381,54 @@ impl Room {
                     content: member.content,
                 })
                 .collect(),
+            base,
+        }
+    }
+
+    /// Rewrites a long game's log to start from where the game stands now,
+    /// keeping only the turns players may still resume on. Recovery then
+    /// replays only what comes after, and the log never reaches its size
+    /// limit. Runs right after sealing, when the rules have applied exactly
+    /// the logged events. Rules that cannot save their state keep the whole
+    /// log.
+    fn compact_log(&mut self) {
+        let (Some(dir), Some(written)) = (&self.data_dir, self.log.as_ref().map(RoomLog::written))
+        else {
+            return;
         };
-        match RoomLog::create(dir, &start) {
-            Ok(log) => self.log = Some(log),
+        let Phase::Running(game) = &self.phase else {
+            return;
+        };
+        if written < self.compact_at || !game.pending.is_empty() {
+            return;
+        }
+        let Some(rules) = self.ruleset.save() else {
+            self.compact_at = u64::MAX;
+            return;
+        };
+        let base = game.base(rules, self.content, &self.banned);
+        let first_history = game.histories.first().map_or(0, |history| history.id);
+        let start = self.start_record(first_history, Some(base));
+        let frames: Vec<&[u8]> = game.log.iter().map(|turn| &*turn.frame).collect();
+        let path = RoomLog::path_for(dir, &self.id);
+        // The rewrite replaces the file, which must not be open meanwhile.
+        drop(self.log.take());
+        match RoomLog::rewrite(dir, &start, &frames) {
+            Ok(log) => {
+                info!(room = %self.id, before = written, after = log.written(), "compacted the room log");
+                metrics::increment(&self.metrics.logs_compacted);
+                self.compact_at = next_compaction(log.written(), self.compact_log_at);
+                self.log = Some(log);
+            }
             Err(error) => {
-                error!(room = %self.id, %error, "cannot create the room log; the game will not survive a restart");
+                warn!(room = %self.id, %error, "cannot compact the room log; it keeps growing");
+                self.compact_at = next_compaction(written, self.compact_log_at);
+                match RoomLog::reopen(&path) {
+                    Ok(log) => self.log = Some(log),
+                    Err(error) => {
+                        error!(room = %self.id, %error, "cannot reopen the room log; it stops here");
+                    }
+                }
             }
         }
     }
@@ -2113,6 +2218,7 @@ impl Room {
                 }
             }
         }
+        self.compact_log();
     }
 
     /// Sends a control message to a member, disconnecting members whose
@@ -2287,6 +2393,30 @@ fn slowest_pacer(members: &[Member]) -> Option<u64> {
     slowest
 }
 
+/// Keeps `seated` as a game's events say: who sits at the table, in join
+/// order.
+fn seat(seated: &mut Vec<Seat>, event: &Event) {
+    match &event.body {
+        EventBody::PlayerLeft { player, .. } => seated.retain(|(seat, ..)| seat != player),
+        EventBody::PlayerJoined {
+            player,
+            name,
+            platform,
+        } => {
+            seated.retain(|(seat, ..)| seat != player);
+            seated.push((*player, name.clone(), *platform));
+        }
+        EventBody::Command { .. } | EventBody::Save => {}
+    }
+}
+
+/// Where a log compacted to `size` bytes is compacted next: once it has
+/// grown by `every`, or by its own size if that is more, so a rewrite never
+/// writes more than was appended since the last.
+fn next_compaction(size: u64, every: u64) -> u64 {
+    size.saturating_add(every.max(size))
+}
+
 /// A fresh history ID. It is random, so a client can never mistake a later
 /// history of the room for one it saw.
 fn new_history() -> u64 {
@@ -2323,6 +2453,79 @@ impl Game {
                 after_turn: 0,
             }],
             saves: Saves::default(),
+            seated: Vec::new(),
+        }
+    }
+
+    /// Stands the game where a compacted log's kept turns begin, with the
+    /// base's histories and table. `false` if the base contradicts itself.
+    fn rebase(&mut self, base: &Base) -> bool {
+        let consistent = base.first_turn >= 1
+            && base.first_turn <= base.after_turn.saturating_add(1)
+            && base.first_event >= 1
+            && base.first_event <= base.next_event
+            && base.sealed_before <= base.sealed_through
+            && base.sealed_through <= MAX_FRONTIER
+            && base.histories.first().is_some_and(|&(_, after)| after == 0)
+            && base.histories.windows(2).all(|pair| pair[0].1 <= pair[1].1)
+            && base
+                .histories
+                .last()
+                .is_some_and(|&(_, after)| after <= base.after_turn);
+        if !consistent {
+            return false;
+        }
+        self.next_turn = base.first_turn;
+        self.log_first_turn = base.first_turn;
+        self.next_event = base.first_event;
+        self.sealed_through = base.sealed_before;
+        self.sealed_before_log = base.sealed_before;
+        self.speed = base.speed;
+        self.announced_speed = base.speed;
+        self.histories = base
+            .histories
+            .iter()
+            .map(|&(id, after_turn)| History { id, after_turn })
+            .collect();
+        self.seated.clone_from(&base.seated);
+        true
+    }
+
+    /// Whether the game stands where `base` says its kept turns end.
+    fn meets(&self, base: &Base) -> bool {
+        self.next_turn == base.after_turn.saturating_add(1)
+            && self.next_event == base.next_event
+            && self.sealed_through == base.sealed_through
+    }
+
+    /// Where the game stands now, for a compacted log that keeps the turns
+    /// of the resume window. Only between turns: nothing may be pending.
+    fn base(
+        &self,
+        rules: Vec<u8>,
+        content: Option<ContentFingerprint>,
+        banned: &BTreeSet<PlayerId>,
+    ) -> Base {
+        Base {
+            first_turn: self.log_first_turn,
+            first_event: self
+                .log
+                .front()
+                .map_or(self.next_event, |turn| turn.first_event),
+            sealed_before: self.sealed_before_log,
+            after_turn: self.next_turn - 1,
+            next_event: self.next_event,
+            sealed_through: self.sealed_through,
+            speed: self.speed,
+            histories: self
+                .histories
+                .iter()
+                .map(|history| (history.id, history.after_turn))
+                .collect(),
+            content,
+            seated: self.seated.clone(),
+            banned: banned.iter().copied().collect(),
+            rules,
         }
     }
 
@@ -2386,6 +2589,7 @@ impl Game {
         };
         self.next_event += 1;
         ruleset.apply(&event);
+        seat(&mut self.seated, &event);
         self.pending.push(event);
     }
 
@@ -2438,11 +2642,16 @@ impl Game {
         Ok(frames)
     }
 
-    /// Keeps a sealed turn for resuming, dropping the oldest beyond the
-    /// window's turns or bytes. The newest turn always stays.
+    /// Keeps a sealed turn for resuming.
     fn remember(&mut self, turn: LoggedTurn) {
         self.log_bytes += turn.frame.len();
         self.log.push_back(turn);
+        self.trim();
+    }
+
+    /// Drops the oldest turns beyond the window's turns or bytes. The newest
+    /// turn always stays.
+    fn trim(&mut self) {
         while self.log.len() > self.resume_window
             || (self.log_bytes > RESUME_WINDOW_BYTES && self.log.len() > 1)
         {
@@ -2672,6 +2881,262 @@ mod tests {
             slowest_pacer(&[pace(Pace::Following(9)), pace(Pace::CatchingUp(Some(1)))]),
             Some(9)
         );
+    }
+
+    /// Rules whose state is every command's payload, in order, so a replay
+    /// that skips or repeats one shows.
+    #[derive(Default)]
+    struct Recorder(Vec<u8>);
+
+    impl Ruleset for Recorder {
+        fn validate(&self, _player: &PlayerId, _payload: &Payload) -> Result<(), u16> {
+            Ok(())
+        }
+
+        fn apply(&mut self, event: &Event) {
+            if let EventBody::Command { payload, .. } = &event.body {
+                self.0.extend_from_slice(payload.as_bytes());
+            }
+        }
+
+        fn save(&self) -> Option<Vec<u8>> {
+            Some(self.0.clone())
+        }
+
+        fn restore(&mut self, state: &[u8]) -> Result<(), String> {
+            self.0 = state.to_vec();
+            Ok(())
+        }
+    }
+
+    fn player(n: u8) -> PlayerId {
+        PlayerId(FixedBytes([n; 32]))
+    }
+
+    fn joined(n: u8) -> EventBody {
+        EventBody::PlayerJoined {
+            player: player(n),
+            name: Text::new(format!("p{n}")).unwrap(),
+            platform: Platform::current(),
+        }
+    }
+
+    fn command(n: u8, byte: u8) -> EventBody {
+        EventBody::Command {
+            player: player(n),
+            client_seq: u64::from(byte),
+            payload: Payload::new(vec![byte]).unwrap(),
+        }
+    }
+
+    fn recover_room(path: &Path, dir: &Path) -> Room {
+        let env = RoomEnv {
+            tick: Duration::from_millis(100),
+            metrics: Arc::new(Metrics::default()),
+            data_dir: Some(dir.to_owned()),
+            timeouts: Timeouts {
+                stall: Duration::from_secs(20),
+                load: Duration::from_secs(300),
+                abandoned: Duration::from_secs(600),
+            },
+            snapshots: None,
+            compact_log_at: u64::MAX,
+        };
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &[0; 32]);
+        Room::recover(path, key, Box::new(Recorder::default()), env)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn running(room: &mut Room) -> &mut Game {
+        let Phase::Running(game) = &mut room.phase else {
+            panic!("the room runs a game");
+        };
+        game
+    }
+
+    #[test]
+    fn a_compacted_log_restores_the_same_game() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = RoomId(FixedBytes([5; 16]));
+        let settings = RoomSettings::DEFAULT;
+
+        // Twenty turns with a command each, then one where a third player
+        // joins, then two empty ones.
+        let mut game = Game::new(settings, 1);
+        let mut rules = Recorder::default();
+        let mut frames = Vec::new();
+        game.append(joined(1), &mut rules);
+        game.append(joined(2), &mut rules);
+        for turn in 1..=20 {
+            game.append(command(1, turn), &mut rules);
+            frames.extend(game.seal(u64::from(turn) * 10).unwrap());
+        }
+        game.append(joined(3), &mut rules);
+        game.append(command(3, 21), &mut rules);
+        frames.extend(game.seal(210).unwrap());
+        frames.extend(game.seal(220).unwrap());
+        frames.extend(game.seal(230).unwrap());
+        let start = StartRecord {
+            version: persist::FORMAT_VERSION,
+            history: 1,
+            id,
+            name: Text::new("compacted").unwrap(),
+            owner: player(1),
+            max_players: 8,
+            settings,
+            invite_tag: vec![0; 32],
+            password_tag: None,
+            members: Vec::new(),
+            base: None,
+        };
+        let mut log = RoomLog::create(&dir, &start).unwrap();
+        for frame in &frames {
+            log.append(frame).unwrap();
+        }
+        drop(log);
+        let path = RoomLog::path_for(&dir, &id);
+
+        // A restored room compacts, keeping its last three turns.
+        let mut first = recover_room(&path, &dir);
+        let before = std::fs::metadata(&path).unwrap().len();
+        let game = running(&mut first);
+        game.resume_window = 3;
+        game.trim();
+        first.compact_at = 0;
+        first.compact_log();
+        assert_eq!(
+            first
+                .metrics
+                .logs_compacted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "the log shrank: {after} < {before}");
+
+        // Play goes on after the compaction: the second player is kicked
+        // and a fourth joins.
+        let Phase::Running(game) = &mut first.phase else {
+            panic!("the room runs a game");
+        };
+        let kicked = EventBody::PlayerLeft {
+            player: player(2),
+            kicked: true,
+        };
+        game.append(kicked, first.ruleset.as_mut());
+        game.append(joined(4), first.ruleset.as_mut());
+        game.append(command(4, 99), first.ruleset.as_mut());
+        let frames_after = game.seal(240).unwrap();
+        first.publish(frames_after.clone());
+        let game = running(&mut first);
+        let expected = (game.next_turn, game.next_event, game.sealed_through);
+        let seated = game.seated.clone();
+        let histories: Vec<(u64, u64)> = game
+            .histories
+            .iter()
+            .map(|history| (history.id, history.after_turn))
+            .collect();
+        let rules = first.ruleset.save().unwrap();
+        drop(first);
+
+        // A second restart reads the compacted log: the base, the kept
+        // turns for resuming only, and the turn after, replayed.
+        let mut second = recover_room(&path, &dir);
+        assert_eq!(
+            second.ruleset.save().unwrap(),
+            rules,
+            "no command lost or repeated"
+        );
+        let seats: Vec<PlayerId> = second.members.iter().map(|m| m.player).collect();
+        assert_eq!(seats, [player(1), player(3), player(4)]);
+        assert!(second.banned.contains(&player(2)));
+        let game = running(&mut second);
+        assert_eq!(
+            (game.next_turn, game.next_event, game.sealed_through),
+            expected
+        );
+        assert_eq!(game.seated, seated);
+        assert_eq!((game.log_first_turn, game.sealed_before_log), (21, 200));
+        let restored: Vec<(u64, u64)> = game
+            .histories
+            .iter()
+            .map(|history| (history.id, history.after_turn))
+            .collect();
+        assert_eq!(restored[..histories.len()], histories[..], "and one more");
+        assert_eq!(restored.len(), histories.len() + 1);
+
+        // A player who saw turn 22 resumes on the kept turns; one who saw
+        // only turn 19 cannot.
+        let history = histories.last().unwrap().0;
+        let stream = game
+            .stream_after(Some(Resume {
+                after_turn: 22,
+                history,
+            }))
+            .unwrap();
+        assert_eq!(stream.backlog.len(), 2);
+        assert_eq!(stream.backlog[0], frames[22]);
+        assert_eq!(stream.backlog[1], frames_after[0]);
+        assert!(
+            game.stream_after(Some(Resume {
+                after_turn: 19,
+                history,
+            }))
+            .is_err()
+        );
+        drop(second);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_base_that_contradicts_itself_is_refused() {
+        let good = Base {
+            first_turn: 5,
+            first_event: 3,
+            sealed_before: 40,
+            after_turn: 7,
+            next_event: 4,
+            sealed_through: 70,
+            speed: Speed::NORMAL,
+            histories: vec![(1, 0), (2, 6)],
+            content: None,
+            seated: Vec::new(),
+            banned: Vec::new(),
+            rules: Vec::new(),
+        };
+        let fresh = || Game::new(RoomSettings::DEFAULT, 1);
+        assert!(fresh().rebase(&good));
+        let broken = [
+            Base {
+                first_turn: 9,
+                ..good.clone()
+            },
+            Base {
+                first_event: 5,
+                ..good.clone()
+            },
+            Base {
+                sealed_before: 71,
+                ..good.clone()
+            },
+            Base {
+                histories: Vec::new(),
+                ..good.clone()
+            },
+            Base {
+                histories: vec![(1, 0), (2, 8)],
+                ..good.clone()
+            },
+            Base {
+                histories: vec![(1, 3)],
+                ..good.clone()
+            },
+        ];
+        for base in &broken {
+            assert!(!fresh().rebase(base), "{base:?}");
+        }
     }
 
     fn test_member() -> Member {

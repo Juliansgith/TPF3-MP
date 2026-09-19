@@ -87,6 +87,12 @@ pub struct ServerConfig {
     /// nobody can then join a running game, and a player who can no longer
     /// resume replays the game from its first turn.
     pub snapshots: Option<SnapshotConfig>,
+    /// A running game's log is compacted once it grows past this many
+    /// bytes: rewritten to start from the game's current state, keeping
+    /// only the turns players may still resume on. It is compacted again
+    /// each time it grows by as much, or by its compacted size if that is
+    /// more. Rules that cannot save their state keep their whole log.
+    pub compact_log_at: u64,
 }
 
 impl ServerConfig {
@@ -119,6 +125,7 @@ impl ServerConfig {
             // Large worlds take minutes to load.
             load_timeout: Duration::from_secs(300),
             snapshots: None,
+            compact_log_at: 64 << 20,
         }
     }
 }
@@ -143,6 +150,7 @@ impl fmt::Debug for ServerConfig {
             .field("tick", &self.tick)
             .field("data_dir", &self.data_dir)
             .field("snapshots", &self.snapshots)
+            .field("compact_log_at", &self.compact_log_at)
             .finish_non_exhaustive()
     }
 }
@@ -200,6 +208,7 @@ impl Server {
                     abandoned: config.abandoned_timeout,
                 },
                 snapshots: snapshots.clone(),
+                compact_log_at: config.compact_log_at,
             },
         }));
         let restored = directory.recover();

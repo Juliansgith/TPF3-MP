@@ -207,6 +207,15 @@ impl Ruleset for ToyRules {
     fn apply(&mut self, event: &Event) {
         self.ledger.apply(event);
     }
+
+    fn save(&self) -> Option<Vec<u8>> {
+        postcard::to_stdvec(&self.ledger).ok()
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), String> {
+        self.ledger = postcard::from_bytes(state).map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

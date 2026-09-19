@@ -106,18 +106,28 @@ Persistence details:
   sealed, so a process crash loses nothing. A power loss or kernel crash can
   lose the last few turns; a client that saw them is told
   `ResumeUnavailable`, even once the room has sealed new turns with the same
-  numbers (see "Histories" in PROTOCOL.md). Logs from before format
-  version 2 are set aside, not restored.
+  numbers (see "Histories" in PROTOCOL.md). Logs of an older format are
+  set aside, not restored.
 - **Damaged logs.** Recovery reads a log without changing it. A damaged final
   record is what a crash leaves behind, so it is cut off once the room is
   rebuilt. Any other damage leaves the log exactly as it was, renamed to
   `*.broken` (or `*.1.broken` and so on, never replacing an earlier one) and
   kept for diagnosis. Symbolic links are ignored.
-- **Size limits.** A room's log stops growing at 1 GiB; the game continues
-  but would not survive a restart. Each player may send 32 KiB of commands
-  per second, with a 256 KiB burst, so an honest game takes days to get
-  there. Recovery streams a log and holds at most the last 64 MiB of turns
-  per room in memory.
+- **Compaction.** Once a game's log passes 64 MiB (`--compact-log-mib`),
+  it is rewritten to start from where the game stands: the canonical
+  rules' saved state, plus the last hour of turns for players who resume.
+  It is compacted again each time it grows by as much, or by its compacted
+  size if that is more. A restart then replays only the turns after the
+  rewrite. The new log is written and flushed under
+  `<room>.log.compacting` and replaces the old one only when complete, so
+  a crash during compaction leaves the old log, and the next start deletes
+  the leftover.
+- **Size limits.** A log that cannot be compacted, because its rules
+  cannot save their state, stops growing at 1 GiB; the game continues but
+  would not survive a restart. Each player may send 32 KiB of commands per
+  second, with a 256 KiB burst, so an honest game takes days to get there.
+  Recovery streams a log and holds at most the last 64 MiB of turns per
+  room in memory.
 - **Permissions.** On Linux, logs are readable by the server's user only:
   they hold invite and password tags and every command.
 - **Invite key.** Restored games are rejoined with their original invites,

@@ -7,6 +7,11 @@
 //! byte for byte as clients received it, so a recovered room serves resumes
 //! from exactly the same bytes.
 //!
+//! A long game's log is compacted: once the room agreed on a snapshot, the
+//! log is rewritten to start from that snapshot's point. Its start record
+//! then carries a [`Base`], the game's state there, and only the turns
+//! after it follow.
+//!
 //! Recovery reads a log one record at a time and changes nothing on disk
 //! until the room has been rebuilt. A crash can tear only the last record,
 //! so a damaged final record is cut off before appending continues. Damage
@@ -22,17 +27,20 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tpf3mp_proto::{
-    ContentFingerprint, Platform, PlayerId, RoomId, RoomSettings, TURN_MAX_FRAME, Text,
+    ContentFingerprint, Platform, PlayerId, RoomId, RoomSettings, Speed, TURN_MAX_FRAME, Text,
 };
 
 /// Version of the log's layout. Version 2 added histories: the start
 /// record names the first, and each recovery logs a turn-stream start
 /// naming the next. Version 3 has the events of protocol snapshots: joins
 /// name the player's platform, departures say whether it was a kick, and
-/// saves appear in the log.
-pub(crate) const FORMAT_VERSION: u16 = 3;
-/// Largest record a log may hold: a turn frame at its cap.
-const MAX_RECORD: usize = TURN_MAX_FRAME + 64;
+/// saves appear in the log. Version 4 lets the start record carry a
+/// [`Base`], for compacted logs.
+pub(crate) const FORMAT_VERSION: u16 = 4;
+/// Largest record a log may hold: a turn frame at its cap, or a start
+/// record whose base holds the rules' state.
+const MAX_RECORD: usize = 16 << 20;
+const _: () = assert!(MAX_RECORD >= TURN_MAX_FRAME + 64);
 const HEADER: usize = 8;
 /// Bytes one room's log may reach. Past this the game keeps running but is
 /// no longer logged, so one room cannot fill the disk. An honest game takes
@@ -53,6 +61,37 @@ pub(crate) struct StartRecord {
     pub(crate) invite_tag: Vec<u8>,
     pub(crate) password_tag: Option<Vec<u8>>,
     pub(crate) members: Vec<StartMember>,
+    /// For a compacted log, the game's state before its first turn.
+    pub(crate) base: Option<Base>,
+}
+
+/// A running game's state after a turn, which a compacted log starts from
+/// instead of the turns before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Base {
+    /// Where the log's turns begin: the first turn, the first event it
+    /// carries, and the frontier before it. The turns up to `after_turn` are
+    /// kept only for players who resume; the base covers them already.
+    pub(crate) first_turn: u64,
+    pub(crate) first_event: u64,
+    pub(crate) sealed_before: u64,
+    /// The last turn the base covers; the log's turns after it are replayed.
+    pub(crate) after_turn: u64,
+    /// The next event, the frontier and the speed after `after_turn`.
+    pub(crate) next_event: u64,
+    pub(crate) sealed_through: u64,
+    pub(crate) speed: Speed,
+    /// Every history of the game, oldest first: its ID and the last turn it
+    /// shares with the one before.
+    pub(crate) histories: Vec<(u64, u64)>,
+    /// The game build and mods every player runs.
+    pub(crate) content: Option<ContentFingerprint>,
+    /// Who sat at the table, in join order.
+    pub(crate) seated: Vec<(PlayerId, Text<32>, Platform)>,
+    /// Players the owner removed.
+    pub(crate) banned: Vec<PlayerId>,
+    /// The canonical rules' state (`Ruleset::save`).
+    pub(crate) rules: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +141,62 @@ impl RoomLog {
         log.append(&payload)?;
         log.file.sync_all()?;
         Ok(log)
+    }
+
+    /// Replaces a room's log with `start` and `frames`, all at once: the new
+    /// log is written and flushed under another name, then renamed over the
+    /// old one, so a crash leaves one or the other whole. The old log must
+    /// not be open. Returns the new log, ready for appending.
+    pub(crate) fn rewrite(dir: &Path, start: &StartRecord, frames: &[&[u8]]) -> io::Result<Self> {
+        let path = Self::path_for(dir, &start.id);
+        let partial = path.with_extension("log.compacting");
+        let _ = fs::remove_file(&partial);
+        let file = private_options().create_new(true).open(&partial)?;
+        let mut log = Self {
+            file,
+            path: partial.clone(),
+            written: 0,
+        };
+        let written = (|| {
+            let payload = postcard::to_stdvec(start).map_err(io::Error::other)?;
+            log.append(&payload)?;
+            for frame in frames {
+                log.append(frame)?;
+            }
+            log.file.sync_all()
+        })();
+        if let Err(error) = written {
+            drop(log);
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+        let Self { file, written, .. } = log;
+        drop(file);
+        if let Err(error) = fs::rename(&partial, &path) {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+        sync_dir(dir);
+        Self::reopen(&path).map(|mut log| {
+            log.written = written;
+            log
+        })
+    }
+
+    /// Opens a log for appending where it ends.
+    pub(crate) fn reopen(path: &Path) -> io::Result<Self> {
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        let written = file.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            written,
+        })
+    }
+
+    /// Bytes in the log.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
     }
 
     /// Opens an existing log for reading, record by record. Symbolic links
@@ -249,6 +344,17 @@ impl LogReader {
     }
 }
 
+/// Makes a rename in `dir` durable, where the platform allows: on Unix a
+/// directory is flushed like a file; elsewhere the rename is left to the
+/// file system.
+fn sync_dir(dir: &Path) {
+    if cfg!(unix)
+        && let Ok(dir) = File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
 /// Logs hold invite and password tags and every player's commands, so only
 /// the server's own user may read them.
 fn private_options() -> OpenOptions {
@@ -286,6 +392,7 @@ mod tests {
             invite_tag: vec![3; 32],
             password_tag: None,
             members: Vec::new(),
+            base: None,
         }
     }
 
@@ -408,6 +515,47 @@ mod tests {
         let error = log.append(b"does not fit").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         drop(log);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rewritten_log_holds_exactly_the_new_start_and_frames() {
+        let dir = temp_dir("log-rewrite");
+        let mut log = RoomLog::create(&dir, &start()).unwrap();
+        log.append(b"old turn").unwrap();
+        drop(log);
+        let mut compacted = start();
+        compacted.base = Some(Base {
+            first_turn: 39,
+            first_event: 11,
+            sealed_before: 280,
+            after_turn: 40,
+            next_event: 12,
+            sealed_through: 300,
+            speed: Speed::NORMAL,
+            histories: vec![(1, 0)],
+            content: None,
+            seated: Vec::new(),
+            banned: Vec::new(),
+            rules: vec![9; 100],
+        });
+        let mut log = RoomLog::rewrite(&dir, &compacted, &[b"turn 41", b"turn 42"]).unwrap();
+        log.append(b"turn 43").unwrap();
+        drop(log);
+        let path = RoomLog::path_for(&dir, &start().id);
+        let (_, records) = read_all(&path).unwrap();
+        assert_eq!(records.len(), 4);
+        let first: StartRecord = postcard::from_bytes(&records[0]).unwrap();
+        assert_eq!(first.base, compacted.base);
+        assert_eq!(
+            records[1..],
+            [
+                b"turn 41".to_vec(),
+                b"turn 42".to_vec(),
+                b"turn 43".to_vec()
+            ]
+        );
+        assert!(!path.with_extension("log.compacting").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

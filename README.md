@@ -33,6 +33,8 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
 - **Sequencer.** Hard lockstep turns. A server-owned clock holds for players
   who are loading or slow, and stops waiting for one that stalls. Pause,
   speed, and exact resume after a reconnect, which survives a server restart.
+  Long games' logs are compacted to the canonical state plus the last hour
+  of turns, so a restart replays little and no log outgrows its disk.
 - **Playout.** Each client plays behind its own jitter buffer, so a player
   feels their own round trip plus a small buffer. Paced bots over 150 ms
   round trips see a median of about 220 ms, and a poor link delays only its
@@ -77,7 +79,7 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
 **Waiting for the game:** the TPF3-specific hook (build profile, detours,
 the real `Game`), and the release-day measurements in
 [docs/DAY_ONE.md](docs/DAY_ONE.md). **Still to build:** a WebSocket fallback
-for networks that block UDP, and compacting old room logs.
+for networks that block UDP.
 
 ## Layout
 
