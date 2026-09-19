@@ -106,6 +106,9 @@ What happens during the restart:
    started are not kept.
 4. A restored game that nobody reconnects to within 10 minutes closes and
    its log is deleted, like any running game whose players all disconnected.
+   `--abandon-after-mins` sets both: raise it to keep games for players who
+   come back another day. Such a game holds its room slot, counted against
+   the address that created it, until it closes.
 
 Persistence details:
 

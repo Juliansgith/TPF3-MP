@@ -103,6 +103,14 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     save_gap_secs: u64,
 
+    /// Minutes a running game waits for its players when none is
+    /// connected, before it closes and its log is deleted. Also how long
+    /// games restored at start wait. Longer keeps games for players who
+    /// come back another day, and keeps their rooms counting against the
+    /// address that created them all the while.
+    #[arg(long, default_value_t = 10)]
+    abandon_after_mins: u64,
+
     /// Size in MiB past which a running game's log is compacted to start
     /// from the game's current state.
     #[arg(long, default_value_t = 64)]
@@ -166,6 +174,8 @@ async fn main() -> Result<()> {
     config.max_rooms_per_address = args.max_rooms_per_address;
     config.data_dir = args.data_dir.clone();
     config.compact_log_at = args.compact_log_mib.max(1).saturating_mul(1 << 20);
+    config.abandoned_timeout =
+        Duration::from_secs(args.abandon_after_mins.max(1).saturating_mul(60));
     if !args.tunnel_path.starts_with('/') {
         bail!("--tunnel-path must start with /");
     }
