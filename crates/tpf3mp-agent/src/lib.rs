@@ -18,7 +18,7 @@ use std::{
 
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tpf3mp_net::{
     Identity, IdentityError, NetError, ServerTrust, TlsError, client_config, close, read_message,
     read_preamble, write_message, write_preamble,
@@ -33,13 +33,20 @@ use tpf3mp_proto::{
 pub use follower::{Action, FollowError, TurnFollower};
 pub use playout::Playout;
 
+/// How long connecting and the handshake may take, so a server that never
+/// answers cannot hang the client.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a request may wait for its response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Messages queued for the server before senders wait.
 const OUTGOING_QUEUE: usize = 256;
 /// Events queued for the application before the client stops reading. The
 /// server then sees a slow consumer and disconnects rather than buffer.
-const EVENT_QUEUE: usize = 4096;
+const EVENT_QUEUE: usize = 1024;
+/// Bytes of turns queued for the application before the client stops
+/// reading, weighed like [`TurnFollower`]'s backlog. Counting events alone,
+/// a hostile server could make the client hold gigabytes.
+const EVENT_BYTES: usize = 64 << 20;
 
 pub struct ConnectOptions {
     pub server: SocketAddr,
@@ -94,6 +101,8 @@ pub enum ConnectError {
     Protocol(#[from] NetError),
     #[error("the server answered the handshake with an unexpected message")]
     UnexpectedMessage,
+    #[error("the server did not complete the handshake in time")]
+    Timeout,
 }
 
 fn version_mismatch(client: &u32, server: &u32) -> String {
@@ -136,6 +145,39 @@ pub enum ClientEvent {
     Closed(quinn::ConnectionError),
 }
 
+/// An event with the share of the byte budget it holds while queued.
+type Queued = (ClientEvent, Option<OwnedSemaphorePermit>);
+
+/// What the server tells this client, in order. Turns count against a byte
+/// budget until received, so a client that reads slowly stops reading the
+/// network instead of buffering without bound.
+#[derive(Debug)]
+pub struct Events {
+    receiver: mpsc::Receiver<Queued>,
+}
+
+impl Events {
+    /// The next event, or `None` once the connection is gone and every
+    /// event has been received.
+    pub async fn recv(&mut self) -> Option<ClientEvent> {
+        self.receiver.recv().await.map(|(event, _budget)| event)
+    }
+
+    /// The next event if one is queued.
+    pub fn try_recv(&mut self) -> Result<ClientEvent, mpsc::error::TryRecvError> {
+        self.receiver.try_recv().map(|(event, _budget)| event)
+    }
+
+    /// Events queued now.
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+}
+
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<Response, RequestError>>>>>;
 
 /// An open, authenticated session with a server.
@@ -161,9 +203,13 @@ impl fmt::Debug for Client {
 
 /// Connects to a server and completes the handshake. Server messages arrive
 /// on the returned receiver.
-pub async fn connect(
-    options: ConnectOptions,
-) -> Result<(Client, mpsc::Receiver<ClientEvent>), ConnectError> {
+pub async fn connect(options: ConnectOptions) -> Result<(Client, Events), ConnectError> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_within(options))
+        .await
+        .map_err(|_| ConnectError::Timeout)?
+}
+
+async fn connect_within(options: ConnectOptions) -> Result<(Client, Events), ConnectError> {
     let local: SocketAddr = if options.server.is_ipv6() {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
@@ -200,12 +246,16 @@ pub async fn connect(
         Arc::clone(&reader_done),
         events.clone(),
     ));
-    tokio::spawn(read_turns(connection.clone(), events.clone()));
+    tokio::spawn(read_turns(
+        connection.clone(),
+        events.clone(),
+        Arc::new(Semaphore::new(EVENT_BYTES)),
+    ));
     tokio::spawn({
         let connection = connection.clone();
         async move {
             let reason = connection.closed().await;
-            let _ = events.send(ClientEvent::Closed(reason)).await;
+            let _ = events.send((ClientEvent::Closed(reason), None)).await;
         }
     });
 
@@ -220,7 +270,9 @@ pub async fn connect(
             reader_done,
             next_request: AtomicU32::new(1),
         },
-        events_rx,
+        Events {
+            receiver: events_rx,
+        },
     ))
 }
 
@@ -419,7 +471,7 @@ async fn read_control(
     connection: quinn::Connection,
     pending: Pending,
     done: Arc<AtomicBool>,
-    events: mpsc::Sender<ClientEvent>,
+    events: mpsc::Sender<Queued>,
 ) {
     loop {
         let message = match read_message::<ServerMessage>(&mut recv, CONTROL_MAX_FRAME).await {
@@ -452,7 +504,7 @@ async fn read_control(
                 break;
             }
         };
-        if events.send(event).await.is_err() {
+        if events.send((event, None)).await.is_err() {
             break;
         }
     }
@@ -466,9 +518,13 @@ async fn read_control(
 
 /// Reads turn streams one after another, so a stream that replaces an older
 /// one is only read once the older one has ended.
-async fn read_turns(connection: quinn::Connection, events: mpsc::Sender<ClientEvent>) {
+async fn read_turns(
+    connection: quinn::Connection,
+    events: mpsc::Sender<Queued>,
+    budget: Arc<Semaphore>,
+) {
     while let Ok(mut recv) = connection.accept_uni().await {
-        match read_turn_stream(&mut recv, &events).await {
+        match read_turn_stream(&mut recv, &events, &budget).await {
             Ok(()) => {}
             Err(TurnStreamError::Violation) => {
                 connection.close(close::PROTOCOL_VIOLATION, b"malformed turn stream");
@@ -486,7 +542,8 @@ enum TurnStreamError {
 
 async fn read_turn_stream(
     recv: &mut RecvStream,
-    events: &mpsc::Sender<ClientEvent>,
+    events: &mpsc::Sender<Queued>,
+    budget: &Arc<Semaphore>,
 ) -> Result<(), TurnStreamError> {
     match read_preamble(recv).await {
         Ok(PROTOCOL_VERSION) => {}
@@ -501,15 +558,25 @@ async fn read_turn_stream(
         Err(_) => return Err(TurnStreamError::Violation),
     };
     events
-        .send(ClientEvent::TurnStream(start))
+        .send((ClientEvent::TurnStream(start), None))
         .await
         .map_err(|_| TurnStreamError::Receiver)?;
     loop {
         match read_message::<TurnMessage>(recv, TURN_MAX_FRAME).await {
-            Ok(TurnMessage::Turn(turn)) => events
-                .send(ClientEvent::Turn(turn))
-                .await
-                .map_err(|_| TurnStreamError::Receiver)?,
+            Ok(TurnMessage::Turn(turn)) => {
+                // Waits while the application holds the whole budget, which
+                // stops reading and lets QUIC flow control reach the server.
+                let weight = u32::try_from(follower::turn_weight(&turn).min(EVENT_BYTES))
+                    .unwrap_or(u32::MAX);
+                let share = Arc::clone(budget)
+                    .acquire_many_owned(weight)
+                    .await
+                    .map_err(|_| TurnStreamError::Receiver)?;
+                events
+                    .send((ClientEvent::Turn(turn), Some(share)))
+                    .await
+                    .map_err(|_| TurnStreamError::Receiver)?;
+            }
             Ok(TurnMessage::Start(_)) => return Err(TurnStreamError::Violation),
             // The server finished the stream, or the connection ended.
             Err(error) if error.is_disconnect() => return Ok(()),

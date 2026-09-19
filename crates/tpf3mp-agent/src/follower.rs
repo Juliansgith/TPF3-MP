@@ -4,7 +4,14 @@
 use std::collections::VecDeque;
 
 use thiserror::Error;
-use tpf3mp_proto::{Event, Speed, Turn, TurnStart};
+use tpf3mp_proto::{Event, EventBody, Speed, Turn, TurnStart};
+
+/// Bytes of events a follower holds before it refuses more. An honest
+/// server's backlog is far smaller (it keeps at most 64 MiB of turns for
+/// resuming), so only a broken or hostile one gets here.
+pub const MAX_QUEUED_BYTES: usize = 256 << 20;
+/// What an event costs besides its payload, for the byte bound.
+const EVENT_OVERHEAD: usize = 64;
 
 /// A turn that breaks the protocol. The client must disconnect and resume
 /// from its last good state rather than apply anything further.
@@ -14,12 +21,16 @@ pub enum FollowError {
     TurnGap { expected: u64, got: u64 },
     #[error("event {got} arrived where event {expected} was due")]
     EventGap { expected: u64, got: u64 },
-    #[error("event {seq} is for step {step}, which was already sealed (through {sealed})")]
-    SealedStep { seq: u64, step: u64, sealed: u64 },
+    #[error("event {seq} is for step {step}, but new events are for step {expected}")]
+    EventStep { seq: u64, step: u64, expected: u64 },
     #[error("the frontier moved back from {from} to {to}")]
     FrontierRegressed { from: u64, to: u64 },
     #[error("the turn stream restarts at turn {got}, but turn {expected} is next")]
     RestartMismatch { expected: u64, got: u64 },
+    #[error("a turn or event number is at the end of its range")]
+    Overflow,
+    #[error("more than {MAX_QUEUED_BYTES} bytes of events are waiting")]
+    Backlog,
 }
 
 /// What the game should do next.
@@ -40,6 +51,8 @@ pub struct TurnFollower {
     speed: Speed,
     executed: u64,
     queue: VecDeque<Event>,
+    /// Bytes of the events in `queue`, counted as [`event_size`].
+    queued_bytes: usize,
 }
 
 impl TurnFollower {
@@ -52,6 +65,7 @@ impl TurnFollower {
             speed: Speed::NORMAL,
             executed: 0,
             queue: VecDeque::new(),
+            queued_bytes: 0,
         }
     }
 
@@ -75,6 +89,10 @@ impl TurnFollower {
 
     /// Checks a turn against the invariants and queues its events. On error
     /// nothing of the turn is kept.
+    ///
+    /// Every event must be for the step after the previous turn's frontier:
+    /// that is the only step the server gives new events, and it keeps the
+    /// queue in step order, so no event can be stranded behind another.
     pub fn accept(&mut self, turn: Turn) -> Result<(), FollowError> {
         if turn.number != self.next_turn {
             return Err(FollowError::TurnGap {
@@ -88,7 +106,13 @@ impl TurnFollower {
                 to: turn.sealed_through,
             });
         }
+        let next_turn = self.next_turn.checked_add(1).ok_or(FollowError::Overflow)?;
+        let step = self
+            .sealed_through
+            .checked_add(1)
+            .ok_or(FollowError::Overflow)?;
         let mut expected = self.next_event;
+        let mut bytes = 0;
         for event in &turn.events {
             if event.seq != expected {
                 return Err(FollowError::EventGap {
@@ -96,19 +120,24 @@ impl TurnFollower {
                     got: event.seq,
                 });
             }
-            if event.step <= self.sealed_through {
-                return Err(FollowError::SealedStep {
+            if event.step != step {
+                return Err(FollowError::EventStep {
                     seq: event.seq,
                     step: event.step,
-                    sealed: self.sealed_through,
+                    expected: step,
                 });
             }
-            expected += 1;
+            expected = expected.checked_add(1).ok_or(FollowError::Overflow)?;
+            bytes += event_size(event);
         }
-        self.next_turn += 1;
+        if self.queued_bytes + bytes > MAX_QUEUED_BYTES {
+            return Err(FollowError::Backlog);
+        }
+        self.next_turn = next_turn;
         self.next_event = expected;
         self.sealed_through = turn.sealed_through;
         self.speed = turn.speed;
+        self.queued_bytes += bytes;
         self.queue.extend(turn.events);
         Ok(())
     }
@@ -118,7 +147,9 @@ impl TurnFollower {
     pub fn next_action(&mut self) -> Option<Action> {
         let step = self.executed + 1;
         if self.queue.front().is_some_and(|event| event.step == step) {
-            return self.queue.pop_front().map(Action::Apply);
+            let event = self.queue.pop_front()?;
+            self.queued_bytes = self.queued_bytes.saturating_sub(event_size(&event));
+            return Some(Action::Apply(event));
         }
         if step <= self.sealed_through {
             self.executed = step;
@@ -153,6 +184,19 @@ impl TurnFollower {
     pub fn last_turn(&self) -> Option<u64> {
         self.next_turn.checked_sub(1).filter(|turn| *turn > 0)
     }
+}
+
+/// What a turn weighs in bytes, for bounding what a client queues.
+pub(crate) fn turn_weight(turn: &Turn) -> usize {
+    EVENT_OVERHEAD + turn.events.iter().map(event_size).sum::<usize>()
+}
+
+fn event_size(event: &Event) -> usize {
+    EVENT_OVERHEAD
+        + match &event.body {
+            EventBody::Command { payload, .. } => payload.len(),
+            _ => 0,
+        }
 }
 
 #[cfg(test)]
@@ -255,11 +299,20 @@ mod tests {
         );
         assert_eq!(
             follower.accept(turn(2, 6, vec![event(2, 5)])),
-            Err(FollowError::SealedStep {
+            Err(FollowError::EventStep {
                 seq: 2,
                 step: 5,
-                sealed: 5
+                expected: 6
             })
+        );
+        assert_eq!(
+            follower.accept(turn(2, 6, vec![event(2, 7)])),
+            Err(FollowError::EventStep {
+                seq: 2,
+                step: 7,
+                expected: 6
+            }),
+            "events for a later step are refused too"
         );
         assert_eq!(
             follower.accept(turn(2, 4, vec![])),

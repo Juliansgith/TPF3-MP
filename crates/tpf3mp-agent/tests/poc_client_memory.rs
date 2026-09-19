@@ -1,10 +1,5 @@
-//! Memory proof of concept from the security review: a hostile server and a
-//! real `tpf3mp-agent` client in one process, with a counting allocator.
-//! Passes while the finding exists:
-//!
-//! ```sh
-//! cargo test -p tpf3mp-agent --test poc_client_memory -- --ignored --nocapture
-//! ```
+//! A memory bound from the security review: a hostile server and a real
+//! `tpf3mp-agent` client in one process, with a counting allocator.
 
 #![allow(unsafe_code, clippy::unwrap_used)]
 
@@ -72,20 +67,18 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-const FRAMES: u64 = 64;
+const FRAMES: u64 = 200;
 /// Small events that fill most of a 1 MiB turn frame.
 const EVENTS_PER_TURN: u64 = 26_000;
-/// `EVENT_QUEUE` in `tpf3mp-agent`: the bound counts events, not bytes.
-const EVENT_QUEUE: f64 = 4096.0;
+const MIB: f64 = 1024.0 * 1024.0;
 
-/// FINDING: the agent's event channel (`EVENT_QUEUE` = 4096) bounds the
-/// number of queued `ClientEvent`s, not their size, and a `Turn` may fill a
-/// 1 MiB frame that decodes to about twice that. A server (or a room whose
-/// members send large intents) can therefore make the agent hold gigabytes
-/// while the game is not draining events, such as during a loading screen.
+/// Review finding M7: the agent's event channel bounded the number of
+/// queued events, not their size, and a turn filling a 1 MiB frame decodes
+/// to about twice that. A server could make a client hold gigabytes while
+/// the game was not draining events, such as during a loading screen. Turns
+/// now count against a byte budget until the application receives them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "security PoC (demonstration, passes while the finding exists)"]
-async fn poc_hostile_server_fills_the_client_event_queue() {
+async fn a_hostile_server_cannot_fill_the_client_with_turns() {
     let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
     let leaf = identity.leaf().clone();
     let endpoint = quinn::Endpoint::server(
@@ -122,7 +115,6 @@ async fn poc_hostile_server_fills_the_client_event_queue() {
             .await
             .unwrap();
         let mut seq = 1;
-        let mut wire = 0;
         for number in 1..=FRAMES {
             let events = (0..EVENTS_PER_TURN)
                 .map(|_| {
@@ -143,10 +135,12 @@ async fn poc_hostile_server_fills_the_client_event_queue() {
                 events,
             });
             let frame = tpf3mp_proto::encode_frame(&turn, TURN_MAX_FRAME).unwrap();
-            wire += frame.len();
-            turns.write_all(&frame).await.unwrap();
+            // Blocks for good once the client stops reading.
+            if turns.write_all(&frame).await.is_err() {
+                break;
+            }
         }
-        (endpoint, connection, send, turns, wire)
+        drop((endpoint, connection, send, turns));
     });
 
     let player = Arc::new(Identity::generate().unwrap().0);
@@ -162,26 +156,19 @@ async fn poc_hostile_server_fills_the_client_event_queue() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = LIVE.load(Relaxed);
     go.send(()).unwrap();
-    let (_endpoint, _connection, _send, _turns, wire) = server.await.unwrap();
-    // The game is busy (a loading screen) and does not read events yet.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while (events.len() as u64) < FRAMES + 1 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the client queues every turn");
+    // The game is busy (a loading screen) and does not read events; the
+    // server pushes as fast as the client takes them.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let held = LIVE.load(Relaxed).saturating_sub(before) as f64;
-    let per_turn = held / FRAMES as f64;
+    let queued = events.len();
+    server.abort();
     println!(
-        "{FRAMES} turns ({:.1} MiB on the wire) sit in the client's event queue: {:.1} MiB \
-         held, {:.2} MiB per turn; a full queue of {EVENT_QUEUE} turns holds about {:.1} GiB",
-        wire as f64 / 1048576.0,
-        held / 1048576.0,
-        per_turn / 1048576.0,
-        per_turn * EVENT_QUEUE / 1073741824.0,
+        "{queued} of {FRAMES} oversized turns queued while the game was busy: {:.1} MiB held",
+        held / MIB
     );
     drop(events);
     drop(client);
-    assert!(per_turn > 1_000_000.0, "only {per_turn} bytes per turn");
+    assert!(queued < 100, "the client queued {queued} turns");
+    // The 64 MiB budget, weighed conservatively, plus flow control windows.
+    assert!(held < 192.0 * MIB, "the client held {:.1} MiB", held / MIB);
 }

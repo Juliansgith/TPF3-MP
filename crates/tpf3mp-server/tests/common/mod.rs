@@ -6,11 +6,8 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
-use tpf3mp_agent::{Action, Client, ClientEvent, ConnectOptions, TurnFollower, connect};
+use tokio::{sync::oneshot, task::JoinHandle};
+use tpf3mp_agent::{Action, Client, ClientEvent, ConnectOptions, Events, TurnFollower, connect};
 use tpf3mp_net::{Identity, ServerIdentity, ServerTrust, client_config};
 use tpf3mp_proto::{
     ContentFingerprint, CreateRoom, Event, FixedBytes, IntentRejection, Invite, JoinRoom,
@@ -156,7 +153,7 @@ pub fn application_close_code(error: &quinn::ConnectionError) -> Option<quinn::V
 
 pub struct TestClient {
     pub client: Client,
-    pub events: mpsc::Receiver<ClientEvent>,
+    pub events: Events,
     pub identity: Arc<Identity>,
 }
 

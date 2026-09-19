@@ -2,8 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use tokio::sync::mpsc;
-use tpf3mp_agent::{Client, ClientEvent, ConnectOptions, connect};
+use tpf3mp_agent::{Client, ClientEvent, ConnectOptions, Events, connect};
 use tpf3mp_net::{CertificateDer, Identity, ServerTrust};
 use tpf3mp_proto::{CreateRoom, Invite, JoinRoom, RoomSettings, RoomView, Text};
 use tracing_subscriber::EnvFilter;
@@ -121,7 +120,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn open(server: &Server) -> Result<(Client, mpsc::Receiver<ClientEvent>)> {
+async fn open(server: &Server) -> Result<(Client, Events)> {
     let (host, _port) = server
         .server
         .rsplit_once(':')
@@ -170,7 +169,7 @@ fn print_room(room: &RoomView) {
     }
 }
 
-async fn follow(client: Client, mut events: mpsc::Receiver<ClientEvent>) {
+async fn follow(client: Client, mut events: Events) {
     loop {
         tokio::select! {
             event = events.recv() => match event {

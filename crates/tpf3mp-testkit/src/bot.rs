@@ -8,8 +8,9 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tpf3mp_agent::{Action, Client, ClientError, ClientEvent, FollowError, Playout, TurnFollower};
+use tpf3mp_agent::{
+    Action, Client, ClientError, ClientEvent, Events, FollowError, Playout, TurnFollower,
+};
 use tpf3mp_proto::{EventBody, LaneDigest, PlayerId};
 
 use crate::{
@@ -73,7 +74,7 @@ pub enum BotError {
 
 pub struct Bot {
     client: Client,
-    events: mpsc::Receiver<ClientEvent>,
+    events: Events,
     config: BotConfig,
     world: ToyWorld,
     follower: Option<TurnFollower>,
@@ -91,7 +92,7 @@ pub struct Bot {
 }
 
 impl Bot {
-    pub fn new(client: Client, events: mpsc::Receiver<ClientEvent>, config: BotConfig) -> Self {
+    pub fn new(client: Client, events: Events, config: BotConfig) -> Self {
         let mut world = ToyWorld::new(config.world_seed);
         if let Some(step) = config.drift_at {
             world = world.with_drift(step);

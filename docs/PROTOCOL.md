@@ -83,7 +83,11 @@ Invariants every client relies on:
    `PROTOCOL_VIOLATION` and reconnects.
 
 Together these make every replica apply the same events at the same point in
-simulation time, whatever its latency. Invariant 1 also makes building work
+simulation time, whatever its latency. Clients enforce them strictly
+(`TurnFollower`): an event whose step is not the previous turn's frontier
+plus one, a counter at the end of its range, or more than 256 MiB of events
+waiting is a protocol violation. A client also holds at most 64 MiB of
+turns the game has not taken yet, then stops reading until it does. Invariant 1 also makes building work
 while paused: a paused client has executed `sealed_through` and can apply the
 events for `sealed_through + 1` at once, without running a step.
 

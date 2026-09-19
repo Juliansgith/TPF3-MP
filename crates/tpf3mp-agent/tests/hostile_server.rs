@@ -1,13 +1,6 @@
-//! Proofs of concept from the security review: turn streams a hostile or
-//! broken server can send, which `TurnFollower` must refuse rather than
-//! follow into a wedged or crashed state.
-//!
-//! Each test asserts the behaviour the follower should have and fails today.
-//! Run them with
-//!
-//! ```sh
-//! cargo test -p tpf3mp-agent --test hostile_server -- --ignored
-//! ```
+//! From the security review: turn streams a hostile or broken server can
+//! send, which `TurnFollower` must refuse rather than follow into a wedged
+//! or crashed state.
 
 #![allow(clippy::unwrap_used)]
 
@@ -61,7 +54,6 @@ fn drain(follower: &mut TurnFollower) -> (Vec<u64>, u64) {
 /// front forever and silently blocks every later event, while steps keep
 /// executing: the replica forks without any error.
 #[test]
-#[ignore = "security PoC: fails until the follower checks event steps"]
 fn events_whose_steps_go_backwards_are_refused() {
     let mut follower = TurnFollower::new(&start(1, 1));
     let accepted = follower.accept(turn(1, 200, vec![event(1, 100), event(2, 50)]));
@@ -81,7 +73,6 @@ fn events_whose_steps_go_backwards_are_refused() {
 /// sends events for a step beyond the next one makes the follower keep every
 /// event, with no bound, and apply none of them.
 #[test]
-#[ignore = "security PoC: fails until the follower checks event steps"]
 fn events_beyond_the_next_step_are_refused() {
     let mut follower = TurnFollower::new(&start(1, 1));
     let mut held = 0;
@@ -105,7 +96,6 @@ fn events_beyond_the_next_step_are_refused() {
 /// counter with `+=`, so a stream starting at `u64::MAX` panics with an
 /// arithmetic overflow; release builds wrap and then report no last turn.
 #[test]
-#[ignore = "security PoC: fails until the follower refuses counters it cannot advance"]
 fn counters_at_the_end_of_the_range_do_not_panic() {
     let turn_number = std::panic::catch_unwind(|| {
         let mut follower = TurnFollower::new(&start(u64::MAX, 1));
