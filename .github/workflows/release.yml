@@ -2,12 +2,13 @@ name: release
 
 # Builds the player's package for every platform: the agent (with its
 # launcher), the in-game hook library and the server. Runs by hand, which
-# leaves the packages as workflow artifacts, or on a version tag, which also
-# attaches them to a draft release to review before publishing.
+# leaves the packages as workflow artifacts, or on a push to `main`, the
+# release branch (see AGENTS.md), which also attaches them to a draft
+# release of the workspace's version, to review before publishing.
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,8 +17,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::cannot read the workspace version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   package:
     name: package (${{ matrix.name }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -37,14 +57,14 @@ jobs:
       - name: Package
         shell: bash
         env:
+          VERSION: ${{ needs.version.outputs.version }}
           # The server the launcher offers first, as host:port. Set the
           # repository variable TPF3MP_DEFAULT_SERVER to fill it in;
           # players can still type another or pass --server.
           DEFAULT_SERVER: ${{ vars.TPF3MP_DEFAULT_SERVER }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          dir="tpf3mp-${version}-${{ matrix.name }}"
+          dir="tpf3mp-${VERSION}-${{ matrix.name }}"
           mkdir -p "$dir"
           cp README.md LICENSE docs/PLAYING.md "$dir/"
           server=""
@@ -92,8 +112,8 @@ jobs:
 
   draft:
     name: draft release
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, package]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -105,7 +125,20 @@ jobs:
       - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.version.outputs.version }}
         run: |
-          gh release create "$GITHUB_REF_NAME" packages/* \
-            --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
-            --title "TPF3-MP $GITHUB_REF_NAME"
+          set -euo pipefail
+          # A published version is final: releasing again needs a version
+          # bump in Cargo.toml. A draft is refreshed with this commit.
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "::error::$TAG is already published; bump the version in Cargo.toml"
+              exit 1
+            fi
+            gh release upload "$TAG" packages/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+          else
+            gh release create "$TAG" packages/* \
+              --repo "$GITHUB_REPOSITORY" --draft --generate-notes \
+              --target "$GITHUB_SHA" --title "TPF3-MP $TAG"
+          fi

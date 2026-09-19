@@ -247,9 +247,12 @@ PROTOCOL.md describes the flow.
 Linux x64 and macOS arm64: the agent with its launcher, the in-game hook
 library and the server, plus a script that opens the launcher.
 
-- **Cutting one.** Push a version tag, for example
-  `git tag v0.1.0 && git push origin v0.1.0`. The workflow attaches the
-  packages to a draft release; review it on GitHub, then publish it.
+- **Cutting one.** Every push to `main`, which only receives what passed
+  `acceptance` (see [AGENTS.md](../AGENTS.md)), builds the packages and
+  attaches them to a draft release `v<version>`, the version in
+  `Cargo.toml`. Review the draft on GitHub, then publish it; publishing
+  creates the tag. Later pushes refresh the draft until it is published.
+  After that, `main` needs a version bump before it can release again.
 - **The server players see first.** Set the repository variable
   `TPF3MP_DEFAULT_SERVER` (Settings, Secrets and variables, Actions,
   Variables) to the public server's `host:port`, and the packages' launcher
