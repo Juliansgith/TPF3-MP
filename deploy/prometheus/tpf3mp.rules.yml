@@ -1,0 +1,77 @@
+# Alerting rules for tpf3mp-server, for a Prometheus that scrapes the admin
+# endpoint (see docs/OPERATIONS.md, "Monitoring"):
+#
+#   scrape_configs:
+#     - job_name: tpf3mp
+#       static_configs:
+#         - targets: ["127.0.0.1:9470"]
+#
+#   rule_files:
+#     - tpf3mp.rules.yml
+#
+# Thresholds are starting points for one node; tune them to its traffic.
+
+groups:
+  - name: tpf3mp
+    rules:
+      - alert: Tpf3mpDown
+        expr: up{job="tpf3mp"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The TPF3-MP server does not answer its admin endpoint.
+
+      - alert: Tpf3mpReplicasDiverging
+        expr: increase(tpf3mp_divergences_total[15m]) > 10
+        labels:
+          severity: ticket
+        annotations:
+          summary: Players' worlds keep differing from the room's verdicts.
+          description: >
+            Look at which platforms diverge. A new game patch that changed
+            the simulation, or a mod mismatch, is the usual cause.
+
+      - alert: Tpf3mpSlowConsumers
+        expr: increase(tpf3mp_slow_consumers_total[10m]) > 20
+        labels:
+          severity: ticket
+        annotations:
+          summary: Players are disconnected for not keeping up with their turn streams.
+
+      - alert: Tpf3mpSavesNotArriving
+        expr: >
+          increase(tpf3mp_uploads_failed_total[30m]) > 5
+          and increase(tpf3mp_snapshots_agreed_total[30m]) == 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: Players' saves are not reaching the server; late joiners wait.
+
+      - alert: Tpf3mpHandshakeFlood
+        expr: rate(tpf3mp_connections_refused_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Connection attempts are refused for too many handshakes in progress.
+          description: >
+            Honest players retry and get in; a sustained rate means someone
+            floods the server with handshakes.
+
+      - alert: Tpf3mpProtocolViolations
+        expr: increase(tpf3mp_protocol_violations_total[10m]) > 50
+        labels:
+          severity: ticket
+        annotations:
+          summary: Many sessions break the protocol; a broken client release, or probing.
+
+      - alert: Tpf3mpTunnelsRefused
+        expr: increase(tpf3mp_tunnels_refused_total[10m]) > 100
+        labels:
+          severity: ticket
+        annotations:
+          summary: Many tunnel connections are refused by the limits.
+          description: >
+            Either one network holds many players behind UDP blocks, which
+            wants higher per-address limits, or someone probes the tunnel.

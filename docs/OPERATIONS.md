@@ -71,6 +71,10 @@ certificate that agents pin with `--pin-cert <file>`.
   refused, divergences, slow consumers, log compactions and tunnels opened
   and refused, and for snapshots: saves, snapshots agreed, failed uploads,
   late joins, rebases and bytes served.
+- **Alerts.** `deploy/prometheus/tpf3mp.rules.yml` holds alerting rules for
+  a Prometheus that scrapes the endpoint: the server down, replicas
+  diverging, slow consumers, saves not arriving, handshake floods, protocol
+  violations and refused tunnels.
 - **Health.** `/healthz` returns `ok`.
 - **Logs.** Logs go to stdout (`docker compose logs -f`) and never contain
   IP addresses or invite tokens. `RUST_LOG=debug` adds per-connection
@@ -264,6 +268,18 @@ Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and
 - with every room logged and compacted past 8 KiB (`--data-dir`,
   `--compact-log-kib 8`), 3,000 steps: 121 compactions during the run,
   p99 114 ms, and memory level at about 150 MB.
+
+The server on its own, as a separate release-build process with the bots in
+another, 1,500 steps at 50 steps per second:
+
+| rooms × players | logged | server CPU | memory | p99 |
+|---|---|---|---|---|
+| 100 × 4 | no | 0.38 cores | 31 MB | 112 ms |
+| 200 × 4 | yes | 0.70 cores | 48 MB | 114 ms |
+
+That is about a three-hundredth of a core per busy room, growing linearly,
+with logging costing little. Rooms default to 5 steps per second, far
+fewer turns than this.
 
 Repeat against the real host after deploying. Every bot connects from the
 machine running the load test, so first raise that address's limits on the
