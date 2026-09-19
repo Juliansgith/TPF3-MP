@@ -47,6 +47,9 @@ enum Command {
     },
     /// Open the launcher: a page in your browser from which you connect,
     /// create or join rooms, get ready, chat and play.
+    // A package's script may name a server; the player's own flags, which
+    // come after, win.
+    #[command(args_override_self = true)]
     Launcher(LauncherArgs),
     /// Join a room with an invite and follow it until Ctrl-C.
     Join {

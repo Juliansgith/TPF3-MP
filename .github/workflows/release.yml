@@ -36,25 +36,40 @@ jobs:
         run: cargo build --release --locked -p tpf3mp-agent -p tpf3mp-server -p tpf3mp-hook
       - name: Package
         shell: bash
+        env:
+          # The server the launcher offers first, as host:port. Set the
+          # repository variable TPF3MP_DEFAULT_SERVER to fill it in;
+          # players can still type another or pass --server.
+          DEFAULT_SERVER: ${{ vars.TPF3MP_DEFAULT_SERVER }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           dir="tpf3mp-${version}-${{ matrix.name }}"
           mkdir -p "$dir"
-          cp README.md LICENSE "$dir/"
+          cp README.md LICENSE docs/PLAYING.md "$dir/"
+          server=""
+          if [ -n "$DEFAULT_SERVER" ]; then
+            # A bracket expression: "]" first and "-" last are literal.
+            if ! [[ "$DEFAULT_SERVER" =~ ^[]A-Za-z0-9.:[-]+$ ]]; then
+              echo "::error::TPF3MP_DEFAULT_SERVER must be host:port, nothing else"
+              exit 1
+            fi
+            server="--server $DEFAULT_SERVER "
+          fi
           case "${{ matrix.name }}" in
             windows-*)
               cp target/release/tpf3mp-agent.exe target/release/tpf3mp-server.exe \
                  target/release/tpf3mp_hook.dll "$dir/"
-              printf '@echo off\r\n"%%~dp0tpf3mp-agent.exe" launcher %%*\r\nif errorlevel 1 pause\r\n' \
-                > "$dir/Launch TPF3-MP.cmd"
+              printf '@echo off\r\n"%%~dp0tpf3mp-agent.exe" launcher %s%%*\r\nif errorlevel 1 pause\r\n' \
+                "$server" > "$dir/Launch TPF3-MP.cmd"
               7z a "$dir.zip" "$dir" > /dev/null
               echo "archive=$dir.zip" >> "$GITHUB_ENV"
               ;;
             linux-*)
               cp target/release/tpf3mp-agent target/release/tpf3mp-server \
                  target/release/libtpf3mp_hook.so "$dir/"
-              printf '#!/bin/sh\nexec "$(dirname "$0")/tpf3mp-agent" launcher "$@"\n' > "$dir/tpf3mp-launcher.sh"
+              printf '#!/bin/sh\nexec "$(dirname "$0")/tpf3mp-agent" launcher %s"$@"\n' "$server" \
+                > "$dir/tpf3mp-launcher.sh"
               chmod +x "$dir/tpf3mp-launcher.sh"
               tar czf "$dir.tar.gz" "$dir"
               echo "archive=$dir.tar.gz" >> "$GITHUB_ENV"
@@ -62,7 +77,8 @@ jobs:
             macos-*)
               cp target/release/tpf3mp-agent target/release/tpf3mp-server \
                  target/release/libtpf3mp_hook.dylib "$dir/"
-              printf '#!/bin/sh\nexec "$(dirname "$0")/tpf3mp-agent" launcher "$@"\n' > "$dir/tpf3mp-launcher.command"
+              printf '#!/bin/sh\nexec "$(dirname "$0")/tpf3mp-agent" launcher %s"$@"\n' "$server" \
+                > "$dir/tpf3mp-launcher.command"
               chmod +x "$dir/tpf3mp-launcher.command"
               tar czf "$dir.tar.gz" "$dir"
               echo "archive=$dir.tar.gz" >> "$GITHUB_ENV"
