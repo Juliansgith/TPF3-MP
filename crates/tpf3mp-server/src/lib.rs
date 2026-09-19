@@ -44,6 +44,7 @@ use crate::{
 /// How long a shutdown waits for connections to finish ending.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub identity: ServerIdentity,

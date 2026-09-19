@@ -1559,6 +1559,7 @@ name = "tpf3mp-bridge"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "proptest",
  "serde",
  "thiserror",
  "tpf3mp-ipc",
@@ -1632,6 +1633,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "postcard",
+ "proptest",
  "serde",
  "thiserror",
 ]

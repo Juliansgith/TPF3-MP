@@ -15,5 +15,8 @@ thiserror.workspace = true
 tpf3mp-ipc.workspace = true
 tpf3mp-proto.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

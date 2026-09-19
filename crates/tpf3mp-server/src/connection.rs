@@ -326,6 +326,9 @@ impl Client {
         control_writer.abort();
         turn_writer.abort();
         bulk.abort();
+        // Each holds the connection, and with it the server's socket: the
+        // connection's task ends only once they have.
+        let _ = tokio::join!(control_writer, turn_writer, bulk);
     }
 
     /// Enters or leaves a room, and returns the room left.

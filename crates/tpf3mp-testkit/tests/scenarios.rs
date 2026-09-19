@@ -10,7 +10,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use tpf3mp_net::tunnel::TunnelUrl;
 use tpf3mp_net::{ServerIdentity, ServerTrust};
 use tpf3mp_proto::{RoomSettings, Speed};
-use tpf3mp_server::{Server, ServerConfig, ServerStats, SnapshotConfig, TunnelConfig};
+use tpf3mp_server::{Server, ServerConfig, ServerError, ServerStats, SnapshotConfig, TunnelConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -87,7 +87,7 @@ impl TestServer {
         config.max_sessions_per_address = 1000;
         config.max_handshakes_per_address = 1000;
         config.max_rooms_per_address = 1000;
-        let server = Server::bind(config).unwrap();
+        let server = bind_retrying(config).await;
         let address = server.local_addr().unwrap();
         let stats = server.stats();
         let tunnel = format!(
@@ -127,6 +127,26 @@ impl TestServer {
             let _ = stop.send(());
         }
         let _ = tokio::time::timeout(Duration::from_secs(10), &mut self.task).await;
+    }
+}
+
+/// Binds a server, waiting a little for its address when a server just
+/// stopped there. A real restart is a new process, which frees the port at
+/// once; one in the same process frees it when the old server's last task
+/// has dropped its socket.
+async fn bind_retrying(config: ServerConfig) -> Server {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Server::bind(config.clone()) {
+            Ok(server) => return server,
+            Err(ServerError::Bind(error))
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("cannot start the server: {error}"),
+        }
     }
 }
 
