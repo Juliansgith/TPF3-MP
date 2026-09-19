@@ -27,6 +27,27 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  release-build:
+    name: release build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      # What the release workflow packages, built as it builds it, so an
+      # optimized or link-time problem shows before a release is tagged.
+      - run: cargo build --release --locked -p tpf3mp-agent -p tpf3mp-server -p tpf3mp-hook
+      - name: The binaries start
+        shell: bash
+        run: |
+          ./target/release/tpf3mp-agent --version
+          ./target/release/tpf3mp-server --version
+
   image:
     name: server image
     runs-on: ubuntu-latest

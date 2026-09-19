@@ -172,11 +172,12 @@ connection carries:
 
 | channel | carries |
 |---|---|
-| control stream | handshake, room membership, lobby |
+| control stream | handshake, rooms and lobby, chat, and the client's game messages: intents, progress, checkpoint and save reports |
 | turn stream | sealed turns, server to client |
-| intent stream | intents and reports, client to server |
 | bulk streams | snapshots, so a 100 MB+ transfer never delays turns |
-| datagrams | advisory traffic: cursors, build previews, pings |
+
+QUIC datagrams are reserved for advisory traffic such as cursors and build
+previews, which nothing sends yet; the server accepts none.
 
 **Fallback:** for networks that block UDP, the same QUIC connection runs
 through a WebSocket over TLS on TCP 443, one datagram per message, usually
@@ -196,7 +197,8 @@ mismatch with an actionable reason before anything else is exchanged.
 
 There are two kinds:
 
-- **Canonical state:** small, kept by the server at every checkpoint.
+- **Canonical state:** small, written into a room's log whenever the log is
+  compacted, so a restart replays only the turns after it.
 - **Native world saves:** large, loadable across platforms (announced for
   TPF3; verified on release day).
 
@@ -207,9 +209,9 @@ Native saves are:
 - deduplicated, so a rejoining or rebased player downloads only the chunks
   it does not already have.
 
-The server keeps the latest agreed native save and the event log since it.
-Hot-join, reconnect, crash resume, rebasing and persistent worlds all use that
-one path.
+The server keeps the latest agreed native save, the one before, and the
+recent turns (up to an hour). Hot-join, reconnect, crash resume, rebasing and
+persistent worlds all use that one path: a world, then the turns since.
 
 ## Security
 
