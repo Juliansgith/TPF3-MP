@@ -455,7 +455,6 @@ async fn divergences_reported_to_cat(attack: bool) -> Vec<(u64, Vec<u16>)> {
 /// Control for the test below: without the attack, Cat's divergence at
 /// step 1000 is reported.
 #[tokio::test]
-#[ignore = "security PoC control (passes); slow"]
 async fn without_interference_a_divergence_is_reported() {
     let diverged = divergences_reported_to_cat(false).await;
     assert!(
@@ -473,7 +472,6 @@ async fn without_interference_a_divergence_is_reported() {
 /// the member refills them), and every honest checkpoint is silently
 /// dropped: divergence detection is off for the whole room.
 #[tokio::test]
-#[ignore = "security PoC: fails until checkpoint rounds cannot be exhausted by one member"]
 async fn one_member_cannot_switch_off_divergence_detection() {
     let diverged = divergences_reported_to_cat(true).await;
     assert!(

@@ -49,10 +49,19 @@ const REQUEST_BURST: u32 = 20;
 /// Of those, attempts to join a room.
 const JOINS_PER_SECOND: u32 = 1;
 const JOIN_BURST: u32 = 5;
-/// Game messages one connection may send per second: intents, progress
-/// reports and checkpoints together. A game sends a few dozen.
-const GAME_MESSAGES_PER_SECOND: u32 = 200;
-const GAME_MESSAGE_BURST: u32 = 400;
+/// Game messages one connection may send per second, and the burst on top,
+/// each kind on its own so a flood of one never starves another: dropping
+/// a member's progress reports would make its room wait for it.
+///
+/// Checkpoints have no limit here. A flood would starve the sender's own
+/// honest reports, and every round would then wait for them; the room
+/// instead ignores reports for closed rounds at almost no cost.
+const PROGRESS_PER_SECOND: u32 = 200;
+const PROGRESS_BURST: u32 = 400;
+/// Above the room's own per-player limit, which answers with reasons; this
+/// only keeps a flood out of the room's queue.
+const INTENTS_PER_SECOND: u32 = 40;
+const INTENT_BURST: u32 = 80;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
@@ -250,7 +259,8 @@ struct Client {
     turns: Option<mpsc::Receiver<TurnFeed>>,
     requests: TokenBucket,
     joins: TokenBucket,
-    game_messages: TokenBucket,
+    progress: TokenBucket,
+    intents: TokenBucket,
 }
 
 impl Client {
@@ -275,7 +285,8 @@ impl Client {
             turns: Some(turns_rx),
             requests: TokenBucket::new(REQUESTS_PER_SECOND, REQUEST_BURST),
             joins: TokenBucket::new(JOINS_PER_SECOND, JOIN_BURST),
-            game_messages: TokenBucket::new(GAME_MESSAGES_PER_SECOND, GAME_MESSAGE_BURST),
+            progress: TokenBucket::new(PROGRESS_PER_SECOND, PROGRESS_BURST),
+            intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
         }
     }
 
@@ -344,7 +355,12 @@ impl Client {
                     }
                 }
                 ClientMessage::Game(message) => {
-                    if self.game_messages.take(now, 1) {
+                    let allowed = match &message {
+                        GameMessage::Intent { .. } => self.intents.take(now, 1),
+                        GameMessage::Progress { .. } => self.progress.take(now, 1),
+                        GameMessage::Checkpoint { .. } => true,
+                    };
+                    if allowed {
                         self.game(message)?;
                     } else if let GameMessage::Intent { client_seq, .. } = message {
                         self.reject_intent(client_seq, IntentRejection::RateLimited);

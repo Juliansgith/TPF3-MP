@@ -55,7 +55,10 @@ const PAYLOAD_BURST: u32 = 256 * 1024;
 /// deciding with the reports it has.
 const CHECKPOINT_DEADLINE: Duration = Duration::from_secs(30);
 /// Decided rounds kept to judge members who report late.
-const DECIDED_ROUNDS_KEPT: usize = 8;
+const DECIDED_ROUNDS_KEPT: usize = 64;
+/// Reports a round needs for a verdict. One report compares against
+/// nothing, and would only judge later reporters by an unchecked claim.
+const MIN_VERDICT_REPORTS: usize = 2;
 /// Undecided rounds at once; no client can make the server hold more.
 const MAX_OPEN_ROUNDS: usize = 64;
 /// Turns kept in memory for resuming: an hour at the default tick, and at
@@ -352,6 +355,10 @@ struct Game {
     started: Instant,
     /// Checkpoint rounds by step.
     rounds: BTreeMap<u64, Round>,
+    /// Rounds at or below this step are closed: pruned or expired. A report
+    /// for such a step without a kept round is ignored, so nobody can reopen
+    /// old rounds, fill the open-round limit and switch verdicts off.
+    rounds_closed_through: u64,
 }
 
 struct Round {
@@ -1093,6 +1100,10 @@ impl Room {
             debug!(room = %self.id, %player, step, "ignoring a checkpoint that is not due");
             return;
         }
+        if step <= game.rounds_closed_through && !game.rounds.contains_key(&step) {
+            debug!(room = %self.id, %player, step, "ignoring a checkpoint for a closed round");
+            return;
+        }
         let open = game
             .rounds
             .values()
@@ -1130,7 +1141,9 @@ impl Room {
             }
             None => {
                 round.reports.push(report);
-                if round_complete(&self.members, round) {
+                if round.reports.len() >= MIN_VERDICT_REPORTS
+                    && round_complete(&self.members, round)
+                {
                     decide_round(round)
                 } else {
                     Vec::new()
@@ -1142,20 +1155,29 @@ impl Room {
     }
 
     /// Decides rounds that everyone pacing the room has reported (members may
-    /// have left since the last report) or whose deadline has passed.
+    /// have left since the last report) or whose deadline has passed. A
+    /// round too few members reported by its deadline closes without a
+    /// verdict.
     fn decide_waiting_rounds(&mut self, now: Instant) {
         let Phase::Running(game) = &mut self.phase else {
             return;
         };
         let mut decided = Vec::new();
+        let mut expired = Vec::new();
         for (step, round) in &mut game.rounds {
-            let overdue = now.saturating_duration_since(round.opened) >= CHECKPOINT_DEADLINE;
-            if round.verdict.is_none()
-                && !round.reports.is_empty()
-                && (overdue || round_complete(&self.members, round))
-            {
-                decided.push((*step, decide_round(round)));
+            if round.verdict.is_some() {
+                continue;
             }
+            let overdue = now.saturating_duration_since(round.opened) >= CHECKPOINT_DEADLINE;
+            let enough = round.reports.len() >= MIN_VERDICT_REPORTS;
+            if enough && (overdue || round_complete(&self.members, round)) {
+                decided.push((*step, decide_round(round)));
+            } else if overdue {
+                expired.push(*step);
+            }
+        }
+        for step in expired {
+            game.close_round(step);
         }
         if decided.is_empty() {
             return;
@@ -1396,6 +1418,7 @@ impl Game {
             last_tick: Instant::now(),
             started: Instant::now(),
             rounds: BTreeMap::new(),
+            rounds_closed_through: 0,
         }
     }
 
@@ -1409,8 +1432,13 @@ impl Game {
             .collect();
         let excess = decided.len().saturating_sub(DECIDED_ROUNDS_KEPT);
         for step in &decided[..excess] {
-            self.rounds.remove(step);
+            self.close_round(*step);
         }
+    }
+
+    fn close_round(&mut self, step: u64) {
+        self.rounds.remove(&step);
+        self.rounds_closed_through = self.rounds_closed_through.max(step);
     }
 
     /// Orders an event: the next sequence number, and the first step no

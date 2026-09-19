@@ -153,12 +153,18 @@ These travel on the control stream.
   setting). The server compares members' digests, as described in
   [ARCHITECTURE.md](ARCHITECTURE.md) under "Authority and data flow".
   - **Deciding.** A round is decided once every member pacing the room has
-    reported, or 30 seconds after the first report.
+    reported, or 30 seconds after the first report. It needs at least two
+    reports: one report compares against nothing, so a round that has only
+    one at its deadline closes without a verdict.
   - **Verdict.** For each lane, a strict majority wins; otherwise the anchor
     wins (the reporter on the most common platform, earliest in join order).
   - **Divergence.** A member that differs from the verdict receives
     `Diverged` with the step and the lanes. So does a member that reports
-    after the decision.
+    after the decision, while the room still keeps that round (the last 64
+    decided rounds).
+  - **Closed rounds.** A report for a step whose round was closed and
+    dropped is ignored, so nobody can reopen old rounds and crowd out new
+    ones.
 
 Game messages that arrive when the sender is not in a running room are
 ignored; an intent is answered with `IntentRejected(GameNotRunning)`. Such
@@ -201,8 +207,10 @@ the stream continues its log exactly (`TurnFollower::restart`).
   - Requests, per connection: 10 per second with a burst of 20, of which
     joins 1 per second with a burst of 5. Excess requests are answered with
     `RateLimited`.
-  - Game messages, per connection: 200 per second with a burst of 400.
-    Excess progress reports and checkpoints are dropped.
+  - Game messages, per connection and per kind: progress reports 200 per
+    second with a burst of 400 (excess ones are dropped), intents 40 per
+    second with a burst of 80. Checkpoints are not limited here: the room
+    ignores reports for closed rounds.
   - Requests that change nothing, such as setting ready twice, do not send
     everyone the room again.
 - **Password guessing.** A room takes 10 wrong passwords per minute from
