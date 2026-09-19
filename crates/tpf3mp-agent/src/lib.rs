@@ -6,6 +6,7 @@ pub mod bridge;
 mod follower;
 pub mod launcher;
 mod playout;
+pub mod save_check;
 pub mod transfer;
 
 use std::{
@@ -557,6 +558,11 @@ impl Client {
     /// Whether the session runs through a tunnel rather than over UDP.
     pub fn tunneled(&self) -> bool {
         self.tunneled
+    }
+
+    /// Waits for the connection to close, and says why it did.
+    pub async fn closed(&self) -> quinn::ConnectionError {
+        self.connection.closed().await
     }
 
     /// Sends a request and waits for its response.

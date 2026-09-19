@@ -1539,6 +1539,7 @@ dependencies = [
  "clap",
  "dirs",
  "getrandom 0.4.3",
+ "proptest",
  "quinn",
  "ring",
  "serde",

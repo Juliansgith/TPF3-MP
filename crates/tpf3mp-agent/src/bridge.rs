@@ -939,7 +939,18 @@ pub async fn play<L: HookLink>(
     rejoin: &Rejoin,
 ) -> Result<BridgeEnd, BridgeFault> {
     loop {
-        match bridge.run(&client, &mut events).await {
+        let ended = match bridge.run(&client, &mut events).await {
+            // A request can find the connection gone before its closing
+            // reaches the events: then it is the same loss.
+            Err(BridgeFault::Client(
+                error @ (ClientError::Disconnected | ClientError::Timeout),
+            )) => match tokio::time::timeout(CLOSE_NOTICE, client.closed()).await {
+                Ok(reason) => Ok(BridgeEnd::Closed(reason)),
+                Err(_) => Err(BridgeFault::Client(error)),
+            },
+            other => other,
+        };
+        match ended {
             Ok(BridgeEnd::Closed(reason)) if worth_rejoining(&reason) => {
                 warn!(%reason, "lost the server; rejoining the room");
                 bridge.status(|status| status.notice("lost the server; rejoining the room"));
@@ -972,6 +983,10 @@ pub async fn play<L: HookLink>(
         }
     }
 }
+
+/// How long a request that failed for a lost connection waits for the
+/// connection to say it closed, before the failure counts as a fault.
+const CLOSE_NOTICE: Duration = Duration::from_secs(5);
 
 /// Whether a lost connection is worth rejoining after: not when this side
 /// closed it, another connection replaced it, or the protocol broke.

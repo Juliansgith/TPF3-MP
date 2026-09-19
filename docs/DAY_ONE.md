@@ -97,9 +97,14 @@ do not change D2.
 - Load a save made on Windows on Linux and macOS, and the reverse.
 - Measure save sizes for small, medium and large maps.
 - Find what a save can make the game run (script state, mod code), and
-  write the check the agent applies to a received save before the game
-  loads it, as TPF2MP's `save_metadata.py` did. Until then a received save
-  is only as trustworthy as the player who uploaded it.
+  apply a check to a received save before the game loads it, as TPF2MP's
+  `save_metadata.py` did. Its rule for TPF2's `.sav.lua` sidecar, pure data
+  under `function data() return { ... } end`, is ported as
+  `tpf3mp_agent::save_check::check_lua_data`; if TPF3 saves carry such a
+  file, check it where the bridge takes a fetched world (`Done::Fetched` in
+  `crates/tpf3mp-agent/src/bridge.rs`) and refuse to load on failure. Until
+  then a received save is only as trustworthy as the player who uploaded
+  it.
 - Run `measure --pair` on two saves of one world taken minutes apart, to
   see how well snapshots deduplicate (SNAPSHOTS.md).
 

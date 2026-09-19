@@ -20,7 +20,9 @@ waits for the [release-day investigation](docs/DAY_ONE.md).
   simulating identically.
 
 The full design is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the
-reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
+reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md). Players start
+with [docs/PLAYING.md](docs/PLAYING.md); server operators with
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Status
 
