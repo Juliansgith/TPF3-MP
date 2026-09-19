@@ -956,8 +956,9 @@ pub async fn play<L: HookLink>(
                 return Err(fault);
             }
         }
+        let options = rejoin.options.again_after(&client);
         drop(client);
-        match rejoin_room(bridge, rejoin).await {
+        match rejoin_room(bridge, rejoin, &options).await {
             Ok((new_client, new_events)) => {
                 info!("rejoined the room");
                 bridge.status(|status| status.notice("rejoined the room"));
@@ -994,13 +995,14 @@ fn worth_rejoining(reason: &quinn::ConnectionError) -> bool {
 async fn rejoin_room<L: HookLink>(
     bridge: &mut Bridge<L>,
     rejoin: &Rejoin,
+    options: &ConnectOptions,
 ) -> Result<(Client, Events), String> {
     let deadline = Instant::now() + rejoin.give_up_after;
     let mut backoff = Duration::from_millis(250);
     let mut resume = bridge.resume_point();
     loop {
         let attempt = async {
-            let (client, events) = connect(rejoin.options.clone())
+            let (client, events) = connect(options.clone())
                 .await
                 .map_err(|error| (error.to_string(), false))?;
             client

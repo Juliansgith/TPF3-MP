@@ -53,7 +53,8 @@ WebSocket tunnel instead:
   QUIC keep-alives cross an open connection's tunnel every 5 s.
 
 Clients try UDP first. If UDP has not connected after 3 s, the tunnel joins
-the race, and whichever connects first is kept. Over a tunnel, one lost TCP
+the race, and whichever connects first is kept. Once a connection needed the
+tunnel, reconnecting starts both at once. Over a tunnel, one lost TCP
 segment holds up everything behind it, so it is only a fallback.
 
 ## Handshake and identity

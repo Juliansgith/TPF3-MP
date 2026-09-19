@@ -248,9 +248,9 @@ async fn act(
             view.server_version = Some(client.welcome().server_version.as_str().to_owned());
             drop(view);
             *connected = Some(Connected {
+                options: options.again_after(&client),
                 client,
                 events,
-                options,
             });
             Ok(())
         }

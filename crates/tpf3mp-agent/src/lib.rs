@@ -120,6 +120,19 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
+    /// The options for connecting again after `client` connected with
+    /// these: a network that needed the tunnel likely still does, so UDP
+    /// and the tunnel start together, and whichever answers first wins.
+    pub fn again_after(&self, client: &Client) -> Self {
+        let mut options = self.clone();
+        if client.tunneled() && matches!(options.route, Route::UdpOrTunnel(_)) {
+            options.fallback_after = Duration::ZERO;
+        }
+        options
+    }
+}
+
+impl ConnectOptions {
     pub fn new(
         server: SocketAddr,
         server_name: impl Into<String>,

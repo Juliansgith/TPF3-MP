@@ -99,15 +99,21 @@ async fn udp_that_gets_no_answer_falls_back_to_the_tunnel() {
     options.server = silent.local_addr().unwrap();
     options.route = Route::UdpOrTunnel(tls_url(&server));
     options.fallback_after = Duration::from_millis(200);
-    let (client, _events) = connect(options).await.unwrap();
+    let (client, _events) = connect(options.clone()).await.unwrap();
     assert!(client.tunneled(), "the tunnel won the race");
+    // Reconnecting, UDP and the tunnel start together.
+    assert_eq!(options.again_after(&client).fallback_after, Duration::ZERO);
 
     // Where UDP gets through, it is kept.
     let identity = new_identity();
     let mut options = server.options(identity, "bob");
     options.route = Route::UdpOrTunnel(tls_url(&server));
-    let (client, _events) = connect(options).await.unwrap();
+    let (client, _events) = connect(options.clone()).await.unwrap();
     assert!(!client.tunneled());
+    assert_eq!(
+        options.again_after(&client).fallback_after,
+        options.fallback_after
+    );
     server.shut_down().await;
 }
 
