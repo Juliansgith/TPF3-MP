@@ -115,6 +115,7 @@ impl TestServer {
             server: via,
             server_name: "localhost".into(),
             trust: self.trust.clone(),
+            tunnel: None,
             settings,
             speed: Speed::NORMAL,
             bots,

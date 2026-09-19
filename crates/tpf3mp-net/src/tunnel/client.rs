@@ -7,10 +7,11 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -38,6 +39,10 @@ use super::{
 };
 use crate::{ServerTrust, tls::tunnel_client_tls};
 
+/// How long one address of a tunnel's host has alone before the next joins
+/// the race, as browsers do (RFC 8305).
+const NEXT_ADDRESS_AFTER: Duration = Duration::from_millis(250);
+
 /// A client's QUIC socket that sends and receives through a tunnel. Every
 /// datagram goes to the tunnel's server, whatever address QUIC names, and
 /// every datagram received comes from `peer`, the address the endpoint
@@ -58,7 +63,7 @@ pub async fn connect(
     trust: &ServerTrust,
     peer: SocketAddr,
 ) -> Result<Arc<TunnelSocket>, TunnelError> {
-    let tcp = TcpStream::connect((url.host(), url.port())).await?;
+    let tcp = connect_tcp(url.host(), url.port()).await?;
     tcp.set_nodelay(true)?;
     let mut request = url.uri().clone().into_client_request()?;
     request
@@ -77,6 +82,38 @@ pub async fn connect(
         let (ws, response) = client_async_with_config(request, tcp, Some(ws_config())).await?;
         check_protocol(&response)?;
         Ok(TunnelSocket::start(ws, peer))
+    }
+}
+
+/// Connects to the first address of `host` that answers. Each address the
+/// name resolves to, IPv4 first, gets a quarter second alone before the
+/// next joins in, so one that never answers, or answers slowly with a
+/// refusal as a closed port on Windows does, costs a quarter second rather
+/// than a timeout.
+async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    addresses.sort_by_key(|address| !address.is_ipv4());
+    let mut untried = addresses.into_iter();
+    let mut attempts = FuturesUnordered::new();
+    let mut failure = io::Error::new(io::ErrorKind::NotFound, "the host has no address");
+    loop {
+        if attempts.is_empty() {
+            match untried.next() {
+                Some(address) => attempts.push(TcpStream::connect(address)),
+                None => return Err(failure),
+            }
+        }
+        tokio::select! {
+            Some(result) = attempts.next() => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => failure = error,
+            },
+            () = tokio::time::sleep(NEXT_ADDRESS_AFTER), if untried.len() > 0 => {
+                if let Some(address) = untried.next() {
+                    attempts.push(TcpStream::connect(address));
+                }
+            }
+        }
     }
 }
 

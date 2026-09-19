@@ -240,7 +240,12 @@ Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and
 - 1,000 steps at 50 steps per second;
 - 229,000 events applied across replicas;
 - no divergence;
-- p99 command latency 112 ms on loopback.
+- p99 command latency 114 ms on loopback, through the socket that also
+  takes tunnels, as deployed;
+- with every bot in a TLS tunnel instead (`--tunneled`): p99 116 ms and
+  the same run time. On loopback nothing is lost, so this measures the
+  tunnel's own cost; on a lossy link, TCP holds datagrams back behind each
+  lost segment.
 
 Repeat against the real host after deploying. Every bot connects from the
 machine running the load test, so first raise that address's limits on the
@@ -254,6 +259,8 @@ cargo run --release -p tpf3mp-testkit --bin tpf3mp-loadtest -- \
 
 `--paced` makes the bots play at the room's pace behind a jitter buffer, as
 games do, so the latencies it reports are the ones players would feel.
+`--tunnel wss://tpf3mp.example.org/tpf3mp` sends every bot through the
+tunnel instead, through the reverse proxy.
 
 ## Security notes
 

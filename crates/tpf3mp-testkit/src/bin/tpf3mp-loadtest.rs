@@ -6,9 +6,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::time::Instant;
-use tpf3mp_net::{CertificateDer, ServerIdentity, ServerTrust};
+use tpf3mp_net::{CertificateDer, ServerIdentity, ServerTrust, tunnel::TunnelUrl};
 use tpf3mp_proto::{RoomSettings, Speed};
-use tpf3mp_server::{Server, ServerConfig};
+use tpf3mp_server::{Server, ServerConfig, TunnelConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -59,6 +59,14 @@ struct Args {
     /// Packet loss per direction, in percent (in-process only).
     #[arg(long, default_value_t = 0.0, conflicts_with = "server")]
     loss_percent: f64,
+    /// Connect every bot through this tunnel (a deployed server's wss://
+    /// URL) instead of over UDP.
+    #[arg(long, requires = "server")]
+    tunnel: Option<String>,
+    /// Connect every bot through the in-process server's tunnel instead of
+    /// over UDP.
+    #[arg(long, conflicts_with = "server")]
+    tunneled: bool,
 }
 
 #[tokio::main]
@@ -68,7 +76,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let (address, server_name, trust, _local) = match &args.server {
+    let (address, server_name, trust, tunnel, _local) = match &args.server {
         Some(server) => {
             let (host, _) = server
                 .rsplit_once(':')
@@ -80,11 +88,17 @@ async fn main() -> Result<()> {
                 Some(path) => ServerTrust::Pinned(CertificateDer::from(std::fs::read(path)?)),
                 None => ServerTrust::WebPki,
             };
-            (address, host.to_owned(), trust, None)
+            let tunnel = args
+                .tunnel
+                .as_deref()
+                .map(|url| url.parse::<TunnelUrl>().context("the tunnel URL"))
+                .transpose()?;
+            (address, host.to_owned(), trust, tunnel, None)
         }
         None => {
-            let (address, trust, local) = start_local(&args).await?;
-            (address, "localhost".to_owned(), trust, Some(local))
+            let (address, trust, tunnel, local) = start_local(&args).await?;
+            let tunnel = args.tunneled.then_some(tunnel);
+            (address, "localhost".to_owned(), trust, tunnel, Some(local))
         }
     };
 
@@ -103,6 +117,7 @@ async fn main() -> Result<()> {
                 server: address,
                 server_name: server_name.clone(),
                 trust: trust.clone(),
+                tunnel: tunnel.clone(),
                 settings,
                 speed: Speed::NORMAL,
                 bots: (0..args.bots)
@@ -159,8 +174,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Starts an in-process server, behind the network emulator when asked.
-async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, LocalServer)> {
+/// Starts an in-process server, behind the network emulator when asked. It
+/// takes tunnels too, as deployed servers do, so UDP bots also go through
+/// the socket that merges them. Returns its tunnel's URL as well.
+async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, TunnelUrl, LocalServer)> {
     let identity = ServerIdentity::self_signed(&["localhost"])?;
     let trust = ServerTrust::Pinned(identity.leaf().clone());
     let mut config = ServerConfig::new("127.0.0.1:0".parse()?, identity);
@@ -171,8 +188,14 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, LocalServe
     config.max_handshakes = 100_000;
     config.max_handshakes_per_address = 100_000;
     config.max_rooms_per_address = 100_000;
+    config.tunnel = Some(TunnelConfig::new("127.0.0.1:0".parse()?));
     let server = Server::bind(config)?;
     let mut address = server.local_addr()?;
+    let tunnel = format!(
+        "wss://localhost:{}/tpf3mp",
+        server.tunnel_addr().context("the tunnel listener")?.port()
+    )
+    .parse()?;
     let task = tokio::spawn(server.run(std::future::pending()));
     let netem = if args.latency_ms > 0 || args.jitter_ms > 0 || args.loss_percent > 0.0 {
         let netem = Netem::start(
@@ -193,6 +216,7 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, LocalServe
     Ok((
         address,
         trust,
+        tunnel,
         LocalServer {
             task,
             _netem: netem,

@@ -35,6 +35,8 @@ pub struct RoomPlan {
     pub server: SocketAddr,
     pub server_name: String,
     pub trust: ServerTrust,
+    /// Connect the bots through this tunnel instead of over UDP.
+    pub tunnel: Option<TunnelUrl>,
     pub settings: RoomSettings,
     pub speed: Speed,
     pub bots: Vec<BotConfig>,
@@ -49,7 +51,7 @@ pub async fn play_room(plan: RoomPlan) -> Result<Vec<BotReport>> {
         bail!("a room needs at least one bot");
     }
     let names: Vec<&str> = plan.bots.iter().map(|bot| bot.name.as_str()).collect();
-    let clients = connect_all(plan.server, &plan.server_name, &plan.trust, &names).await?;
+    let clients = connect_all(&plan, &names).await?;
     let seated: Vec<&Client> = clients.iter().map(|(client, _)| client).collect();
     seat_and_start(&seated, seated.len(), plan.settings).await?;
     if plan.speed != Speed::NORMAL {
@@ -83,15 +85,13 @@ pub async fn play_room(plan: RoomPlan) -> Result<Vec<BotReport>> {
 }
 
 /// Connects one client per name, each with a fresh identity.
-async fn connect_all(
-    server: SocketAddr,
-    server_name: &str,
-    trust: &ServerTrust,
-    names: &[&str],
-) -> Result<Vec<(Client, Events)>> {
+async fn connect_all(plan: &RoomPlan, names: &[&str]) -> Result<Vec<(Client, Events)>> {
     let mut clients = Vec::with_capacity(names.len());
     for name in names {
-        let options = player_options(server, server_name, trust, name)?;
+        let mut options = player_options(plan.server, &plan.server_name, &plan.trust, name)?;
+        if let Some(url) = &plan.tunnel {
+            options.route = Route::Tunnel(url.clone());
+        }
         clients.push(connect(options).await.context("connecting a player")?);
     }
     Ok(clients)
