@@ -266,12 +266,44 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
   since the game thread blocks while loading. The agent gives up on a hook
   whose heartbeat stands still for 60 s.
 
-`tpf3mp_testkit::fake_hook` is a complete hook for the toy game: the real
-link, the real gate, and a world that steps only when released. The
-`games_behind_the_bridge_and_gate_agree` scenario runs three of them in
-one room end to end. On release day, the game-specific part of the hook
-does what the fake hook does with the toy world, applying commands and
-running steps through the real game.
+### The hook's session
+
+`tpf3mp_bridge::Session` is the hook's whole side of the link, run on the
+game thread. The game-specific part of the hook implements the `Game` trait
+and calls the session from its detours:
+
+- **Startup.** `Session::attach(DEFAULT_LINK, build, patience)`, then
+  `wait_for_begin()`, then load the world and call `loaded(next_step)`.
+  Call `heartbeat()` while loading.
+- **Before each simulation step.**
+  - `before_step(&mut game)` blocks until the room releases the step,
+    calling `Game::apply` for each event on the way. A pause can hold it
+    there for as long as the pause lasts.
+  - A game whose simulation shares a thread with its rendering, which must
+    never block, calls `poll_step` instead. It returns `Wait` until the
+    step is released, and the detour skips the step for that frame.
+- **After each step.** `after_step(&mut game)` reports it, and at
+  checkpoint steps sends `Game::lanes()`.
+- **When the player acts.** Capture the action before the game applies it
+  locally and call `command(payload)`. The action happens only when the
+  room's event comes back through `Game::apply`, on every replica alike.
+- **Notices.** `Game::notice` receives speed changes, refusals,
+  divergences and the end of the session, for the game's UI.
+
+The session gives up (`AgentGone`) only when the agent's heartbeat stands
+still for its patience, never merely because a step is withheld.
+
+`tpf3mp_testkit::fake_hook` implements `Game` for the toy game and runs it
+through `Session`: the exact code the real hook will run, over the real
+link. The `games_behind_the_bridge_and_gate_agree` scenario runs three of
+them in one room end to end. `tpf3mp-fakegame` does the same as a separate
+process, for trying the stack by hand (see the README). On release day,
+what remains for TPF3 is:
+
+- the build profile with its signatures;
+- the detours that call the session;
+- `Game` for the real world: applying an event means executing the player
+  command it carries, and the lanes are digests of the game state.
 
 ## Release-day procedure: adding a target for a new build
 

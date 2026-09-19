@@ -12,6 +12,7 @@ publish.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tpf3mp-ipc.workspace = true
 tpf3mp-proto.workspace = true
 
 [lints]

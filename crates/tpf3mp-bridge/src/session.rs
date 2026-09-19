@@ -1,0 +1,285 @@
+//! The game's side of a session, which the hook runs on the game thread.
+//!
+//! Everything here is game-agnostic. The game-specific part of the hook
+//! implements [`Game`] and calls the session from its detours:
+//! [`Session::poll_step`] or [`Session::before_step`] before each simulation
+//! step, [`Session::after_step`] after it, and [`Session::command`] when the
+//! player acts.
+
+use std::time::{Duration, Instant};
+
+use thiserror::Error;
+use tpf3mp_ipc::{IpcError, Link, Role, SendError};
+use tpf3mp_proto::{Event, IntentRejection, LaneDigest, Payload, Speed, Text};
+
+use crate::{
+    BRIDGE_VERSION, BridgeError, Gate, GateError, Gated, MAX_MESSAGE, ToAgent, ToHook,
+    check_version, decode, encode,
+};
+
+/// How long to sleep between polls while waiting for the agent.
+const POLL: Duration = Duration::from_micros(200);
+
+/// What the session needs from the game.
+pub trait Game {
+    /// Applies an event the room ordered. Called only between steps.
+    fn apply(&mut self, event: &Event);
+    /// The world's lane digests, taken at a checkpoint step.
+    fn lanes(&mut self) -> Vec<LaneDigest>;
+    /// Something to show the player.
+    fn notice(&mut self, notice: Notice) {
+        let _ = notice;
+    }
+}
+
+/// Something the game should tell the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    Speed(Speed),
+    Diverged {
+        step: u64,
+        lanes: Vec<u16>,
+    },
+    /// The room refused a command; `command` is what [`Session::command`]
+    /// returned for it.
+    Refused {
+        command: u64,
+        reason: IntentRejection,
+    },
+    /// The session is over.
+    Ended(Text<128>),
+}
+
+/// What the game does about its next step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepGate {
+    /// Run it.
+    Run,
+    /// Not yet: the room has not released it.
+    Wait,
+    /// The session is over; stop following the room.
+    Ended,
+}
+
+/// A game the room began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Begin {
+    pub steps_per_second: u16,
+    pub checkpoint_interval: u32,
+}
+
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error(transparent)]
+    Link(#[from] IpcError),
+    #[error("the link failed: {0}")]
+    Transfer(String),
+    #[error(transparent)]
+    Message(#[from] BridgeError),
+    #[error(transparent)]
+    Gate(#[from] GateError),
+    #[error("the agent sent {0} out of place")]
+    Unexpected(&'static str),
+    #[error("the agent stopped responding")]
+    AgentGone,
+}
+
+/// The hook's end of one session with the agent.
+pub struct Session {
+    link: Link,
+    gate: Gate,
+    checkpoint_interval: u64,
+    /// How long the agent's heartbeat may stand still.
+    patience: Duration,
+    agent_beat: (u64, Instant),
+    buf: Vec<u8>,
+    commands: u64,
+}
+
+impl Session {
+    /// Attaches to the agent's link, waiting up to `patience` for the agent
+    /// to create it, and exchanges hellos. `build` names the game build in
+    /// the agent's log.
+    pub fn attach(name: &str, build: &str, patience: Duration) -> Result<Self, SessionError> {
+        let deadline = Instant::now() + patience;
+        let link = loop {
+            match Link::open(name, Role::Hook) {
+                Ok(link) => break link,
+                Err(error) if Instant::now() >= deadline => return Err(error.into()),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let mut session = Self {
+            agent_beat: (link.peer_heartbeat(), Instant::now()),
+            link,
+            gate: Gate::new(1),
+            checkpoint_interval: u64::MAX,
+            patience,
+            buf: vec![0; MAX_MESSAGE],
+            commands: 0,
+        };
+        session.send(&ToAgent::Hello {
+            version: BRIDGE_VERSION,
+            build: Text::lossy(build),
+        })?;
+        match session.recv_blocking()? {
+            ToHook::Hello { version } => check_version(version)?,
+            _ => return Err(SessionError::Unexpected("something before its hello")),
+        }
+        Ok(session)
+    }
+
+    /// Waits for the room to begin a game. The game then loads its world,
+    /// beating [`Session::heartbeat`] meanwhile, and calls
+    /// [`Session::loaded`].
+    pub fn wait_for_begin(&mut self) -> Result<Begin, SessionError> {
+        match self.recv_blocking()? {
+            ToHook::Begin {
+                steps_per_second,
+                checkpoint_interval,
+            } => {
+                self.checkpoint_interval = u64::from(checkpoint_interval).max(1);
+                Ok(Begin {
+                    steps_per_second,
+                    checkpoint_interval,
+                })
+            }
+            _ => Err(SessionError::Unexpected("something before the game began")),
+        }
+    }
+
+    /// The world is loaded, and `next_step` is the first step it will run.
+    pub fn loaded(&mut self, next_step: u64) -> Result<(), SessionError> {
+        self.gate = Gate::new(next_step);
+        self.send(&ToAgent::Loaded { next_step })
+    }
+
+    /// Without blocking: handles what the agent sent, applying events, and
+    /// says whether the game may run its next step. For a game whose
+    /// simulation shares a thread with its rendering, which must not block.
+    pub fn poll_step(&mut self, game: &mut impl Game) -> Result<StepGate, SessionError> {
+        self.link.heartbeat();
+        loop {
+            if self.gate.ended() {
+                return Ok(StepGate::Ended);
+            }
+            if self.gate.may_run() {
+                return Ok(StepGate::Run);
+            }
+            let Some(message) = self.try_recv()? else {
+                self.check_agent()?;
+                return Ok(StepGate::Wait);
+            };
+            self.handle(message, game)?;
+        }
+    }
+
+    /// Blocks until the game may run its next step, applying events
+    /// meanwhile. A pause can hold the game here for as long as it lasts;
+    /// only an agent that stops beating ends the wait.
+    pub fn before_step(&mut self, game: &mut impl Game) -> Result<StepGate, SessionError> {
+        loop {
+            match self.poll_step(game)? {
+                StepGate::Wait => std::thread::sleep(POLL),
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Records that the game ran its next step and reports it, with the
+    /// world's lanes at checkpoint steps. Returns the step.
+    pub fn after_step(&mut self, game: &mut impl Game) -> Result<u64, SessionError> {
+        let step = self.gate.ran()?;
+        self.send(&ToAgent::Ran { step })?;
+        if step % self.checkpoint_interval == 0 {
+            let lanes = game.lanes();
+            self.send(&ToAgent::Checkpoint { step, lanes })?;
+        }
+        Ok(step)
+    }
+
+    /// Hands a player's action to the room. Returns its number, which a
+    /// refusal names.
+    pub fn command(&mut self, payload: Payload) -> Result<u64, SessionError> {
+        let number = self.commands;
+        self.send(&ToAgent::Command { payload })?;
+        self.commands += 1;
+        Ok(number)
+    }
+
+    /// The step the game runs next.
+    pub fn next_step(&self) -> u64 {
+        self.gate.next_step()
+    }
+
+    /// Tells the agent this side is alive. Call it while loading.
+    pub fn heartbeat(&self) {
+        self.link.heartbeat();
+    }
+
+    /// Puts a line in the agent's log.
+    pub fn log(&mut self, message: &str) -> Result<(), SessionError> {
+        self.send(&ToAgent::Log {
+            message: Text::lossy(message),
+        })
+    }
+
+    fn handle(&mut self, message: ToHook, game: &mut impl Game) -> Result<(), SessionError> {
+        match self.gate.on_message(message)? {
+            Gated::Apply(event) => game.apply(&event),
+            Gated::Speed(speed) => game.notice(Notice::Speed(speed)),
+            Gated::Diverged { step, lanes } => game.notice(Notice::Diverged { step, lanes }),
+            Gated::Refused { command, reason } => {
+                game.notice(Notice::Refused { command, reason });
+            }
+            Gated::Ended(reason) => game.notice(Notice::Ended(reason)),
+            Gated::Nothing => {}
+        }
+        Ok(())
+    }
+
+    fn send(&mut self, message: &ToAgent) -> Result<(), SessionError> {
+        let bytes = encode(message)?;
+        loop {
+            self.link.heartbeat();
+            match self.link.send(&bytes) {
+                Ok(()) => return Ok(()),
+                Err(SendError::Full) => {
+                    self.check_agent()?;
+                    std::thread::sleep(POLL);
+                }
+                Err(error) => return Err(SessionError::Transfer(error.to_string())),
+            }
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<Option<ToHook>, SessionError> {
+        match self.link.recv_into(&mut self.buf) {
+            Ok(Some(len)) => Ok(Some(decode(&self.buf[..len])?)),
+            Ok(None) => Ok(None),
+            Err(error) => Err(SessionError::Transfer(error.to_string())),
+        }
+    }
+
+    fn recv_blocking(&mut self) -> Result<ToHook, SessionError> {
+        loop {
+            self.link.heartbeat();
+            if let Some(message) = self.try_recv()? {
+                return Ok(message);
+            }
+            self.check_agent()?;
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn check_agent(&mut self) -> Result<(), SessionError> {
+        let beat = self.link.peer_heartbeat();
+        let now = Instant::now();
+        if beat != self.agent_beat.0 {
+            self.agent_beat = (beat, now);
+        } else if now.saturating_duration_since(self.agent_beat.1) > self.patience {
+            return Err(SessionError::AgentGone);
+        }
+        Ok(())
+    }
+}

@@ -68,9 +68,11 @@ pub struct BridgeOptions {
     pub playout_memory: Duration,
     /// How often the hook's messages are read.
     pub poll: Duration,
-    /// A hook whose heartbeat stands still this long is gone. Games can load
-    /// for minutes, so the hook must beat from a thread of its own.
+    /// A hook whose heartbeat stands still this long while the game runs is
+    /// gone.
     pub hook_timeout: Duration,
+    /// The same, while the game loads its world, which can take minutes.
+    pub load_timeout: Duration,
     /// The least time between two progress reports to the server.
     pub progress_every: Duration,
 }
@@ -82,6 +84,7 @@ impl Default for BridgeOptions {
             playout_memory: Duration::from_secs(10),
             poll: Duration::from_millis(2),
             hook_timeout: Duration::from_secs(60),
+            load_timeout: Duration::from_secs(600),
             progress_every: Duration::from_millis(20),
         }
     }
@@ -122,6 +125,8 @@ pub struct Bridge<L> {
     outbox: VecDeque<ToHook>,
     hook_ready: bool,
     begun: bool,
+    /// Whether the game has loaded its world.
+    loaded: bool,
     speed: Speed,
     /// Commands the hook has sent; numbers each one's intent.
     commands: u64,
@@ -145,6 +150,7 @@ impl<L: HookLink> Bridge<L> {
             outbox: VecDeque::new(),
             hook_ready: false,
             begun: false,
+            loaded: false,
             speed: Speed::NORMAL,
             commands: 0,
             ran: None,
@@ -192,11 +198,14 @@ impl<L: HookLink> Bridge<L> {
 
     fn check_hook(&mut self, now: Instant) -> Result<(), BridgeFault> {
         let beat = self.link.peer_heartbeat();
+        let limit = if self.loaded {
+            self.options.hook_timeout
+        } else {
+            self.options.load_timeout
+        };
         if beat != self.hook_beat.0 {
             self.hook_beat = (beat, now);
-        } else if self.hook_ready
-            && now.saturating_duration_since(self.hook_beat.1) > self.options.hook_timeout
-        {
+        } else if self.hook_ready && now.saturating_duration_since(self.hook_beat.1) > limit {
             return Err(BridgeFault::HookGone);
         }
         Ok(())
@@ -226,6 +235,7 @@ impl<L: HookLink> Bridge<L> {
                     let progress = next_step.saturating_sub(1);
                     client.report_progress(progress).await?;
                     self.reported = Some(progress);
+                    self.loaded = true;
                 }
                 ToAgent::Command { payload } => {
                     client.send_intent(self.commands, payload).await?;

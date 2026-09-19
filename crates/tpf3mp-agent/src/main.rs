@@ -58,8 +58,9 @@ enum Command {
 #[derive(Debug, ClapArgs)]
 struct Game {
     /// Play the room through the game: create the shared-memory link of
-    /// this name, which the game's hook opens, and bridge the two.
-    #[arg(long)]
+    /// this name, which the game's hook opens, and bridge the two. Without
+    /// a name, the link the hook opens by default.
+    #[arg(long, num_args = 0..=1, default_missing_value = tpf3mp_bridge::DEFAULT_LINK)]
     game_link: Option<String>,
 
     /// What this player's game runs (build and mods). Every player in a

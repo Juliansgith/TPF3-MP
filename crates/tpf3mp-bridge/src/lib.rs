@@ -19,19 +19,25 @@
 //! [`Gate`] refuses anything that breaks this.
 //!
 //! This crate has no async runtime and no network code, because the hook
-//! links it into the game.
+//! links it into the game. [`Session`] is the hook's whole side of the
+//! link; the game-specific part of the hook only implements [`Game`].
 
 mod gate;
+mod session;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tpf3mp_proto::{Event, IntentRejection, LaneDigest, Payload, Speed, Text};
 
 pub use gate::{Gate, GateError, Gated};
+pub use session::{Begin, Game, Notice, Session, SessionError, StepGate};
 
 /// Version of these messages. Both sides send it first and refuse a peer
 /// that speaks another.
 pub const BRIDGE_VERSION: u32 = 1;
+/// The link name the agent creates and the hook opens, unless told
+/// otherwise.
+pub const DEFAULT_LINK: &str = "tpf3mp.default";
 /// Largest encoded message, within the link's default frame limit
 /// (`tpf3mp_ipc::DEFAULT_MAX_MESSAGE`). An event with the largest intent
 /// payload fits.

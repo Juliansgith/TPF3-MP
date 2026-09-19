@@ -1482,6 +1482,7 @@ dependencies = [
  "postcard",
  "serde",
  "thiserror",
+ "tpf3mp-ipc",
  "tpf3mp-proto",
 ]
 
