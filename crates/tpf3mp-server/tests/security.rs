@@ -204,7 +204,6 @@ async fn abandoned_games_do_not_lock_everyone_out_of_the_server() {
 /// good; the same happens to an honest member the room drops as a slow
 /// consumer, and to an owner (ownership then never passes on).
 #[tokio::test]
-#[ignore = "security PoC: fails until a lobby member whose link was dropped is removed"]
 async fn a_lobby_seat_is_freed_even_after_its_link_was_dropped() {
     let server = RunningServer::start(|_| {}).await;
     let mut ann = server.client("ann").await;
@@ -251,7 +250,6 @@ async fn a_lobby_seat_is_freed_even_after_its_link_was_dropped() {
 /// consumer, and in the lobby his seat then stays behind (see
 /// `a_lobby_seat_is_freed_even_after_its_link_was_dropped`).
 #[tokio::test]
-#[ignore = "security PoC: fails until lobby requests are throttled or updates coalesced"]
 async fn one_member_cannot_flood_the_others_off_the_lobby() {
     const BURST: u32 = 12_000;
     let server = RunningServer::start(|_| {}).await;
@@ -330,7 +328,6 @@ async fn one_member_cannot_flood_the_others_off_the_lobby() {
 /// invite can guess the room password online as fast as the room answers;
 /// here every 4-digit PIN over one connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "security PoC: fails until join attempts are rate-limited"]
 async fn a_room_password_cannot_be_guessed_at_line_rate() {
     let server = RunningServer::start(|_| {}).await;
     let ann = server.client("ann").await;

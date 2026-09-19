@@ -147,6 +147,8 @@ pub enum RequestError {
     TooManyRooms,
     /// The requested resume point is no longer held by the server.
     ResumeUnavailable,
+    /// The connection sent requests faster than the server allows.
+    RateLimited,
 }
 
 impl fmt::Display for RequestError {
@@ -164,6 +166,7 @@ impl fmt::Display for RequestError {
             Self::InvalidSettings => "the room settings are out of range",
             Self::TooManyRooms => "the server cannot host more rooms",
             Self::ResumeUnavailable => "the game can no longer be resumed from that point",
+            Self::RateLimited => "too many requests; try again in a moment",
         })
     }
 }
@@ -174,8 +177,9 @@ pub struct RoomSettings {
     /// Simulation steps per second at 1x speed. TPF2 runs 5; TPF3 is
     /// measured on release day.
     pub steps_per_second: u16,
-    /// How far ahead of real time the server seals steps, hiding network
-    /// latency. This is the input delay players feel.
+    /// How far ahead of the room clock the server seals steps. Clients play
+    /// behind a jitter buffer of their own, so this does not set the delay
+    /// players feel (see "Playout" in `docs/PROTOCOL.md`).
     pub input_delay_ms: u16,
     /// Members report checkpoint digests at every step divisible by this.
     pub checkpoint_interval: u32,

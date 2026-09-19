@@ -5,6 +5,7 @@ mod admin;
 mod admission;
 mod connection;
 mod directory;
+mod limit;
 mod metrics;
 mod pacing;
 mod persist;

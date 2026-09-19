@@ -29,6 +29,7 @@ use tracing::{debug, info};
 use crate::{
     Shared,
     admission::{self, Handshake, Origin},
+    limit::TokenBucket,
     metrics,
     room::{MemberLink, NewMember, Reply, RoomCommand, RoomHandle, TurnFeed},
 };
@@ -41,6 +42,17 @@ const CONTROL_QUEUE: usize = 256;
 /// Turns queued for one client before it counts as too slow: about 100 s of
 /// turns at the default tick.
 const TURN_QUEUE: usize = 1024;
+/// Requests one connection may make per second, and the burst on top. A
+/// client makes a handful per game.
+const REQUESTS_PER_SECOND: u32 = 10;
+const REQUEST_BURST: u32 = 20;
+/// Of those, attempts to join a room.
+const JOINS_PER_SECOND: u32 = 1;
+const JOIN_BURST: u32 = 5;
+/// Game messages one connection may send per second: intents, progress
+/// reports and checkpoints together. A game sends a few dozen.
+const GAME_MESSAGES_PER_SECOND: u32 = 200;
+const GAME_MESSAGE_BURST: u32 = 400;
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
@@ -236,6 +248,9 @@ struct Client {
     room: Option<RoomHandle>,
     control: Option<mpsc::Receiver<ServerMessage>>,
     turns: Option<mpsc::Receiver<TurnFeed>>,
+    requests: TokenBucket,
+    joins: TokenBucket,
+    game_messages: TokenBucket,
 }
 
 impl Client {
@@ -258,6 +273,9 @@ impl Client {
             room: None,
             control: Some(control_rx),
             turns: Some(turns_rx),
+            requests: TokenBucket::new(REQUESTS_PER_SECOND, REQUEST_BURST),
+            joins: TokenBucket::new(JOINS_PER_SECOND, JOIN_BURST),
+            game_messages: TokenBucket::new(GAME_MESSAGES_PER_SECOND, GAME_MESSAGE_BURST),
         }
     }
 
@@ -309,16 +327,29 @@ impl Client {
                 Err(error) if error.is_disconnect() => return Ok(()),
                 Err(error) => return Err(Violation::Stream(error)),
             };
+            let now = std::time::Instant::now();
             match message {
                 ClientMessage::Hello(_) => return Err(Violation::SecondHello),
                 ClientMessage::Request { id, request } => {
-                    let result = self.request(request).await;
+                    let joining = matches!(request, Request::JoinRoom(_));
+                    let result =
+                        if !self.requests.take(now, 1) || (joining && !self.joins.take(now, 1)) {
+                            Err(RequestError::RateLimited)
+                        } else {
+                            self.request(request).await
+                        };
                     let response = ServerMessage::Response { id, result };
                     if self.link.control.send(response).await.is_err() {
                         return Ok(());
                     }
                 }
-                ClientMessage::Game(message) => self.game(message)?,
+                ClientMessage::Game(message) => {
+                    if self.game_messages.take(now, 1) {
+                        self.game(message)?;
+                    } else if let GameMessage::Intent { client_seq, .. } = message {
+                        self.reject_intent(client_seq, IntentRejection::RateLimited);
+                    }
+                }
             }
         }
     }

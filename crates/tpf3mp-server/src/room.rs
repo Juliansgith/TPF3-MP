@@ -28,6 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     admission::RoomShare,
     directory::Directory,
+    limit::TokenBucket,
     metrics::{self, Metrics},
     pacing::Pacer,
     persist::{self, LogError, RoomLog, StartMember, StartRecord},
@@ -208,8 +209,14 @@ impl RoomSecrets {
     }
 
     /// Checks the invite token and password in constant time. Both are always
-    /// checked, so the failure reveals nothing about which one was wrong.
-    fn admits(&self, room: &RoomId, token: &FixedBytes<32>, password: Option<&Text<64>>) -> bool {
+    /// checked; which one failed stays inside the server, and the client
+    /// learns only `BadInvite`.
+    fn check(
+        &self,
+        room: &RoomId,
+        token: &FixedBytes<32>,
+        password: Option<&Text<64>>,
+    ) -> Admittance {
         let invite_ok = hmac::verify(
             &self.key,
             &Self::invite_input(room, token),
@@ -226,7 +233,56 @@ impl RoomSecrets {
             .is_ok(),
             (Some(_), None) => false,
         };
-        invite_ok & password_ok
+        match (invite_ok, password_ok) {
+            (true, true) => Admittance::Admitted,
+            (true, false) => Admittance::WrongPassword,
+            (false, _) => Admittance::WrongInvite,
+        }
+    }
+}
+
+enum Admittance {
+    Admitted,
+    /// A valid invite with a wrong or missing password: someone holding the
+    /// invite, possibly guessing.
+    WrongPassword,
+    WrongInvite,
+}
+
+/// Wrong passwords a room takes from newcomers per minute. Past this, it
+/// refuses every newcomer's password, right or wrong, for the rest of the
+/// minute, so a leaked invite does not let anyone guess the password at
+/// line rate. Members already seated are never held up.
+const PASSWORD_FAILURES_PER_MINUTE: u32 = 10;
+
+struct PasswordGuard {
+    window_start: Instant,
+    failures: u32,
+}
+
+impl PasswordGuard {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            failures: 0,
+        }
+    }
+
+    fn roll(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.window_start) >= Duration::from_secs(60) {
+            self.window_start = now;
+            self.failures = 0;
+        }
+    }
+
+    fn open(&mut self, now: Instant) -> bool {
+        self.roll(now);
+        self.failures < PASSWORD_FAILURES_PER_MINUTE
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.roll(now);
+        self.failures = self.failures.saturating_add(1);
     }
 }
 
@@ -327,6 +383,7 @@ pub(crate) struct Room {
     log: Option<RoomLog>,
     /// Since when no member has been connected, while the game runs.
     unattended_since: Option<Instant>,
+    password_guard: PasswordGuard,
     /// Counts this room against the address that created it until it
     /// closes. Restored rooms have none.
     _share: Option<RoomShare>,
@@ -396,6 +453,7 @@ impl Room {
             timeouts: spec.env.timeouts,
             log: None,
             unattended_since: None,
+            password_guard: PasswordGuard::new(),
             _share: Some(spec.share),
             closed: false,
         };
@@ -526,6 +584,7 @@ impl Room {
             // Nobody is connected after a restart; the abandon timeout runs
             // from here.
             unattended_since: None,
+            password_guard: PasswordGuard::new(),
             _share: None,
             closed: false,
         }))
@@ -609,8 +668,10 @@ impl Room {
                 ready,
                 reply,
             } => {
-                let result = self.in_lobby(player).map(|member| member.ready = ready);
-                self.answer_and_broadcast(reply, result);
+                let result = self
+                    .in_lobby(player)
+                    .map(|member| std::mem::replace(&mut member.ready, ready) != ready);
+                self.answer_and_broadcast_if_changed(reply, result);
             }
             RoomCommand::DeclareContent {
                 player,
@@ -619,8 +680,8 @@ impl Room {
             } => {
                 let result = self
                     .in_lobby(player)
-                    .map(|member| member.content = Some(content));
-                self.answer_and_broadcast(reply, result);
+                    .map(|member| member.content.replace(content) != Some(content));
+                self.answer_and_broadcast_if_changed(reply, result);
             }
             RoomCommand::Start { player, reply } => {
                 let result = self.start(player);
@@ -656,6 +717,20 @@ impl Room {
         }
     }
 
+    /// Answers a request that may have changed nothing. Repeating a request
+    /// must not make the room broadcast to everyone again.
+    fn answer_and_broadcast_if_changed(
+        &mut self,
+        reply: Reply,
+        result: Result<bool, RequestError>,
+    ) {
+        let changed = result == Ok(true);
+        let _ = reply.send(result.map(|_| ()));
+        if changed {
+            self.broadcast_view();
+        }
+    }
+
     fn member_mut(&mut self, player: PlayerId) -> Option<&mut Member> {
         self.members
             .iter_mut()
@@ -676,8 +751,15 @@ impl Room {
         password: Option<&Text<64>>,
         resume_after_turn: Option<u64>,
     ) -> Result<RoomView, RequestError> {
-        if !self.secrets.admits(&self.id, token, password) {
-            return Err(RequestError::BadInvite);
+        let now = Instant::now();
+        let seated = self.members.iter().any(|m| m.player == new.player);
+        match self.secrets.check(&self.id, token, password) {
+            Admittance::Admitted if seated || self.password_guard.open(now) => {}
+            Admittance::WrongPassword if !seated => {
+                self.password_guard.failed(now);
+                return Err(RequestError::BadInvite);
+            }
+            _ => return Err(RequestError::BadInvite),
         }
         if let Some(index) = self.members.iter().position(|m| m.player == new.player) {
             // The same player again, e.g. after reconnecting: the new
@@ -737,8 +819,10 @@ impl Room {
     }
 
     fn disconnected(&mut self, player: PlayerId, link: u64) {
+        // The member's link may already be gone, dropped by the room for a
+        // full or closed queue.
         let Some(index) = self.members.iter().position(|member| {
-            member.player == player && member.link.as_ref().is_some_and(|l| l.id == link)
+            member.player == player && member.link.as_ref().is_none_or(|l| l.id == link)
         }) else {
             // An older connection of a player who has reconnected since.
             return;
@@ -1118,7 +1202,24 @@ impl Room {
         self.closed = true;
     }
 
+    /// Frees lobby seats whose connection is gone. A lobby seat is not held
+    /// for anyone, and a notice of the disconnect can be lost when the
+    /// room's queue is full, so this does not wait for one.
+    fn sweep_lobby(&mut self) {
+        if !matches!(self.phase, Phase::Lobby) {
+            return;
+        }
+        while let Some(index) = self.members.iter().position(|m| m.link.is_none()) {
+            let player = self.members.remove(index).player;
+            self.after_departure(player);
+            if self.closed {
+                return;
+            }
+        }
+    }
+
     fn on_tick(&mut self, now: Instant) {
+        self.sweep_lobby();
         self.expire_if_abandoned(now);
         if self.closed {
             return;
@@ -1427,44 +1528,6 @@ impl Game {
     }
 }
 
-/// Rate limit in thousandths of a token, refilled continuously.
-struct TokenBucket {
-    per_second: u32,
-    capacity_milli: u64,
-    milli: u64,
-    last: Instant,
-}
-
-impl TokenBucket {
-    fn new(per_second: u32, burst: u32) -> Self {
-        let capacity_milli = u64::from(burst) * 1000;
-        Self {
-            per_second,
-            capacity_milli,
-            milli: capacity_milli,
-            last: Instant::now(),
-        }
-    }
-
-    /// Takes `cost` tokens if the bucket holds them.
-    fn take(&mut self, now: Instant, cost: u64) -> bool {
-        let elapsed_ms =
-            u64::try_from(now.saturating_duration_since(self.last).as_millis()).unwrap_or(u64::MAX);
-        self.last = now;
-        self.milli = self
-            .milli
-            .saturating_add(elapsed_ms.saturating_mul(u64::from(self.per_second)))
-            .min(self.capacity_milli);
-        let cost_milli = cost.saturating_mul(1000);
-        if self.milli >= cost_milli {
-            self.milli -= cost_milli;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1497,28 +1560,6 @@ mod tests {
             feed(Some(6)),
             Err(RequestError::ResumeUnavailable)
         ));
-    }
-
-    #[test]
-    fn token_bucket_allows_a_burst_then_the_rate() {
-        let start = Instant::now();
-        let mut bucket = TokenBucket::new(10, 3);
-        bucket.last = start;
-        assert!((0..3).all(|_| bucket.take(start, 1)));
-        assert!(!bucket.take(start, 1));
-        // 100 ms at 10 per second refills exactly one token.
-        assert!(bucket.take(start + Duration::from_millis(100), 1));
-        assert!(!bucket.take(start + Duration::from_millis(100), 1));
-    }
-
-    #[test]
-    fn a_bucket_of_bytes_takes_whole_payloads() {
-        let start = Instant::now();
-        let mut bucket = TokenBucket::new(1000, 5000);
-        bucket.last = start;
-        assert!(bucket.take(start, 4000));
-        assert!(!bucket.take(start, 2000), "only 1000 bytes left");
-        assert!(bucket.take(start + Duration::from_secs(1), 2000));
     }
 
     #[test]

@@ -194,8 +194,20 @@ the stream continues its log exactly (`TurnFollower::restart`).
   - a first message that is not `Hello`, or a second `Hello`;
   - progress beyond the sealed frontier;
   - a checkpoint with too many lanes.
-- **Rate limits.** Intents are limited per player: 20 per second with a
-  burst of 40, and 32 KiB of payload per second with a burst of 256 KiB.
-  Excess intents are answered with `IntentRejected(RateLimited)`.
+- **Rate limits.**
+  - Intents, per player: 20 per second with a burst of 40, and 32 KiB of
+    payload per second with a burst of 256 KiB. Excess intents are answered
+    with `IntentRejected(RateLimited)`.
+  - Requests, per connection: 10 per second with a burst of 20, of which
+    joins 1 per second with a burst of 5. Excess requests are answered with
+    `RateLimited`.
+  - Game messages, per connection: 200 per second with a burst of 400.
+    Excess progress reports and checkpoints are dropped.
+  - Requests that change nothing, such as setting ready twice, do not send
+    everyone the room again.
+- **Password guessing.** A room takes 10 wrong passwords per minute from
+  players not already seated. Past that, it refuses every newcomer's
+  password, right or wrong, for the rest of the minute. Seated members
+  rejoining are never held up.
 - **Rejected requests** are answered with a typed error and leave the
   connection open.
