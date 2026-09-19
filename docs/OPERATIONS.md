@@ -284,6 +284,12 @@ That is about a three-hundredth of a core per busy room, growing linearly,
 with logging costing little. Rooms default to 5 steps per second, far
 fewer turns than this.
 
+Memory follows the rooms: 20 rooms of 4 players took a server at 13 MB at
+rest to 33 MB after 5 minutes of play, as each room's resume window fills
+(it holds up to an hour of turns). Once the games closed, it settled at
+19 MB and stayed there; 15 minutes of play in one process showed no
+divergence and steady latency.
+
 Repeat against the real host after deploying. Every bot connects from the
 machine running the load test, so first raise that address's limits on the
 server, for example with `--max-sessions-per-address 1000

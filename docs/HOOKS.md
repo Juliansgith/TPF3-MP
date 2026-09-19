@@ -356,7 +356,12 @@ by hand (see the README). On release day, what remains for TPF3 is:
   command it carries, the lanes are digests of the game state, and saving
   and loading use the game's own save format;
 - checking that a save is complete and loads on every platform
-  (DAY_ONE.md).
+  (DAY_ONE.md);
+- checking a received save's script data before the game loads it
+  (`tpf3mp_agent::save_check`, DAY_ONE.md section 7);
+- on the server, a `Ruleset` that validates TPF3's command format and
+  applies the canonical economy, with `save` and `restore` so its rooms'
+  logs compact (`crates/tpf3mp-server/src/ruleset.rs`).
 
 ## Release-day procedure: adding a target for a new build
 
