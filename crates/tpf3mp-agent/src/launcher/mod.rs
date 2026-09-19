@@ -12,10 +12,14 @@ mod api;
 mod http;
 
 use std::{
+    fs,
     net::SocketAddr,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
+
+use serde::{Deserialize, Serialize};
 
 use tokio::{
     net::TcpListener,
@@ -49,6 +53,9 @@ pub struct LauncherConfig {
     pub listen: SocketAddr,
     /// Which tunnel connections take when UDP does not get through.
     pub tunnel: TunnelChoice,
+    /// Where the server and name of each connection are remembered for the
+    /// next run (see [`Remembered`]).
+    pub remember: Option<PathBuf>,
     /// The server the page offers first, as `host:port`.
     pub server: Option<String>,
     /// How to trust servers.
@@ -446,12 +453,48 @@ async fn connect_to(
     view.name = options.name.as_str().to_owned();
     view.server_version = Some(client.welcome().server_version.as_str().to_owned());
     drop(view);
+    if let Some(file) = &config.remember {
+        let remembered = Remembered {
+            server: Some(server.to_owned()),
+            name: Some(options.name.as_str().to_owned()),
+        };
+        if let Err(error) = remembered.save(file) {
+            warn!(%error, "cannot remember the server and name for next time");
+        }
+    }
     *connected = Some(Connected {
         options: options.again_after(&client),
         client,
         events,
     });
     Ok(())
+}
+
+/// What the launcher remembers between runs: the server and the name the
+/// player last connected with, which the page then offers first.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remembered {
+    pub server: Option<String>,
+    pub name: Option<String>,
+}
+
+impl Remembered {
+    /// What `file` holds, or nothing if it is missing or not ours.
+    pub fn load(file: &Path) -> Self {
+        let small = fs::metadata(file).is_ok_and(|metadata| metadata.len() <= 4096);
+        small
+            .then(|| fs::read(file).ok())
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, file: &Path) -> std::io::Result<()> {
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(file, serde_json::to_vec_pretty(self)?)
+    }
 }
 
 /// Joins the room of `invite` on the current connection.
@@ -608,6 +651,23 @@ mod tests {
             room: RoomId(FixedBytes([5; 16])),
             token: FixedBytes([6; 32]),
         }
+    }
+
+    #[test]
+    fn the_server_and_name_are_remembered_for_next_time() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-remember-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let file = dir.join("launcher.json");
+        assert_eq!(Remembered::load(&file), Remembered::default());
+        let remembered = Remembered {
+            server: Some("tpf3mp.example.org:29470".into()),
+            name: Some("Ann".into()),
+        };
+        remembered.save(&file).unwrap();
+        assert_eq!(Remembered::load(&file), remembered);
+        fs::write(&file, b"not json").unwrap();
+        assert_eq!(Remembered::load(&file), Remembered::default());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

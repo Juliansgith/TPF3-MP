@@ -54,7 +54,7 @@ jobs:
               echo "::error::TPF3MP_DEFAULT_SERVER must be host:port, nothing else"
               exit 1
             fi
-            server="--server $DEFAULT_SERVER "
+            server="--default-server $DEFAULT_SERVER "
           fi
           case "${{ matrix.name }}" in
             windows-*)

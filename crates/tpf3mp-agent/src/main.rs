@@ -6,7 +6,7 @@ use tpf3mp_agent::{
     Client, ClientEvent, ConnectOptions, Events, TunnelChoice, Worlds,
     bridge::{self, Bridge, BridgeOptions, Rejoin},
     connect,
-    launcher::{Launcher, LauncherConfig},
+    launcher::{Launcher, LauncherConfig, Remembered},
 };
 use tpf3mp_net::{CertificateDer, Identity, ServerTrust, tunnel::TunnelUrl};
 use tpf3mp_proto::{
@@ -47,8 +47,8 @@ enum Command {
     },
     /// Open the launcher: a page in your browser from which you connect,
     /// create or join rooms, get ready, chat and play.
-    // A package's script may name a server; the player's own flags, which
-    // come after, win.
+    // A flag given twice counts once, the later winning, so a player may
+    // add flags to a package's script.
     #[command(args_override_self = true)]
     Launcher(LauncherArgs),
     /// Join a room with an invite and follow it until Ctrl-C.
@@ -118,18 +118,24 @@ struct LauncherArgs {
     #[arg(long, default_value = "127.0.0.1:47470")]
     listen: SocketAddr,
 
-    /// The server the page offers first, as host:port.
+    /// The server the page offers first, as host:port. Without it, the
+    /// server last connected to, then --default-server.
     #[arg(long)]
     server: Option<String>,
+
+    /// The server offered when there is neither --server nor one from last
+    /// time, as a package sets it.
+    #[arg(long)]
+    default_server: Option<String>,
 
     /// Trust exactly this DER certificate instead of public certificate
     /// authorities (for development servers).
     #[arg(long)]
     pin_cert: Option<PathBuf>,
 
-    /// The name the page offers first.
-    #[arg(long, default_value = "player")]
-    name: String,
+    /// The name the page offers first. Without it, the name last used.
+    #[arg(long)]
+    name: Option<String>,
 
     /// Identity key file. Created on first use.
     #[arg(long)]
@@ -324,9 +330,11 @@ async fn launch(args: LauncherArgs) -> Result<()> {
         )),
         None => ServerTrust::WebPki,
     };
-    let identity = Arc::new(Identity::load_or_create(&identity_path(
-        args.identity.as_ref(),
-    )?)?);
+    let identity_file = identity_path(args.identity.as_ref())?;
+    let identity = Arc::new(Identity::load_or_create(&identity_file)?);
+    // Next to the identity: the same player's last server and name.
+    let remember = identity_file.with_file_name("launcher.json");
+    let remembered = Remembered::load(&remember);
     let game = Game {
         game_link: Some(args.game_link.clone()),
         content: args.content.clone(),
@@ -335,11 +343,15 @@ async fn launch(args: LauncherArgs) -> Result<()> {
     };
     let launcher = Launcher::start(LauncherConfig {
         listen: args.listen,
-        server: args.server,
+        server: args.server.or(remembered.server).or(args.default_server),
         tunnel: args.tunnel.choice()?,
+        remember: Some(remember),
         trust,
         identity,
-        name: args.name,
+        name: args
+            .name
+            .or(remembered.name)
+            .unwrap_or_else(|| "player".to_owned()),
         content: game.fingerprint()?,
         link: args.game_link.clone(),
         worlds: game.open_worlds(&args.game_link)?,

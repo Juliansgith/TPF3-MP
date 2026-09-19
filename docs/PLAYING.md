@@ -31,8 +31,9 @@ The page works only on your own machine, and only in the tab the launcher
 opened: other pages and other programs cannot use it.
 
 1. **Server.** Enter the server's address and the name others will see,
-   then **Connect**. Got an invite? Paste the whole of it here instead,
-   with your name: you are connected and in the room in one step.
+   then **Connect**; the launcher remembers both for next time. Got an
+   invite? Paste the whole of it here instead, with your name: you are
+   connected and in the room in one step.
 2. **Rooms.** Either create a room, with an optional password, or paste an
    invite someone sent you and **Join room**.
 3. **Invite.** In your room, **Copy invite** and send it to your friends,

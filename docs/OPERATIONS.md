@@ -249,8 +249,9 @@ library and the server, plus a script that opens the launcher.
 - **The server players see first.** Set the repository variable
   `TPF3MP_DEFAULT_SERVER` (Settings, Secrets and variables, Actions,
   Variables) to the public server's `host:port`, and the packages' launcher
-  fills it in; players can still type another. The packages also carry
-  `PLAYING.md`.
+  offers it (`--default-server`) until a player has connected elsewhere;
+  the launcher remembers each player's last server and name. The packages
+  also carry `PLAYING.md`.
 - **Building without releasing.** Run the workflow by hand. The packages
   stay workflow artifacts, but the repository is public, so anyone can
   download them.
