@@ -461,9 +461,57 @@ async fn a_player_joins_a_running_game_from_the_rooms_world() {
         reports[2].received, 1,
         "the newcomer loaded the room's world"
     );
-    assert!(
-        reports[..2].iter().all(|report| report.saves >= 1),
-        "the room saved for the newcomer"
+    // The owner's world, saved at the start, serves the newcomer too: it
+    // loads that save and plays the turns since.
+    assert!(reports[0].saves >= 1, "the owner saved its world");
+    assert_eq!(reports[1].received, 1, "the other starter loaded it too");
+    for report in &reports {
+        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
+    }
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_player_starts_from_the_owners_world() {
+    let root = temp_dir("owners-world");
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let server = TestServer::start_saving(
+        "127.0.0.1:0".parse().unwrap(),
+        identity,
+        None,
+        root.join("server"),
+    )
+    .await;
+    let settings = RoomSettings {
+        steps_per_second: 100,
+        input_delay_ms: 60,
+        checkpoint_interval: 20,
+    };
+    // Each player's own starting world differs, as maps generated on
+    // different machines might.
+    let mut players = saving_players(3, 400);
+    for (index, player) in players.iter_mut().enumerate() {
+        player.world_seed = 40 + index as u64;
+    }
+    let reports = play_bridged_room(BridgedPlan {
+        server: server.address,
+        server_name: "localhost".into(),
+        trust: server.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(60),
+        worlds: Some(root.join("players")),
+    })
+    .await
+    .unwrap();
+
+    assert_worlds_agree(&reports);
+    let received: Vec<usize> = reports.iter().map(|report| report.received).collect();
+    assert_eq!(
+        received,
+        [0, 1, 1],
+        "everyone but the owner loaded its world"
     );
     for report in &reports {
         assert!(report.diverged.is_empty(), "{:?}", report.diverged);
@@ -503,13 +551,14 @@ async fn a_diverged_replica_is_rebased_onto_the_agreed_world() {
     .unwrap();
 
     // The drifting replica was told, given the agreed world, and ended in
-    // the same world as everyone else.
+    // the same world as everyone else. Every player but the owner also
+    // loaded the owner's world at the start.
     assert!(!reports[2].diverged.is_empty(), "the drift was noticed");
-    assert_eq!(reports[2].received, 1, "the replica was rebased once");
+    assert_eq!(reports[2].received, 2, "the start, then one rebase");
     assert_worlds_agree(&reports);
-    for report in &reports[..2] {
+    for (report, received) in reports[..2].iter().zip([0, 1]) {
         assert!(report.diverged.is_empty(), "{:?}", report.diverged);
-        assert_eq!(report.received, 0);
+        assert_eq!(report.received, received);
     }
     server.stop().await;
     let _ = std::fs::remove_dir_all(&root);

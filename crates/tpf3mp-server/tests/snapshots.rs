@@ -93,15 +93,15 @@ async fn a_kicked_player_stays_out_even_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let secret = [3; 32];
     let server = RunningServer::start(saving_and_logging(dir.path(), secret)).await;
-    let clients = vec![server.client("ann").await, server.client("bob").await];
-    let (mut players, invite) = running(clients).await;
-    let bob = players.pop().unwrap();
-    let bob_identity = std::sync::Arc::clone(&bob.test.identity);
-    players[0]
-        .client()
-        .kick(bob.test.client.player())
+    let (mut players, invite) = running(vec![server.client("ann").await]).await;
+    // Bob joins the running game, then Ann removes him.
+    let bob = server.client("bob").await;
+    let bob_identity = std::sync::Arc::clone(&bob.identity);
+    bob.client
+        .join_room(newcomer(&invite, Some(1)))
         .await
         .unwrap();
+    players[0].client().kick(bob.client.player()).await.unwrap();
     drop(bob);
     let refused = ClientError::Refused(RequestError::BadInvite);
     let bob = server

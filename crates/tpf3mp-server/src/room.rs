@@ -1208,10 +1208,22 @@ impl Room {
         };
         let open = game.turn_start(self.id, self.settings, &first, None);
         self.content = first_content;
+        // With snapshots, the owner's world is everyone's: the owner loads
+        // it, the room saves it before the first step, and every other
+        // player loads that save. Worlds generated on each machine could
+        // differ between platforms. Everyone still holds the clock until
+        // loaded.
+        let shared_world = self.snapshots.is_some();
+        let owner = self.owner;
         for member in &mut self.members {
             member.pace = Pace::Loading;
-            member.needs = Needs::Nothing;
             member.stream_from = 1;
+            member.streaming = false;
+            if shared_world && member.player != owner {
+                member.needs = Needs::World;
+                continue;
+            }
+            member.needs = Needs::Nothing;
             if let Some(link) = &member.link {
                 member.streaming = link
                     .turns
@@ -1224,8 +1236,12 @@ impl Room {
         }
         let history = game.history();
         self.phase = Phase::Running(Box::new(game));
+        if shared_world && self.members.len() > 1 {
+            // Save as soon as the owner has loaded.
+            self.offer_worlds(Instant::now());
+        }
         self.open_log(history);
-        info!(room = %self.id, players = self.members.len(), "game started");
+        info!(room = %self.id, players = self.members.len(), shared_world, "game started");
         metrics::increment(&self.metrics.games_started);
         Ok(())
     }
@@ -1363,7 +1379,7 @@ impl Room {
             return;
         };
         let (sealed, paused, started) = (game.sealed_through, game.speed.is_paused(), game.started);
-        for member in self.members.iter_mut().filter(|m| m.streaming) {
+        for member in self.members.iter_mut().filter(|m| holds_clock(m)) {
             if paused {
                 member.advanced = now;
                 continue;
@@ -1798,7 +1814,11 @@ impl Room {
             }
             member.needs = Needs::Nothing;
             member.offered = offered;
-            member.pace = Pace::CatchingUp(None);
+            // A player still loading the first world keeps holding the
+            // clock; anyone else catches up.
+            if member.pace != Pace::Loading {
+                member.pace = Pace::CatchingUp(None);
+            }
             member.stream_from = stream_from;
         }
     }
@@ -2101,6 +2121,12 @@ impl Member {
     }
 }
 
+/// Whether a member can hold the room's clock: one with a turn stream, or
+/// one still waiting for the world the game starts from.
+fn holds_clock(member: &Member) -> bool {
+    member.streaming || (member.pace == Pace::Loading && member.link.is_some())
+}
+
 /// Whether every member pacing the room has reported this round. Members
 /// catching up report later and are judged against the verdict then.
 fn round_complete(members: &[Member], round: &Round) -> bool {
@@ -2182,10 +2208,10 @@ fn decide_round(round: &mut Round) -> Vec<(PlayerId, Vec<u16>)> {
 
 /// The lowest progress among members who pace the room, or `None` to hold
 /// the clock: while anyone is still loading, or when nobody is following.
-/// Only members with an open turn stream count; `streaming` implies a link.
+/// Only members that can hold the clock count (see [`holds_clock`]).
 fn slowest_pacer(members: &[Member]) -> Option<u64> {
     let mut slowest: Option<u64> = None;
-    for member in members.iter().filter(|m| m.streaming) {
+    for member in members.iter().filter(|m| holds_clock(m)) {
         match member.pace {
             Pace::Loading => return None,
             Pace::Following(step) => {

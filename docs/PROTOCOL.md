@@ -65,6 +65,12 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
 - **Starting.** In the lobby, members declare their **content fingerprint**
   (game build plus mod set digest) and toggle **ready**. The owner can start
   the game only when every member is ready and all fingerprints are equal.
+- **The first world.** On a server that keeps snapshots, the owner's world
+  is everyone's: the owner's game loads it, the room saves it before the
+  first step, and every other player loads that save (see "Snapshots").
+  Worlds generated separately on each machine could differ between
+  platforms. Everyone still holds the clock until loaded. Without
+  snapshots, every player loads the same world locally.
 - **Joining a running game.** A newcomer names its content fingerprint in
   `JoinRoom`, and it must equal the game's. Every replica sees
   `PlayerJoined` at one step, and the newcomer receives the room's world to

@@ -258,11 +258,13 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
 - **From the agent (`ToHook`):**
   - `Hello`: always first.
   - `Begin`: a game starts, and saves go in this directory.
-  - `Load { file, next_step }`: load a world, then run `next_step`. The
-    first load of a game names no file (the world every player starts
-    from). Later loads name a save the room agreed on: for a player who
-    joins a running game, one who could no longer resume, one rebased after
-    diverging. Everything sent before a load is void.
+  - `Load { file, next_step }`: load a world, then run `next_step`.
+    Without a file, the game loads the world the player chose to start
+    from: the owner's, or everyone's on a server that keeps no snapshots.
+    With one, a save the room agreed on: the owner's world at the start,
+    or the room's latest for a player who joins a running game, could no
+    longer resume, or is rebased after diverging. Everything sent before
+    a load is void.
   - `Apply(event)`: apply this event before its step. A `Save` event is not
     applied: the session saves the world there (see below).
   - `Release { through }`: steps up to and including this one may run.
