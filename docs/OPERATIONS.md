@@ -260,7 +260,10 @@ Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and
 - with every bot in a TLS tunnel instead (`--tunneled`): p99 116 ms and
   the same run time. On loopback nothing is lost, so this measures the
   tunnel's own cost; on a lossy link, TCP holds datagrams back behind each
-  lost segment.
+  lost segment;
+- with every room logged and compacted past 8 KiB (`--data-dir`,
+  `--compact-log-kib 8`), 3,000 steps: 121 compactions during the run,
+  p99 114 ms, and memory level at about 150 MB.
 
 Repeat against the real host after deploying. Every bot connects from the
 machine running the load test, so first raise that address's limits on the

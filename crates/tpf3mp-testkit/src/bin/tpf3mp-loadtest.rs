@@ -8,7 +8,7 @@ use clap::Parser;
 use tokio::time::Instant;
 use tpf3mp_net::{CertificateDer, ServerIdentity, ServerTrust, tunnel::TunnelUrl};
 use tpf3mp_proto::{RoomSettings, Speed};
-use tpf3mp_server::{Server, ServerConfig, TunnelConfig};
+use tpf3mp_server::{Server, ServerConfig, ServerStats, TunnelConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -67,6 +67,13 @@ struct Args {
     /// over UDP.
     #[arg(long, conflicts_with = "server")]
     tunneled: bool,
+    /// Log the in-process server's rooms here, as a server with
+    /// --data-dir does, so games are persisted and compacted under load.
+    #[arg(long, conflicts_with = "server")]
+    data_dir: Option<PathBuf>,
+    /// Compact a room's log past this many KiB (with --data-dir).
+    #[arg(long, default_value_t = 64 * 1024, requires = "data_dir")]
+    compact_log_kib: u64,
 }
 
 #[tokio::main]
@@ -76,7 +83,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let (address, server_name, trust, tunnel, _local) = match &args.server {
+    let (address, server_name, trust, tunnel, local) = match &args.server {
         Some(server) => {
             let (host, _) = server
                 .rsplit_once(':')
@@ -170,6 +177,21 @@ async fn main() -> Result<()> {
     if let Some([p50, p95, p99, max]) = latency_summary(&reports) {
         println!("intent-to-apply latency: p50 {p50} ms, p95 {p95} ms, p99 {p99} ms, max {max} ms");
     }
+    if let Some(local) = &local {
+        let metrics = local.stats.render_metrics();
+        let counter = |name: &str| {
+            metrics
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("tpf3mp_{name} ")))
+                .unwrap_or("0")
+                .to_owned()
+        };
+        println!(
+            "server: {} logs compacted, {} tunnels opened",
+            counter("logs_compacted_total"),
+            counter("tunnels_opened_total")
+        );
+    }
     anyhow::ensure!(failed == 0 && diverged == 0, "load test failed");
     Ok(())
 }
@@ -189,7 +211,10 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, TunnelUrl,
     config.max_handshakes_per_address = 100_000;
     config.max_rooms_per_address = 100_000;
     config.tunnel = Some(TunnelConfig::new("127.0.0.1:0".parse()?));
+    config.data_dir = args.data_dir.clone();
+    config.compact_log_at = args.compact_log_kib.max(1).saturating_mul(1024);
     let server = Server::bind(config)?;
+    let stats = server.stats();
     let mut address = server.local_addr()?;
     let tunnel = format!(
         "wss://localhost:{}/tpf3mp",
@@ -219,6 +244,7 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, TunnelUrl,
         tunnel,
         LocalServer {
             task,
+            stats,
             _netem: netem,
         },
     ))
@@ -226,6 +252,7 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, TunnelUrl,
 
 struct LocalServer {
     task: tokio::task::JoinHandle<()>,
+    stats: ServerStats,
     _netem: Option<Netem>,
 }
 
