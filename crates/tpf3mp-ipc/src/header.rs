@@ -80,11 +80,19 @@ impl Layout {
         unsafe { AtomicU64::from_ptr(self.base.add(offset).cast::<u64>()) }
     }
 
-    /// Zeroes the header (resetting the rings and counters) before a fresh init.
+    /// Zeroes the header (resetting the rings and counters) before a fresh
+    /// init. A peer of an earlier session may still be reading the header,
+    /// always atomically, so it is cleared with atomic stores too: the magic
+    /// first, telling that peer the link is being reset.
     pub fn zero_header(&self) {
-        // SAFETY: the first HEADER_SIZE bytes are within the mapping.
-        unsafe {
-            core::ptr::write_bytes(self.base, 0, HEADER_SIZE);
+        self.u32_at(OFF_MAGIC).store(0, Ordering::Release);
+        for offset in (OFF_ABI..OFF_HOOK_HEARTBEAT).step_by(4) {
+            self.u32_at(offset).store(0, Ordering::Relaxed);
+        }
+        self.u64_at(OFF_HOOK_HEARTBEAT).store(0, Ordering::Relaxed);
+        self.u64_at(OFF_AGENT_HEARTBEAT).store(0, Ordering::Relaxed);
+        for offset in (OFF_H2A_HEAD..HEADER_SIZE).step_by(4) {
+            self.u32_at(offset).store(0, Ordering::Relaxed);
         }
     }
 

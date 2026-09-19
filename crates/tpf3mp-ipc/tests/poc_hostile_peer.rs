@@ -1,6 +1,6 @@
-//! Adversarial-review proof-of-concept: a hostile peer that creates the shared
-//! mapping itself and writes an arbitrary 64-byte header and ring bytes, then a
-//! normal `Link::open` on this side consumes them.
+//! From the adversarial review of the unsafe code: a hostile peer that
+//! creates the shared mapping itself and writes an arbitrary 64-byte header
+//! and ring bytes, which a normal `Link::open` on this side then consumes.
 //!
 //! The threat model (see the review brief and `docs/HOOKS.md`) treats the peer
 //! as untrusted: it may write any header field and any ring index. In TPF3-MP
@@ -11,9 +11,8 @@
 //!
 //! These tests do not create the mapping through `Link::create` (which validates
 //! its inputs); they lay out the raw shared object by hand, the way a foreign
-//! agent would. The Win32 calls are declared here directly so the PoC adds no
-//! dependency to the crate under review. All tests are `#[ignore]`d so the
-//! normal suite stays green; each doc comment says whether it is safe to run.
+//! agent would. The Win32 calls are declared here directly so the tests add no
+//! dependency to the crate. Each test failed before its fix and now guards it.
 #![cfg(windows)]
 #![allow(unsafe_code, clippy::unwrap_used)]
 
@@ -152,125 +151,91 @@ impl HostileMapping {
     }
 }
 
-/// FINDING 1 (High). `Link::open` never checks `max_message` against
-/// `ring_capacity`, unlike `Link::create`. A hostile owner can therefore make
-/// `max_message` larger than the ring, breaking the invariant that both
-/// `read_wrapping`/`write_wrapping` and the `pop_into` corruption check rely on.
-///
-/// Safe to run: this only asserts that `open` accepts the out-of-range value.
+/// Review finding 1 (High). `Link::open` did not check `max_message` against
+/// `ring_capacity`, unlike `Link::create`. A hostile owner could make
+/// `max_message` larger than the ring, and a frame of up to that length then
+/// passed every check in `pop_into`: its copy read past the ring, off the
+/// end of the mapping, inside the game. `open` now refuses such a header.
 #[test]
-#[ignore = "review PoC (High): Link::open accepts max_message > ring_capacity; safe to run"]
-fn open_accepts_max_message_larger_than_ring() {
+fn open_refuses_max_message_larger_than_ring() {
     let logical = unique_logical("badmax");
     let _map = HostileMapping::create(&logical, 4096, 5 * 4096);
-    let link = Link::open(&logical, Role::Hook).expect("open should accept the hostile header");
-    assert_eq!(link.ring_capacity(), 4096);
-    assert_eq!(link.max_message(), 5 * 4096);
-    assert!(
-        link.max_message() > link.ring_capacity(),
-        "the ring's core invariant (max_message <= ring_capacity) is violated, \
-         yet open succeeded; this is what enables the pop_into over-read"
-    );
+    assert!(matches!(
+        Link::open(&logical, Role::Hook),
+        Err(tpf3mp_ipc::IpcError::InvalidConfig(_))
+    ));
 }
 
-/// FINDING 1 (High), the actual memory-safety consequence. With `max_message`
-/// unbounded, a hostile producer sets `tail` and a length prefix so a message of
-/// `len > 2 * ring_capacity` passes every check in `pop_into`, and
-/// `read_wrapping`'s single-wrap copy then reads `len - (capacity - start)`
-/// bytes starting at the ring base - well past the `ring_capacity`-byte data
-/// area, into the rest of the mapping and beyond its end.
-///
-/// DO NOT RUN: this performs an out-of-bounds read (undefined behaviour) and,
-/// because the a2h ring is the last region in the mapping, will typically fault
-/// and take the process down. It exists to document the exploit precisely.
+/// Review finding 1, the exploit itself: a frame of three rings' length,
+/// sized to pass a hostile `max_message`. It can no longer be reached,
+/// because the link never opens.
 #[test]
-#[ignore = "review PoC (High): triggers the out-of-bounds read (UB / likely crash); do not run"]
-fn pop_into_reads_out_of_bounds_when_max_message_unbounded() {
+fn a_frame_longer_than_the_ring_is_never_read() {
     const CAP: u32 = 4096;
     let logical = unique_logical("oob");
     let map = HostileMapping::create(&logical, CAP, 8 * CAP);
-    let link = Link::open(&logical, Role::Hook).unwrap();
-
-    // A frame claiming 3*CAP payload bytes: > max_message? no (max is 8*CAP);
-    // available (3*CAP+4) >= 4 + 3*CAP? yes. So pop_into accepts it.
     let len = 3 * CAP;
     map.put_a2h_bytes(CAP, 0, &len.to_le_bytes());
     map.put_u32(OFF_A2H_HEAD, 0);
     map.put_u32(OFF_A2H_TAIL, len + 4);
-
-    // A buffer sized from the (hostile) max_message, the pattern the shipped
-    // `ipc-echo` helper and the integration tests use: vec![0; max_message].
-    let mut out = vec![0u8; link.max_message() as usize];
-    // Over-reads ~CAP bytes past the end of the mapping.
-    let _ = link.recv_into(&mut out);
+    assert!(Link::open(&logical, Role::Hook).is_err());
 }
 
-/// FINDING 2 (Medium). `peek_len`/`Link::next_len` return the raw u32 length
-/// prefix with no `max_message` bound. A caller that sizes a receive buffer from
-/// `next_len` (a natural reading of the API - "the length of the next waiting
-/// message, for sizing a receive buffer") can be driven to allocate up to 4 GiB
-/// by a hostile peer, even when `max_message` is honest.
-///
-/// Safe to run: only inspects the returned length.
+/// Review finding 2 (Medium). `next_len` returned the raw length prefix, so a
+/// caller sizing a buffer from it could be made to allocate 4 GiB. It now
+/// never exceeds `max_message`: a corrupt frame reads as nothing waiting,
+/// and `recv_into` reports the corruption.
 #[test]
-#[ignore = "review PoC (Medium): next_len returns an unbounded peer-controlled length; safe to run"]
-fn next_len_is_unbounded_by_max_message() {
+fn next_len_never_exceeds_max_message() {
     const CAP: u32 = 4096;
     let logical = unique_logical("nextlen");
-    // Honest max_message this time - the finding does not need finding 1.
     let map = HostileMapping::create(&logical, CAP, 1024);
     let link = Link::open(&logical, Role::Hook).unwrap();
 
-    // Make >= 4 bytes "available" and write a length prefix of 0xFFFF_FFFF.
     map.put_u32(OFF_A2H_HEAD, 0);
     map.put_u32(OFF_A2H_TAIL, 16);
     map.put_a2h_bytes(CAP, 0, &0xFFFF_FFFFu32.to_le_bytes());
 
+    assert_eq!(link.next_len(), None);
+    let mut out = vec![0u8; 1024];
     assert_eq!(
-        link.next_len(),
-        Some(0xFFFF_FFFF),
-        "next_len surfaces a 4 GiB length a hostile peer wrote, far above max_message ({}); \
-         a caller sizing an allocation from this would allocate 4 GiB",
-        link.max_message()
+        link.recv_into(&mut out),
+        Err(tpf3mp_ipc::RecvError::Corrupt)
     );
 }
 
-/// FINDING 3 (Medium/Low). The producer's free-space computation
-/// `free = self.capacity - used` (ring.rs) is an unchecked subtraction. A
-/// hostile consumer can set `head` so that `used = tail - head` (wrapping)
-/// exceeds `capacity`; the subtraction then underflows. In a debug build this
-/// panics (a hostile peer can crash the producer); in a release build - what the
-/// game ships - it wraps to a huge `free`, the `need > free` guard passes, and
-/// the producer overwrites the ring. The writes stay in bounds (masked), so this
-/// is ring corruption / a panic-DoS, not an out-of-bounds write.
-///
-/// Runnable, but in a debug build it deliberately provokes (and catches) a
-/// subtract-with-overflow panic, which prints a panic message to stderr.
+/// Review finding 2's counterpart on the read side: a producer claiming more
+/// bytes than the ring holds is corrupt, however the lengths look.
 #[test]
-#[ignore = "review PoC (Medium): hostile head underflows the producer's free-space math; runnable"]
-fn producer_free_space_underflows_with_hostile_head() {
+fn a_tail_beyond_the_ring_is_corrupt() {
     const CAP: u32 = 4096;
-    let logical = unique_logical("underflow");
-    // We open as the Hook, i.e. the producer of the hook->agent ring; the peer
-    // (agent) owns h2a_head. A valid max_message isolates this from finding 1.
+    let logical = unique_logical("bigtail");
     let map = HostileMapping::create(&logical, CAP, 1024);
     let link = Link::open(&logical, Role::Hook).unwrap();
+    map.put_a2h_bytes(CAP, 0, &8u32.to_le_bytes());
+    map.put_u32(OFF_A2H_HEAD, 0);
+    map.put_u32(OFF_A2H_TAIL, CAP + 12);
+    let mut out = vec![0u8; 1024];
+    assert_eq!(
+        link.recv_into(&mut out),
+        Err(tpf3mp_ipc::RecvError::Corrupt)
+    );
+}
 
-    // h2a_tail is 0 (fresh); set h2a_head so tail - head wraps to > capacity.
+/// Review finding 3 (Medium). The producer computed its free space as
+/// `capacity - used` with `used` from the peer's `head`: a hostile head
+/// underflowed it, which panicked in debug builds and in release builds
+/// let the producer overwrite unread bytes. It is now refused as corruption.
+#[test]
+fn a_hostile_head_is_refused_not_underflowed() {
+    const CAP: u32 = 4096;
+    let logical = unique_logical("underflow");
+    let map = HostileMapping::create(&logical, CAP, 1024);
+    let link = Link::open(&logical, Role::Hook).unwrap();
     map.put_u32(OFF_H2A_HEAD, CAP + 4);
-
     let result = catch_unwind(AssertUnwindSafe(|| link.send(b"x")));
-    match result {
-        Err(_) => {
-            // Debug build: unchecked `capacity - used` underflowed and panicked.
-        }
-        Ok(send_result) => {
-            // Release build: no panic; the guard was bypassed by the wrapped
-            // free value, so the (in-bounds, masked) write was allowed.
-            assert!(
-                send_result.is_ok(),
-                "release build accepted the send despite used > capacity"
-            );
-        }
-    }
+    assert_eq!(
+        result.expect("no panic"),
+        Err(tpf3mp_ipc::SendError::Corrupt)
+    );
 }

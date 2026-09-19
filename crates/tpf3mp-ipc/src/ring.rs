@@ -38,6 +38,8 @@ pub enum PushError {
     Full,
     #[error("message of {len} bytes exceeds the {max}-byte ring limit")]
     TooLarge { len: usize, max: usize },
+    #[error("the ring is corrupt: the consumer's index is inconsistent with the ring state")]
+    Corrupt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -105,7 +107,11 @@ impl Ring {
         let tail = self.tail().load(Ordering::Relaxed);
         let head = self.head().load(Ordering::Acquire);
         let used = tail.wrapping_sub(head);
-        let free = self.capacity - used;
+        // The consumer owns `head`; one that claims more bytes in use than
+        // the ring holds is broken or hostile, and nothing is written.
+        let Some(free) = self.capacity.checked_sub(used) else {
+            return Err(PushError::Corrupt);
+        };
         if need > free {
             return Err(PushError::Full);
         }
@@ -121,11 +127,14 @@ impl Ring {
         Ok(())
     }
 
-    /// The length of the next message without consuming it, or `None` if empty.
+    /// The length of the next message without consuming it: never more than
+    /// `max_message`. `None` if the ring is empty, or if the next frame is
+    /// corrupt, which [`Ring::pop_into`] then reports.
     pub fn peek_len(&self) -> Option<u32> {
         let tail = self.tail().load(Ordering::Acquire);
         let head = self.head().load(Ordering::Relaxed);
-        if tail.wrapping_sub(head) < LENGTH_PREFIX as u32 {
+        let available = tail.wrapping_sub(head);
+        if available < LENGTH_PREFIX as u32 || available > self.capacity {
             return None;
         }
         let mut length = [0u8; LENGTH_PREFIX];
@@ -133,7 +142,8 @@ impl Ring {
         unsafe {
             self.read_wrapping(head, &mut length);
         }
-        Some(u32::from_le_bytes(length))
+        let len = u32::from_le_bytes(length);
+        (len <= self.max_message).then_some(len)
     }
 
     /// Reads the next message into `out`. Called only by the consumer. Returns
@@ -146,7 +156,9 @@ impl Ring {
         if available == 0 {
             return Ok(None);
         }
-        if available < LENGTH_PREFIX as u32 {
+        // The producer owns `tail`: it cannot have published more than the
+        // ring holds, nor less than a whole length prefix.
+        if available < LENGTH_PREFIX as u32 || available > self.capacity {
             return Err(PopError::Corrupt);
         }
         let mut length = [0u8; LENGTH_PREFIX];
@@ -182,6 +194,10 @@ impl Ring {
     ///
     /// The caller must have reserved `src.len()` free bytes at `at`.
     unsafe fn write_wrapping(&self, at: u32, src: &[u8]) {
+        debug_assert!(
+            src.len() <= self.capacity as usize,
+            "a copy wraps once at most"
+        );
         let mask = self.capacity - 1;
         let start = (at & mask) as usize;
         let first = core::cmp::min(src.len(), self.capacity as usize - start);
@@ -204,6 +220,10 @@ impl Ring {
     ///
     /// The caller must know `dst.len()` bytes are present at `at`.
     unsafe fn read_wrapping(&self, at: u32, dst: &mut [u8]) {
+        debug_assert!(
+            dst.len() <= self.capacity as usize,
+            "a copy wraps once at most"
+        );
         let mask = self.capacity - 1;
         let start = (at & mask) as usize;
         let first = core::cmp::min(dst.len(), self.capacity as usize - start);

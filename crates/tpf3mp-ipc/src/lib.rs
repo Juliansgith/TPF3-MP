@@ -97,6 +97,8 @@ pub enum SendError {
     Full,
     #[error("message of {len} bytes exceeds the {max}-byte limit")]
     TooLarge { len: usize, max: usize },
+    #[error("the outbound ring is corrupt")]
+    Corrupt,
 }
 
 impl From<PushError> for SendError {
@@ -104,6 +106,7 @@ impl From<PushError> for SendError {
         match error {
             PushError::Full => SendError::Full,
             PushError::TooLarge { len, max } => SendError::TooLarge { len, max },
+            PushError::Corrupt => SendError::Corrupt,
         }
     }
 }
@@ -200,6 +203,14 @@ impl Link {
             return Err(IpcError::BadRingCapacity(ring_capacity));
         }
         let max_message = probe.max_message_field();
+        // The same rule `create` applies. The rings rely on it to copy each
+        // message with at most one wrap; a peer that breaks it could make
+        // this side read past its ring.
+        if max_message as usize + LENGTH_PREFIX > ring_capacity as usize {
+            return Err(IpcError::InvalidConfig(
+                "max_message plus the length prefix does not fit the ring",
+            ));
+        }
         let total = HEADER_SIZE + 2 * ring_capacity as usize;
         if region.len() < total {
             return Err(IpcError::Shm(ShmError::TooSmall {
