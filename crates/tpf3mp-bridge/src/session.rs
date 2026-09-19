@@ -14,7 +14,9 @@ use std::{
 
 use thiserror::Error;
 use tpf3mp_ipc::{IpcError, Link, Role, SendError};
-use tpf3mp_proto::{ChatText, Event, EventBody, IntentRejection, LaneDigest, Payload, Speed, Text};
+use tpf3mp_proto::{
+    ChatText, Event, EventBody, IntentRejection, LaneDigest, Payload, RulesName, Speed, Text,
+};
 
 use crate::{
     BRIDGE_VERSION, BridgeError, Gate, GateError, Gated, MAX_MESSAGE, ToAgent, ToHook,
@@ -90,6 +92,8 @@ pub struct Load {
 /// A game the room began.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Begin {
+    /// The rules the room is played by (see `ToHook::Begin`).
+    pub rules: RulesName,
     pub steps_per_second: u16,
     pub checkpoint_interval: u32,
     /// Where the game's saves go.
@@ -172,6 +176,7 @@ impl Session {
         loop {
             match self.recv_blocking()? {
                 ToHook::Begin {
+                    rules,
                     steps_per_second,
                     checkpoint_interval,
                     saves,
@@ -179,6 +184,7 @@ impl Session {
                     self.checkpoint_interval = u64::from(checkpoint_interval).max(1);
                     self.saves = PathBuf::from(saves.as_str());
                     return Ok(Begin {
+                        rules,
                         steps_per_second,
                         checkpoint_interval,
                         saves: self.saves.clone(),

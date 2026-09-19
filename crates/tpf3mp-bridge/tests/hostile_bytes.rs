@@ -39,6 +39,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
     let to_hook = [
         ToHook::Hello { version: 2 },
         ToHook::Begin {
+            rules: Text::new("native").unwrap(),
             steps_per_second: 10,
             checkpoint_interval: 50,
             saves: Text::new("C:/Users/player/TPF3-MP/worlds/saves").unwrap(),

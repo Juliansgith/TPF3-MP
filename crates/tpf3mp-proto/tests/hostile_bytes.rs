@@ -16,9 +16,9 @@ use tpf3mp_proto::{
     Arch, BulkOpen, BulkRequest, BulkResponse, ChunkHash, ClientMessage, ContentFingerprint,
     CreateRoom, Event, EventBody, FixedBytes, GameMessage, Hello, IntentRejection, Invite,
     JoinRoom, LaneDigest, MemberView, Os, Payload, Platform, PlayerId, Reject, RejectReason,
-    Request, RequestError, Response, Resume, RoomId, RoomPhase, RoomSettings, RoomView, SavedWorld,
-    ServerMessage, SessionId, Signature, SnapshotId, Speed, Text, Turn, TurnMessage, TurnStart,
-    Welcome, WorldOffer, decode_frame,
+    Request, RequestError, Response, Resume, RoomId, RoomPhase, RoomSettings, RoomView, RulesOffer,
+    SavedWorld, ServerMessage, SessionId, Signature, SnapshotId, Speed, Text, Turn, TurnMessage,
+    TurnStart, Welcome, WorldOffer, decode_frame,
 };
 
 /// Decodes `bytes` as a `T`: an error, or a message that survives a round
@@ -54,6 +54,7 @@ fn room_view() -> RoomView {
     RoomView {
         id: RoomId(FixedBytes([3; 16])),
         name: Text::new("A room with a name").unwrap(),
+        rules: Text::new("native").unwrap(),
         owner: player(1),
         max_players: 8,
         has_password: true,
@@ -114,6 +115,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                 max_players: 4,
                 password: Some(Text::new("secret").unwrap()),
                 settings: RoomSettings::DEFAULT,
+                rules: Some(Text::new("tpf2mp").unwrap()),
             }),
         },
         ClientMessage::Request {
@@ -157,6 +159,16 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
         ServerMessage::Welcome(Welcome {
             server_version: Text::new("0.1.0").unwrap(),
             session_id: SessionId([6; 16]),
+            rules: vec![
+                RulesOffer {
+                    name: Text::new("native").unwrap(),
+                    description: Text::new("The game's own economy.").unwrap(),
+                },
+                RulesOffer {
+                    name: Text::new("tpf2mp").unwrap(),
+                    description: Text::new("TPF2MP's economy, run by the server.").unwrap(),
+                },
+            ],
         }),
         ServerMessage::Reject(Reject {
             reason: RejectReason::TooManyConnections,
@@ -193,6 +205,7 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
     let turns = [
         TurnMessage::Start(TurnStart {
             room: RoomId(FixedBytes([3; 16])),
+            rules: Text::new("native").unwrap(),
             next_turn: 41,
             next_event: 12,
             sealed_through: 400,

@@ -129,6 +129,7 @@ async fn seat_and_start(
             max_players: u8::try_from(max_players).context("too many players")?,
             password: None,
             settings,
+            rules: None,
         })
         .await?;
     for client in others {

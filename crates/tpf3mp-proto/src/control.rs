@@ -82,6 +82,20 @@ pub struct Hello {
 pub struct Welcome {
     pub server_version: Text<64>,
     pub session_id: SessionId,
+    /// The rules this server offers rooms, the default first.
+    pub rules: Vec<RulesOffer>,
+}
+
+/// The name of a set of rules a room is played by, such as `native`: the
+/// game's own economy.
+pub type RulesName = Text<32>;
+
+/// Rules a server offers: what a host picks from when creating a room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesOffer {
+    pub name: RulesName,
+    /// What playing by them means, for the host choosing.
+    pub description: Text<200>,
 }
 
 /// The server's answer to a [`Hello`] it will not serve. The server closes
@@ -134,6 +148,9 @@ pub struct CreateRoom {
     pub max_players: u8,
     pub password: Option<Text<64>>,
     pub settings: RoomSettings,
+    /// One of the rules the server offers (see [`Welcome::rules`]), or its
+    /// default.
+    pub rules: Option<RulesName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +210,8 @@ pub enum RequestError {
     NoSuchPlayer,
     /// The owner cannot kick themselves; they can leave.
     CannotKickSelf,
+    /// The server does not offer the rules asked for.
+    UnknownRules,
 }
 
 impl fmt::Display for RequestError {
@@ -213,6 +232,7 @@ impl fmt::Display for RequestError {
             Self::RateLimited => "too many requests; try again in a moment",
             Self::NoSuchPlayer => "no such player is in the room",
             Self::CannotKickSelf => "the owner cannot kick themselves; leave the room instead",
+            Self::UnknownRules => "this server does not offer those rules",
         })
     }
 }
@@ -269,6 +289,8 @@ impl Speed {
 pub struct RoomView {
     pub id: RoomId,
     pub name: Text<48>,
+    /// The rules the room is played by.
+    pub rules: RulesName,
     pub owner: PlayerId,
     pub max_players: u8,
     pub has_password: bool,

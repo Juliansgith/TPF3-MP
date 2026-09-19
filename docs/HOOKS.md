@@ -262,7 +262,9 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
 
 - **From the agent (`ToHook`):**
   - `Hello`: always first.
-  - `Begin`: a game starts, and saves go in this directory.
+  - `Begin`: a game starts, and saves go in this directory. It also names the
+    room's rules: with `native`, the game's own economy runs untouched;
+    with canonical rules, the Lua mod shows the server's values instead.
   - `Load { file, next_step }`: load a world, then run `next_step`.
     Without a file, the game loads the world the player chose to start
     from: the owner's, or everyone's on a server that keeps no snapshots.
@@ -361,7 +363,8 @@ by hand (see the README). On release day, what remains for TPF3 is:
   (`tpf3mp_agent::save_check`, DAY_ONE.md section 7);
 - on the server, a `Ruleset` that validates TPF3's command format and
   applies the canonical economy, with `save` and `restore` so its rooms'
-  logs compact (`crates/tpf3mp-server/src/ruleset.rs`).
+  logs compact (`crates/tpf3mp-server/src/ruleset.rs`). It is added to
+  the server's `RulesMenu` next to `native`, which stays offered.
 
 ## Release-day procedure: adding a target for a new build
 

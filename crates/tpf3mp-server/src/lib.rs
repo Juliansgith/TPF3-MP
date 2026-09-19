@@ -28,7 +28,7 @@ use tpf3mp_proto::Text;
 
 pub use crate::{
     admin::serve_admin,
-    ruleset::{AcceptAll, Ruleset, RulesetFactory},
+    ruleset::{AcceptAll, NATIVE, RulesChoice, RulesMenu, Ruleset, RulesetFactory},
     snapshots::SnapshotConfig,
     tunnel::{AddressRange, TunnelConfig},
 };
@@ -77,8 +77,9 @@ pub struct ServerConfig {
     /// Key for the HMAC tags of invites and room passwords. An invite stays
     /// valid only while the server keeps this key.
     pub secret: [u8; 32],
-    /// Creates the canonical rules of each new room.
-    pub ruleset: RulesetFactory,
+    /// The rules hosts pick from for their rooms, the default first: the
+    /// game's own rules and economy unless the operator adds others.
+    pub rules: RulesMenu,
     /// Interval at which running rooms seal turns.
     pub tick: Duration,
     /// Where running games are logged and restored from at start. `None`
@@ -127,7 +128,7 @@ impl ServerConfig {
             // Long enough to ride out a server restart or a player's crash.
             abandoned_timeout: Duration::from_secs(600),
             secret,
-            ruleset: Arc::new(|| Box::new(AcceptAll)),
+            rules: RulesMenu::native(),
             tick: Duration::from_millis(100),
             data_dir: None,
             // Long enough for an autosave or a hitch; short enough that one
@@ -247,7 +248,7 @@ impl Server {
         let directory = Arc::new(Directory::new(DirectoryConfig {
             secret: config.secret,
             max_rooms: config.max_rooms,
-            ruleset: config.ruleset,
+            rules: config.rules,
             env: RoomEnv {
                 tick: config.tick,
                 metrics: Arc::clone(&metrics),

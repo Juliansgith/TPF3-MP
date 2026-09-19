@@ -4,11 +4,14 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::{FAST, RunningServer, content, join, room};
 use tpf3mp_agent::{ClientError, ClientEvent};
 use tpf3mp_proto::{
     CreateRoom, FixedBytes, Invite, JoinRoom, RequestError, RoomId, RoomPhase, RoomSettings, Text,
 };
+use tpf3mp_server::{AcceptAll, RulesChoice, RulesMenu};
 
 #[tokio::test]
 async fn a_room_is_joined_with_its_invite() {
@@ -181,6 +184,53 @@ async fn settings_out_of_range_are_refused() {
     assert_eq!(
         ann.client.create_room(zero_players).await.unwrap_err(),
         ClientError::Refused(RequestError::InvalidSettings)
+    );
+    server.shut_down().await;
+}
+
+#[tokio::test]
+async fn the_host_picks_the_rules_the_room_is_played_by() {
+    let server = RunningServer::start(|config| {
+        config.rules = RulesMenu::native().with(RulesChoice {
+            name: Text::new("strict").unwrap(),
+            description: Text::new("Checked by the server").unwrap(),
+            factory: Arc::new(|| Box::new(AcceptAll)),
+        });
+    })
+    .await;
+    let ann = server.client("ann").await;
+    let bob = server.client("bob").await;
+    let offered: Vec<&str> = ann
+        .client
+        .welcome()
+        .rules
+        .iter()
+        .map(|offer| offer.name.as_str())
+        .collect();
+    assert_eq!(offered, ["native", "strict"]);
+
+    // Without a choice, the server's default: the game's own rules.
+    let (_, native) = ann.client.create_room(room("plain", FAST)).await.unwrap();
+    assert_eq!(native.rules.as_str(), "native");
+    ann.client.leave_room().await.unwrap();
+
+    let strict = CreateRoom {
+        rules: Some(Text::new("strict").unwrap()),
+        ..room("strict", FAST)
+    };
+    let (invite, created) = ann.client.create_room(strict).await.unwrap();
+    assert_eq!(created.rules.as_str(), "strict");
+    let joined = bob.client.join_room(join(&invite)).await.unwrap();
+    assert_eq!(joined.rules.as_str(), "strict");
+
+    let unknown = CreateRoom {
+        rules: Some(Text::new("nonesuch").unwrap()),
+        ..room("other", FAST)
+    };
+    let carl = server.client("carl").await;
+    assert_eq!(
+        carl.client.create_room(unknown).await.unwrap_err(),
+        ClientError::Refused(RequestError::UnknownRules)
     );
     server.shut_down().await;
 }

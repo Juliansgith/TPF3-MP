@@ -41,6 +41,11 @@ enum Command {
         password: Option<String>,
         #[arg(long, default_value_t = 8)]
         max_players: u8,
+        /// The rules, and with them the economy, the room is played by: one
+        /// the server offers (`connect` lists them). Without it, the
+        /// server's default, normally `native`: the game's own.
+        #[arg(long)]
+        rules: Option<String>,
         /// Start the game once this many players are in the room and ready.
         #[arg(long)]
         start_with: Option<usize>,
@@ -248,6 +253,9 @@ async fn run(command: Command) -> Result<()> {
                 welcome.session_id,
                 client.rtt().as_millis()
             );
+            for rules in &welcome.rules {
+                println!("rules offered: {} ({})", rules.name, rules.description);
+            }
             client.close().await;
         }
         Command::Host {
@@ -256,6 +264,7 @@ async fn run(command: Command) -> Result<()> {
             room_name,
             password,
             max_players,
+            rules,
             start_with,
         } => {
             let options = options(&server).await?;
@@ -267,6 +276,7 @@ async fn run(command: Command) -> Result<()> {
                     max_players,
                     password: password.clone(),
                     settings: RoomSettings::DEFAULT,
+                    rules: rules.map(Text::new).transpose().context("rules")?,
                 })
                 .await?;
             println!("invite: {invite}");

@@ -24,7 +24,7 @@ pub use control::{
     AUTH_DOMAIN, AUTH_EXPORTER_LABEL, ChatText, ClientMessage, ContentFingerprint, CreateRoom,
     GameMessage, Hello, IntentRejection, JoinRoom, LaneDigest, MAX_CHECKPOINT_LANES,
     MAX_ROOM_MEMBERS, MemberView, Reject, RejectReason, Request, RequestError, Response, Resume,
-    RoomPhase, RoomSettings, RoomView, ServerMessage, Speed, Welcome,
+    RoomPhase, RoomSettings, RoomView, RulesName, RulesOffer, ServerMessage, Speed, Welcome,
 };
 pub use ids::{Invite, InviteError, PlayerId, RoomId, SessionId, Signature};
 pub use snapshot::{
@@ -34,8 +34,9 @@ pub use snapshot::{
 pub use text::{Text, TextError};
 pub use turn::{Event, EventBody, Turn, TurnMessage, TurnStart};
 
-/// Protocol version. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Protocol version. Client and server must match exactly. Version 2 lets
+/// hosts choose the rules a room is played by.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Application protocol name negotiated during the TLS handshake.
 pub const ALPN: &[u8] = b"tpf3mp";

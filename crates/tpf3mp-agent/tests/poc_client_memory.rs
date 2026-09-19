@@ -97,6 +97,7 @@ async fn a_hostile_server_cannot_fill_the_client_with_turns() {
         let welcome = ServerMessage::Welcome(Welcome {
             server_version: Text::new("hostile").unwrap(),
             session_id: SessionId([0; 16]),
+            rules: Vec::new(),
         });
         write_message(&mut send, &welcome, CONTROL_MAX_FRAME)
             .await
@@ -106,6 +107,7 @@ async fn a_hostile_server_cannot_fill_the_client_with_turns() {
         write_preamble(&mut turns, PROTOCOL_VERSION).await.unwrap();
         let start = TurnMessage::Start(TurnStart {
             room: RoomId(FixedBytes([0; 16])),
+            rules: tpf3mp_proto::Text::new("native").unwrap(),
             next_turn: 1,
             next_event: 1,
             steps_per_second: 5,

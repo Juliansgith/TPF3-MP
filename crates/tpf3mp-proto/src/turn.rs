@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Platform, Text,
     bytes::Payload,
-    control::Speed,
+    control::{RulesName, Speed},
     ids::{PlayerId, RoomId},
     snapshot::WorldOffer,
 };
@@ -20,9 +20,12 @@ pub enum TurnMessage {
 
 /// The first message on a turn stream: where the log continues and how the
 /// room is paced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStart {
     pub room: RoomId,
+    /// The rules the room is played by, which the game needs to know: with
+    /// `native`, its own economy runs as it always does.
+    pub rules: RulesName,
     /// Number of the next turn on this stream.
     pub next_turn: u64,
     /// Sequence number of the next event on this stream.

@@ -125,6 +125,7 @@ async fn a_hostile_server_cannot_fill_the_bridge_outbox() {
         let welcome = ServerMessage::Welcome(Welcome {
             server_version: Text::new("hostile").unwrap(),
             session_id: SessionId([0; 16]),
+            rules: Vec::new(),
         });
         write_message(&mut send, &welcome, CONTROL_MAX_FRAME)
             .await
@@ -135,6 +136,7 @@ async fn a_hostile_server_cannot_fill_the_bridge_outbox() {
         // A new game (no world to fetch), with the frontier held at 0.
         let start = TurnMessage::Start(TurnStart {
             room: RoomId(FixedBytes([0; 16])),
+            rules: tpf3mp_proto::Text::new("native").unwrap(),
             next_turn: 1,
             next_event: 1,
             steps_per_second: 5,

@@ -273,14 +273,20 @@ async fn act(
             room,
             max_players,
             password,
+            rules,
         } => {
             let current = connected.as_ref().ok_or("connect to a server first")?;
+            let rules = match rules.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(name) => Some(Text::new(name).map_err(|_| "no such rules".to_owned())?),
+            };
             let create = CreateRoom {
                 name: Text::new(room.trim())
                     .map_err(|_| "that room name is too long".to_owned())?,
                 max_players,
                 password: password_text(password)?,
                 settings: config.room_settings,
+                rules,
             };
             let (invite, _room) = current
                 .client
@@ -452,6 +458,7 @@ async fn connect_to(
     view.error = None;
     view.name = options.name.as_str().to_owned();
     view.server_version = Some(client.welcome().server_version.as_str().to_owned());
+    view.rules = client.welcome().rules.clone();
     drop(view);
     if let Some(file) = &config.remember {
         let remembered = Remembered {

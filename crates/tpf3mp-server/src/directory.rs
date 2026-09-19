@@ -11,7 +11,7 @@ use std::{
 use ring::hmac;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tpf3mp_proto::{
-    CreateRoom, FixedBytes, Invite, MAX_ROOM_MEMBERS, RequestError, RoomId, RoomView,
+    CreateRoom, FixedBytes, Invite, MAX_ROOM_MEMBERS, RequestError, RoomId, RoomView, RulesOffer,
 };
 use tracing::{info, warn};
 
@@ -19,7 +19,7 @@ use crate::{
     admission::RoomShare,
     metrics,
     room::{NewMember, ROOM_QUEUE, Room, RoomEnv, RoomHandle, RoomSecrets, RoomSpec},
-    ruleset::RulesetFactory,
+    ruleset::RulesMenu,
 };
 
 /// How long a shutdown waits for each room to finish.
@@ -29,7 +29,7 @@ pub(crate) struct Directory {
     rooms: Mutex<HashMap<RoomId, Registered>>,
     max_rooms: usize,
     key: hmac::Key,
-    ruleset: RulesetFactory,
+    rules: RulesMenu,
     env: RoomEnv,
 }
 
@@ -42,7 +42,7 @@ struct Registered {
 pub(crate) struct DirectoryConfig {
     pub(crate) secret: [u8; 32],
     pub(crate) max_rooms: usize,
-    pub(crate) ruleset: RulesetFactory,
+    pub(crate) rules: RulesMenu,
     pub(crate) env: RoomEnv,
 }
 
@@ -52,7 +52,7 @@ impl Directory {
             rooms: Mutex::default(),
             max_rooms: config.max_rooms,
             key: hmac::Key::new(hmac::HMAC_SHA256, &config.secret),
-            ruleset: config.ruleset,
+            rules: config.rules,
             env: config.env,
         }
     }
@@ -102,8 +102,7 @@ impl Directory {
         paths.sort();
         let mut restored = 0;
         for path in paths {
-            let recovered =
-                Room::recover(&path, self.key.clone(), (self.ruleset)(), self.env.clone());
+            let recovered = Room::recover(&path, self.key.clone(), &self.rules, self.env.clone());
             match recovered {
                 Ok(Some(room)) => {
                     info!(room = %room.id(), "restored a running room from its log");
@@ -121,6 +120,11 @@ impl Directory {
         restored
     }
 
+    /// The rules hosts pick from.
+    pub(crate) fn offers(&self) -> Vec<RulesOffer> {
+        self.rules.offers()
+    }
+
     /// Creates a room with `owner` as its first member and starts its task.
     /// The room holds `share` until it closes.
     pub(crate) fn create(
@@ -132,6 +136,10 @@ impl Directory {
         if !request.settings.is_valid() || !(1..=MAX_ROOM_MEMBERS).contains(&request.max_players) {
             return Err(RequestError::InvalidSettings);
         }
+        let rules = self
+            .rules
+            .find(request.rules.as_ref().map(|name| name.as_str()))
+            .ok_or(RequestError::UnknownRules)?;
         let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         if rooms.len() >= self.max_rooms {
             return Err(RequestError::TooManyRooms);
@@ -161,7 +169,8 @@ impl Directory {
                 max_players: request.max_players,
                 settings: request.settings,
                 secrets,
-                ruleset: (self.ruleset)(),
+                rules: rules.name.clone(),
+                ruleset: (rules.factory)(),
                 env: self.env.clone(),
                 share,
             },

@@ -137,6 +137,7 @@ pub fn room(name: &str, settings: RoomSettings) -> CreateRoom {
         max_players: 8,
         password: None,
         settings,
+        rules: None,
     }
 }
 
@@ -301,6 +302,7 @@ impl Player {
     async fn drain(&mut self) {
         let interval = self
             .start
+            .as_ref()
             .map_or(u64::MAX, |start| u64::from(start.checkpoint_interval));
         let mut checkpoints = Vec::new();
         let follower = self.follower.as_mut().expect("following");

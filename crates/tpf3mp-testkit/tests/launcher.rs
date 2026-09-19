@@ -20,7 +20,7 @@ use tpf3mp_proto::{ContentFingerprint, FixedBytes, RoomSettings};
 use tpf3mp_server::{Server, ServerConfig, SnapshotConfig};
 use tpf3mp_testkit::{
     fake_hook::{self, FakeHookConfig},
-    toy::ToyRules,
+    toy::toy_rules_menu,
 };
 
 const WAIT: Duration = Duration::from_secs(60);
@@ -145,7 +145,7 @@ async fn two_players_play_a_room_from_their_launchers() {
     let identity = ServerIdentity::self_signed(&["localhost", "127.0.0.1"]).unwrap();
     let trust = ServerTrust::Pinned(identity.leaf().clone());
     let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
-    config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
+    config.rules = toy_rules_menu();
     config.tick = Duration::from_millis(25);
     config.max_sessions_per_address = 100;
     config.max_handshakes_per_address = 100;
@@ -229,12 +229,24 @@ async fn two_players_play_a_room_from_their_launchers() {
         .act(json!({ "action": "connect", "server": server_address, "name": "Ann" }))
         .await;
     ann_page
-        .act(json!({ "action": "create", "room": "table", "max_players": 4, "password": null }))
+        .act(json!({
+            "action": "create", "room": "table", "max_players": 4, "password": null,
+            "rules": "toy",
+        }))
         .await;
     let state = ann_page
         .wait_for("Ann's room", |state| state["room"]["invite"].is_string())
         .await;
     let invite = state["room"]["invite"].as_str().unwrap().to_owned();
+    // The host chose among the server's rules; the room names its choice.
+    let offered: Vec<&str> = state["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rules| rules["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(offered, ["toy", "native"]);
+    assert_eq!(state["room"]["rules"], "toy");
     assert!(
         invite.starts_with(&format!("{server_address} TPF3MP1.")),
         "the invite names its server: {invite}"

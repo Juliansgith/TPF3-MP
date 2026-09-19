@@ -232,6 +232,7 @@ mod tests {
     fn start() -> TurnStart {
         TurnStart {
             room: RoomId(FixedBytes([0; 16])),
+            rules: tpf3mp_proto::Text::new("native").unwrap(),
             next_turn: 1,
             next_event: 1,
             sealed_through: 0,
@@ -369,7 +370,7 @@ mod tests {
         );
         assert_eq!(follower.restart(&resumed), Ok(()));
         assert_eq!(follower.resume_point().history, 8);
-        let mut elsewhere = resumed;
+        let mut elsewhere = resumed.clone();
         elsewhere.sealed_through = 4;
         assert_eq!(
             follower.restart(&elsewhere),

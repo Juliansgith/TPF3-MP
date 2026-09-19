@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tpf3mp_proto::{Event, Payload, PlayerId};
+use tpf3mp_proto::{Event, Payload, PlayerId, RulesName, RulesOffer, Text};
 
 /// A room's canonical rules.
 ///
@@ -62,5 +62,106 @@ impl Ruleset for AcceptAll {
         } else {
             Err("accepting every intent keeps no state".into())
         }
+    }
+}
+
+/// Rules a host can pick for a room.
+#[derive(Clone)]
+pub struct RulesChoice {
+    /// What the room log records, so a recovered room keeps its rules.
+    pub name: RulesName,
+    pub description: Text<200>,
+    pub factory: RulesetFactory,
+}
+
+/// The rules a server offers its rooms, the default first.
+#[derive(Clone)]
+pub struct RulesMenu {
+    choices: Vec<RulesChoice>,
+}
+
+/// The name of the game's own rules: everything any player does is ordered
+/// as it is, and the game's economy runs as it does alone.
+pub const NATIVE: &str = "native";
+
+impl RulesMenu {
+    /// Only the game's own rules, including its economy.
+    pub fn native() -> Self {
+        Self::single(RulesChoice {
+            name: RulesName::new(NATIVE).expect("short name"),
+            description: Text::new("The game's own rules and economy, as in single player.")
+                .expect("short description"),
+            factory: Arc::new(|| Box::new(AcceptAll)),
+        })
+    }
+
+    /// Just `choice`.
+    pub fn single(choice: RulesChoice) -> Self {
+        Self {
+            choices: vec![choice],
+        }
+    }
+
+    /// Also offers `choice`, replacing any of the same name.
+    #[must_use]
+    pub fn with(mut self, choice: RulesChoice) -> Self {
+        match self.choices.iter_mut().find(|c| c.name == choice.name) {
+            Some(existing) => *existing = choice,
+            None => self.choices.push(choice),
+        }
+        self
+    }
+
+    /// The choice named `name`, or the default without a name.
+    pub fn find(&self, name: Option<&str>) -> Option<&RulesChoice> {
+        match name {
+            None => self.choices.first(),
+            Some(name) => self.choices.iter().find(|c| c.name.as_str() == name),
+        }
+    }
+
+    /// What a host picks from.
+    pub fn offers(&self) -> Vec<RulesOffer> {
+        self.choices
+            .iter()
+            .map(|c| RulesOffer {
+                name: c.name.clone(),
+                description: c.description.clone(),
+            })
+            .collect()
+    }
+}
+
+impl Default for RulesMenu {
+    fn default() -> Self {
+        Self::native()
+    }
+}
+
+impl std::fmt::Debug for RulesMenu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.choices.iter().map(|c| c.name.as_str()))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_the_first_and_names_pick_the_rest() {
+        let menu = RulesMenu::native().with(RulesChoice {
+            name: RulesName::new("strict").unwrap(),
+            description: Text::new("Validated").unwrap(),
+            factory: Arc::new(|| Box::new(AcceptAll)),
+        });
+        assert_eq!(menu.find(None).unwrap().name.as_str(), NATIVE);
+        assert_eq!(menu.find(Some("strict")).unwrap().name.as_str(), "strict");
+        assert!(menu.find(Some("other")).is_none());
+        let offers = menu.offers();
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[0].name.as_str(), NATIVE);
     }
 }

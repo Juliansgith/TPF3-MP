@@ -35,7 +35,12 @@ opened: other pages and other programs cannot use it.
    invite? Paste the whole of it here instead, with your name: you are
    connected and in the room in one step.
 2. **Rooms.** Either create a room, with an optional password, or paste an
-   invite someone sent you and **Join room**.
+   invite someone sent you and **Join room**. When the server offers more
+   than one set of rules, the host picks one when creating the room:
+   `native` is the game's own rules and economy, as in single player;
+   others are run by the server, which checks everyone's money and
+   actions. The room's title shows its rules, and they cannot change once
+   the room exists.
 3. **Invite.** In your room, **Copy invite** and send it to your friends,
    for example on Discord. It holds the server's address, as you typed it,
    and the room's code; if you typed `localhost` or a home network address,

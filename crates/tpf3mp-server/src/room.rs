@@ -20,8 +20,8 @@ use tpf3mp_net::{bulk, close};
 use tpf3mp_proto::{
     ChatText, ContentFingerprint, Event, EventBody, FRAME_HEADER_LEN, FixedBytes, IntentRejection,
     LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError, Resume, RoomId, RoomPhase,
-    RoomSettings, RoomView, SavedWorld, ServerMessage, SnapshotId, Speed, TURN_MAX_FRAME, Text,
-    Turn, TurnMessage, TurnStart, WorldOffer, decode_frame, encode_frame,
+    RoomSettings, RoomView, RulesName, SavedWorld, ServerMessage, SnapshotId, Speed,
+    TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, WorldOffer, decode_frame, encode_frame,
 };
 use tpf3mp_snapshot::{Manifest, ManifestId};
 use tracing::{debug, error, info, warn};
@@ -33,7 +33,7 @@ use crate::{
     metrics::{self, Metrics},
     pacing::Pacer,
     persist::{self, Base, LogError, RoomLog, StartMember, StartRecord},
-    ruleset::Ruleset,
+    ruleset::{RulesMenu, Ruleset},
     snapshots::{
         self, Agreed, Candidates, Pointer, SAVE_DEADLINE, SavePoint, SaveReport, SaveRound, Saves,
         Snapshots, UPLOAD_START, Upload,
@@ -515,6 +515,8 @@ enum Rejoin {
 pub(crate) struct Room {
     id: RoomId,
     name: Text<48>,
+    /// The name of the rules `ruleset` plays by.
+    rules: RulesName,
     owner: PlayerId,
     max_players: u8,
     settings: RoomSettings,
@@ -578,6 +580,8 @@ pub(crate) enum RecoverError {
     Version(u16),
     #[error("the start record's room settings are out of range")]
     Settings,
+    #[error("the room is played by rules \"{0}\", which this server no longer offers")]
+    UnknownRules(String),
     #[error("the log's file name does not match its room")]
     Misnamed,
     #[error("turn record {0} is unreadable")]
@@ -598,6 +602,7 @@ pub(crate) struct RoomSpec {
     pub(crate) max_players: u8,
     pub(crate) settings: RoomSettings,
     pub(crate) secrets: RoomSecrets,
+    pub(crate) rules: RulesName,
     pub(crate) ruleset: Box<dyn Ruleset>,
     pub(crate) env: RoomEnv,
     pub(crate) share: RoomShare,
@@ -608,6 +613,7 @@ impl Room {
         let mut room = Self {
             id: spec.id,
             name: spec.name,
+            rules: spec.rules,
             owner: owner.player,
             max_players: spec.max_players,
             settings: spec.settings,
@@ -643,7 +649,7 @@ impl Room {
     pub(crate) fn recover(
         path: &Path,
         key: hmac::Key,
-        mut ruleset: Box<dyn Ruleset>,
+        menu: &RulesMenu,
         env: RoomEnv,
     ) -> Result<Option<Self>, RecoverError> {
         let mut reader = RoomLog::read(path)?;
@@ -655,6 +661,11 @@ impl Room {
         if !start.settings.is_valid() {
             return Err(RecoverError::Settings);
         }
+        // A room keeps its rules for good; the server must still have them.
+        let mut ruleset = match menu.find(Some(start.rules.as_str())) {
+            Some(choice) => (choice.factory)(),
+            None => return Err(RecoverError::UnknownRules(start.rules.as_str().to_owned())),
+        };
         let expected = start.id.to_string();
         if path.file_stem() != Some(std::ffi::OsStr::new(&expected)) {
             return Err(RecoverError::Misnamed);
@@ -816,7 +827,13 @@ impl Room {
             sealed_through: game.sealed_through,
             backlog: Vec::new(),
         };
-        let marker = TurnMessage::Start(game.turn_start(start.id, start.settings, &head, None));
+        let marker = TurnMessage::Start(game.turn_start(
+            start.id,
+            start.settings,
+            &start.rules,
+            &head,
+            None,
+        ));
         log.append(&encode_frame(&marker, TURN_MAX_FRAME).map_err(io::Error::other)?)?;
         let owner = if members.iter().any(|member| member.player == owner) {
             owner
@@ -829,6 +846,7 @@ impl Room {
         Ok(Some(Self {
             id: start.id,
             name: start.name,
+            rules: start.rules,
             owner,
             max_players: start.max_players,
             settings: start.settings,
@@ -876,6 +894,7 @@ impl Room {
         RoomView {
             id: self.id,
             name: self.name.clone(),
+            rules: self.rules.clone(),
             owner: self.owner,
             max_players: self.max_players,
             has_password: self.secrets.password_tag.is_some(),
@@ -1107,7 +1126,7 @@ impl Room {
                 // Without a world of this game, a player receives one.
                 Phase::Running(_) if resume.is_none() && self.snapshots.is_some() => Rejoin::World,
                 Phase::Running(game) => {
-                    Rejoin::Stream(game.resume_feed(self.id, self.settings, resume)?)
+                    Rejoin::Stream(game.resume_feed(self.id, self.settings, &self.rules, resume)?)
                 }
             };
             let member = &mut self.members[index];
@@ -1324,7 +1343,7 @@ impl Room {
             sealed_through: 0,
             backlog: Vec::new(),
         };
-        let open = game.turn_start(self.id, self.settings, &first, None);
+        let open = game.turn_start(self.id, self.settings, &self.rules, &first, None);
         self.content = first_content;
         // With snapshots, the owner's world is everyone's: the owner loads
         // it, the room saves it before the first step, and every other
@@ -1346,7 +1365,7 @@ impl Room {
                 member.streaming = link
                     .turns
                     .try_send(TurnFeed::Open {
-                        start: open,
+                        start: open.clone(),
                         backlog: Vec::new(),
                     })
                     .is_ok();
@@ -1387,6 +1406,7 @@ impl Room {
             history,
             id: self.id,
             name: self.name.clone(),
+            rules: self.rules.clone(),
             owner: self.owner,
             max_players: self.max_players,
             settings: self.settings,
@@ -2012,7 +2032,10 @@ impl Room {
                 .current
                 .as_ref()
                 .filter(|agreed| serves(agreed))
-                .and_then(|agreed| game.feed_from(self.id, self.settings, agreed).ok());
+                .and_then(|agreed| {
+                    game.feed_from(self.id, self.settings, &self.rules, agreed)
+                        .ok()
+                });
             match feed {
                 Some(feed) => feeds.push((index, feed)),
                 None => waiting = true,
@@ -2642,11 +2665,13 @@ impl Game {
         &self,
         room: RoomId,
         settings: RoomSettings,
+        rules: &RulesName,
         stream: &Stream,
         world: Option<WorldOffer>,
     ) -> TurnStart {
         TurnStart {
             room,
+            rules: rules.clone(),
             next_turn: stream.next_turn,
             next_event: stream.next_event,
             sealed_through: stream.sealed_through,
@@ -2769,11 +2794,12 @@ impl Game {
         &self,
         room: RoomId,
         settings: RoomSettings,
+        rules: &RulesName,
         resume: Option<Resume>,
     ) -> Result<TurnFeed, RequestError> {
         let stream = self.stream_after(resume)?;
         Ok(TurnFeed::Open {
-            start: self.turn_start(room, settings, &stream, None),
+            start: self.turn_start(room, settings, rules, &stream, None),
             backlog: stream.backlog,
         })
     }
@@ -2784,12 +2810,13 @@ impl Game {
         &self,
         room: RoomId,
         settings: RoomSettings,
+        rules: &RulesName,
         agreed: &Agreed,
     ) -> Result<(TurnFeed, u64), RequestError> {
         let stream = self.stream_from_save(&agreed.point)?;
         let next_event = stream.next_event;
         let feed = TurnFeed::Open {
-            start: self.turn_start(room, settings, &stream, Some(agreed.offer())),
+            start: self.turn_start(room, settings, rules, &stream, Some(agreed.offer())),
             backlog: stream.backlog,
         };
         Ok((feed, next_event))
@@ -2866,6 +2893,20 @@ impl Game {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ruleset::{NATIVE, RulesChoice};
+
+    fn native() -> RulesName {
+        RulesName::new(NATIVE).unwrap()
+    }
+
+    /// The native rules, recording what they apply.
+    fn recorder_menu() -> RulesMenu {
+        RulesMenu::single(RulesChoice {
+            name: native(),
+            description: Text::new("records").unwrap(),
+            factory: Arc::new(|| Box::new(Recorder::default())),
+        })
+    }
 
     #[test]
     fn resuming_is_limited_to_the_window() {
@@ -2882,7 +2923,7 @@ mod tests {
                 after_turn,
                 history: 1,
             });
-            game.resume_feed(room, settings, resume)
+            game.resume_feed(room, settings, &native(), resume)
         };
         assert!(matches!(feed(None), Err(RequestError::ResumeUnavailable)));
         assert!(matches!(
@@ -2921,6 +2962,7 @@ mod tests {
             game.resume_feed(
                 room,
                 settings,
+                &native(),
                 Some(Resume {
                     after_turn,
                     history,
@@ -3027,6 +3069,10 @@ mod tests {
     }
 
     fn recover_room(path: &Path, dir: &Path) -> Room {
+        recover_by(path, dir, &recorder_menu()).unwrap().unwrap()
+    }
+
+    fn recover_by(path: &Path, dir: &Path, menu: &RulesMenu) -> Result<Option<Room>, RecoverError> {
         let env = RoomEnv {
             tick: Duration::from_millis(100),
             metrics: Arc::new(Metrics::default()),
@@ -3040,9 +3086,56 @@ mod tests {
             compact_log_at: u64::MAX,
         };
         let key = hmac::Key::new(hmac::HMAC_SHA256, &[0; 32]);
-        Room::recover(path, key, Box::new(Recorder::default()), env)
-            .unwrap()
-            .unwrap()
+        Room::recover(path, key, menu, env)
+    }
+
+    #[test]
+    fn a_room_keeps_its_rules_or_is_not_restored() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = RoomId(FixedBytes([9; 16]));
+        let settings = RoomSettings::DEFAULT;
+        let mut game = Game::new(settings, 1);
+        let mut rules = Recorder::default();
+        game.append(joined(1), &mut rules);
+        let frames = game.seal(10).unwrap();
+        let start = StartRecord {
+            version: persist::FORMAT_VERSION,
+            history: 1,
+            id,
+            name: Text::new("strict room").unwrap(),
+            rules: RulesName::new("strict").unwrap(),
+            owner: player(1),
+            max_players: 8,
+            settings,
+            invite_tag: vec![0; 32],
+            password_tag: None,
+            members: Vec::new(),
+            base: None,
+        };
+        let mut log = RoomLog::create(&dir, &start).unwrap();
+        for frame in &frames {
+            log.append(frame).unwrap();
+        }
+        drop(log);
+        let path = RoomLog::path_for(&dir, &id);
+
+        // A server that dropped the rules does not restore the room with
+        // other rules.
+        assert!(matches!(
+            recover_by(&path, &dir, &recorder_menu()),
+            Err(RecoverError::UnknownRules(name)) if name == "strict"
+        ));
+        // One that has them restores it with them, even if they are not its
+        // default.
+        let menu = recorder_menu().with(RulesChoice {
+            name: RulesName::new("strict").unwrap(),
+            description: Text::new("strict").unwrap(),
+            factory: Arc::new(|| Box::new(Recorder::default())),
+        });
+        let room = recover_by(&path, &dir, &menu).unwrap().unwrap();
+        assert_eq!(room.view().rules.as_str(), "strict");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn running(room: &mut Room) -> &mut Game {
@@ -3080,6 +3173,7 @@ mod tests {
             history: 1,
             id,
             name: Text::new("compacted").unwrap(),
+            rules: native(),
             owner: player(1),
             max_players: 8,
             settings,
@@ -3276,6 +3370,7 @@ mod tests {
             history: 1,
             id,
             name: Text::new("crafted").unwrap(),
+            rules: native(),
             owner: player(1),
             max_players: 8,
             settings: RoomSettings::DEFAULT,
@@ -3310,7 +3405,7 @@ mod tests {
         let key = hmac::Key::new(hmac::HMAC_SHA256, &[0; 32]);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             matches!(
-                Room::recover(&path, key, Box::new(Recorder::default()), env),
+                Room::recover(&path, key, &recorder_menu(), env),
                 Err(RecoverError::Base | RecoverError::Continuity(_))
             )
         }));
@@ -3350,6 +3445,7 @@ mod tests {
             history: 1,
             id,
             name: Text::new("owners").unwrap(),
+            rules: native(),
             owner: player(1),
             max_players: 8,
             settings: RoomSettings::DEFAULT,

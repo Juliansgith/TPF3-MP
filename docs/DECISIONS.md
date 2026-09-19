@@ -86,3 +86,39 @@ regional VPS nodes.
 Julian Cooper (TPF2MP, `tf2mp-relay`) and silver2127 (`tpf2-multiplayer`)
 work on this repository together. Both TPF2 codebases are MIT licensed. Code
 or test vectors taken from them are credited in the file that uses them.
+
+## D6 (2026-09-19): the host chooses the room's rules, the game's own economy included
+
+Each server offers a list of rules, and the host of a room picks one when
+creating it. Each set of rules comes with its economy. The first on the list
+is the default. The room keeps its rules for good: they are recorded in its
+log, and a restarted server restores the room with the same rules or not at
+all.
+
+- **`native` is always offered, and is the default until others ship.** The
+  server orders every player's commands and checks nothing about money. Each
+  game runs its own economy as in single player. Checkpoints still compare
+  every replica's world: one that drifts, for example on another platform,
+  is re-sent the world the room agreed on.
+- **Canonical rules are an option on the same list** (D2). The server
+  validates intents and settles the economy itself, from TPF2MP's
+  integer-arithmetic model. Those rooms get what D2 promises: money no
+  client can forge, balance changes without client updates, and hidden
+  information.
+- The hook learns the room's rules when the game begins (`ToHook::Begin`),
+  so with `native` it leaves the game's economy alone.
+
+This amends D2. Canonical authority stays the design for rooms that choose
+it, and stops being a requirement for every room. D2 rejected "trusting one
+designated replica's native economy"; `native` rooms trust none: every replica
+runs the economy, and the room's agreed world corrects any that disagrees.
+Players who want the game as they know it can have it; players who want a
+server that cannot be cheated choose the canonical rules.
+
+Rejected:
+
+- **One economy per server.** Groups on the same server want different
+  games.
+- **Changing rules mid-game.** The rules' state and the log would have to be
+  converted. A new room is the way to switch.
+

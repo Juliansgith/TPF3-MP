@@ -12,7 +12,8 @@ and the alternatives they rejected are logged in [DECISIONS.md](DECISIONS.md).
 - Dedicated servers operated by the project: first node in Germany, more regions
   later. Players never host and never open a port.
 - Mixed platforms in one room: Windows x64, Linux x64 and macOS arm64.
-- Custom economy rules are a first-class feature, not a patch on top.
+- Custom economy rules are a first-class feature, not a patch on top. The
+  host of each room chooses its rules, including the game's own economy.
 - Secure against outsiders and cheating players, many rooms per server node, and
   negligible overhead inside the game process.
 
@@ -158,12 +159,17 @@ the Rust port. Consequences:
 
 - **No client updates for balance changes.** They ship with the server.
 - **Clients cannot forge money.** They never compute it.
-- **Rulesets are per room:** competitive, co-op or custom.
+- **Rulesets are per room.** The host picks one of the rules the server
+  offers when creating the room (D6): `native`, the game's own economy as
+  in single player, or canonical rules such as competitive, co-op or
+  custom. The room's log records the choice, so a restored room keeps it.
 - **Hidden information works.** Sealed bids or secret contracts stay on the
   server until it reveals them in a sealed turn.
-- **TPF3's native economy is presentation in every mode.** The economy reads
-  canonical facts, never native agents. (A co-op variant that trusts one
-  designated replica's native economy is an open product question below.)
+- **Under canonical rules, TPF3's native economy is presentation.** The
+  economy reads canonical facts, never native agents. Under `native`, the
+  game's economy is the economy: every replica runs it, the server only
+  orders commands, and checkpoints re-send the agreed world to a replica
+  that drifts.
 
 ## Transport
 
@@ -296,6 +302,3 @@ Not carried over:
 - [needs game] Is there any anti-tamper?
 - [needs game] How deterministic is the native simulation per platform pair?
 - [needs game] Is the macOS hook feasible, and are saves really cross-platform?
-- Product: should co-op offer a mode that trusts one designated replica's
-  native economy instead of the canonical model? It would mean more native
-  fidelity, but that player's machine becomes the economic truth.

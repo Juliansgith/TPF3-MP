@@ -1,7 +1,7 @@
 //! Load test: many rooms of bots playing the toy game against a server,
 //! in-process or deployed.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -13,7 +13,7 @@ use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
     scenario::{RoomPlan, latency_summary, play_room},
-    toy::ToyRules,
+    toy::toy_rules_menu,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -203,7 +203,7 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, TunnelUrl,
     let identity = ServerIdentity::self_signed(&["localhost"])?;
     let trust = ServerTrust::Pinned(identity.leaf().clone());
     let mut config = ServerConfig::new("127.0.0.1:0".parse()?, identity);
-    config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
+    config.rules = toy_rules_menu();
     config.max_sessions = 100_000;
     // Every bot connects from loopback, one address.
     config.max_sessions_per_address = 100_000;

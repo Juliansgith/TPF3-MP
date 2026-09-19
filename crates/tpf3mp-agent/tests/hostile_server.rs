@@ -10,6 +10,7 @@ use tpf3mp_proto::{Event, EventBody, FixedBytes, PlayerId, RoomId, Speed, Turn, 
 fn start(next_turn: u64, next_event: u64) -> TurnStart {
     TurnStart {
         room: RoomId(FixedBytes([0; 16])),
+        rules: tpf3mp_proto::Text::new("native").unwrap(),
         next_turn,
         next_event,
         sealed_through: 0,

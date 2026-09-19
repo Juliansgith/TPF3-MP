@@ -76,8 +76,10 @@
         <option>8</option><option>12</option><option>16</option>
       </select>
       <input id="create-password" class="grow" placeholder="password (optional)" maxlength="64">
+      <select id="rules" title="rules and economy"></select>
       <button id="create-button">Create room</button>
     </div>
+    <p id="rules-description" class="muted" style="margin: 0 0 10px"></p>
     <div class="row">
       <input id="invite" class="grow" placeholder="paste an invite" autocomplete="off">
       <input id="join-password" class="grow" placeholder="password (if any)" maxlength="64">
@@ -172,6 +174,30 @@ function cell(row, value) {
   return td;
 }
 
+// The host picks the room's rules, and with them its economy: the game's
+// own, or others the server offers. The first is the server's default.
+function renderRules(rules) {
+  const select = $("rules");
+  const names = rules.map(r => r.name).join("
+");
+  if (select.dataset.names !== names) {
+    const chosen = select.value;
+    select.replaceChildren();
+    for (const r of rules) {
+      const option = document.createElement("option");
+      option.value = r.name;
+      option.textContent = r.name;
+      option.title = r.description;
+      select.appendChild(option);
+    }
+    if (rules.some(r => r.name === chosen)) select.value = chosen;
+    select.dataset.names = names;
+  }
+  show("rules", rules.length > 1);
+  const picked = rules.find(r => r.name === select.value);
+  text($("rules-description"), picked ? "Rules: " + picked.name + " — " + picked.description : "");
+}
+
 function render(s) {
   state = s;
   const badge = $("connection");
@@ -190,9 +216,12 @@ function render(s) {
   show("game", !!s.room);
   show("chat", !!s.room);
 
+  renderRules(s.rules || []);
+
   if (s.room) {
     const room = s.room;
-    text($("room-title"), room.name + " · " + (room.phase === "lobby" ? "lobby" : "game running"));
+    text($("room-title"), room.name + " · " + room.rules + " rules · "
+      + (room.phase === "lobby" ? "lobby" : "game running"));
     if ($("room-invite").value !== (room.invite || "")) $("room-invite").value = room.invite || "";
     const body = $("members");
     body.replaceChildren();
@@ -295,7 +324,9 @@ $("disconnect-button").onclick = () => act({ action: "disconnect" });
 $("create-button").onclick = () => act({
   action: "create", room: $("room-name").value || "TPF3-MP room",
   max_players: Number($("max-players").value), password: $("create-password").value || null,
+  rules: $("rules").value || null,
 });
+$("rules").onchange = () => { if (state) renderRules(state.rules || []); };
 $("join-button").onclick = () =>
   act({ action: "join", invite: $("invite").value, password: $("join-password").value || null });
 $("ready-button").onclick = () =>

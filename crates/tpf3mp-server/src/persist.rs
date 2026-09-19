@@ -29,7 +29,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tpf3mp_proto::{
-    ContentFingerprint, Platform, PlayerId, RoomId, RoomSettings, Speed, TURN_MAX_FRAME, Text,
+    ContentFingerprint, Platform, PlayerId, RoomId, RoomSettings, RulesName, Speed, TURN_MAX_FRAME,
+    Text,
 };
 
 /// Version of the log's layout. Version 2 added histories: the start
@@ -37,8 +38,9 @@ use tpf3mp_proto::{
 /// naming the next. Version 3 has the events of protocol snapshots: joins
 /// name the player's platform, departures say whether it was a kick, and
 /// saves appear in the log. Version 4 lets the start record carry a
-/// [`Base`], for compacted logs.
-pub(crate) const FORMAT_VERSION: u16 = 4;
+/// [`Base`], for compacted logs. Version 5 records the rules the room is
+/// played by.
+pub(crate) const FORMAT_VERSION: u16 = 5;
 /// Largest start record: one whose base holds the rules' state.
 const MAX_START_RECORD: usize = 16 << 20;
 /// Largest record after the start record: a turn frame at its cap. Kept
@@ -59,6 +61,8 @@ pub(crate) struct StartRecord {
     pub(crate) history: u64,
     pub(crate) id: RoomId,
     pub(crate) name: Text<48>,
+    /// The rules the room is played by, which a recovered room keeps.
+    pub(crate) rules: RulesName,
     pub(crate) owner: PlayerId,
     pub(crate) max_players: u8,
     pub(crate) settings: RoomSettings,
@@ -422,6 +426,7 @@ mod tests {
             history: 1,
             id: RoomId(FixedBytes([1; 16])),
             name: Text::new("room").unwrap(),
+            rules: Text::new("native").unwrap(),
             owner: PlayerId(FixedBytes([2; 32])),
             max_players: 4,
             settings: RoomSettings::DEFAULT,

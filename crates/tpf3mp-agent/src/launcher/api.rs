@@ -1,7 +1,7 @@
 //! What the page reads (the state, as JSON) and what it asks (actions).
 
 use serde::{Deserialize, Serialize};
-use tpf3mp_proto::{Arch, FixedBytes, Os, Platform, PlayerId, RoomPhase};
+use tpf3mp_proto::{Arch, FixedBytes, Os, Platform, PlayerId, RoomPhase, RulesOffer};
 
 use crate::bridge::{Status, WorldStatus};
 
@@ -16,6 +16,8 @@ pub(crate) struct View {
     /// The connection runs through a tunnel, not over UDP.
     pub(crate) tunneled: bool,
     pub(crate) server_version: Option<String>,
+    /// The rules the server offers new rooms, the default first.
+    pub(crate) rules: Vec<RulesOffer>,
     pub(crate) in_room: bool,
     pub(crate) invite: Option<String>,
     pub(crate) error: Option<String>,
@@ -34,6 +36,9 @@ pub enum Action {
         room: String,
         max_players: u8,
         password: Option<String>,
+        /// One of the server's rules; the default without.
+        #[serde(default)]
+        rules: Option<String>,
     },
     Join {
         invite: String,
@@ -61,6 +66,7 @@ struct State<'a> {
     player: Option<String>,
     server: Option<&'a str>,
     server_version: Option<&'a str>,
+    rules: Vec<Rules<'a>>,
     connection: &'static str,
     tunneled: bool,
     error: Option<&'a str>,
@@ -71,8 +77,15 @@ struct State<'a> {
 }
 
 #[derive(Serialize)]
+struct Rules<'a> {
+    name: &'a str,
+    description: &'a str,
+}
+
+#[derive(Serialize)]
 struct Room {
     name: String,
+    rules: String,
     phase: &'static str,
     invite: Option<String>,
     you_own: bool,
@@ -125,6 +138,7 @@ pub(crate) fn render(view: &View, status: &Status) -> String {
         .filter(|_| view.in_room)
         .map(|room| Room {
             name: room.name.as_str().to_owned(),
+            rules: room.rules.as_str().to_owned(),
             phase: match room.phase {
                 RoomPhase::Lobby => "lobby",
                 RoomPhase::Running => "running",
@@ -168,6 +182,14 @@ pub(crate) fn render(view: &View, status: &Status) -> String {
         player: you.map(|player| player.to_string()),
         server: view.server.as_deref(),
         server_version: view.server_version.as_deref(),
+        rules: view
+            .rules
+            .iter()
+            .map(|offer| Rules {
+                name: offer.name.as_str(),
+                description: offer.description.as_str(),
+            })
+            .collect(),
         connection,
         tunneled: view.connected && view.tunneled,
         error: view.error.as_deref(),
@@ -245,6 +267,19 @@ mod tests {
             Action::Join {
                 invite: "TPF3MP1.x".into(),
                 password: None
+            }
+        );
+        let action: Action = serde_json::from_str(
+            r#"{"action":"create","room":"R","max_players":4,"password":null,"rules":"native"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            Action::Create {
+                room: "R".into(),
+                max_players: 4,
+                password: None,
+                rules: Some("native".into()),
             }
         );
         let action: Action = serde_json::from_str(r#"{"action":"start"}"#).unwrap();

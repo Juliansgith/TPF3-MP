@@ -10,12 +10,12 @@
 //!   [`ToyWorld::with_drift`] perturbs it the way a platform-specific float
 //!   difference would.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
-use tpf3mp_proto::{Event, EventBody, FixedBytes, LaneDigest, Payload, PlayerId};
-use tpf3mp_server::Ruleset;
+use tpf3mp_proto::{Event, EventBody, FixedBytes, LaneDigest, Payload, PlayerId, Text};
+use tpf3mp_server::{RulesChoice, RulesMenu, Ruleset};
 
 use crate::rng::SplitMix64;
 
@@ -195,6 +195,22 @@ impl Ledger {
 /// The ledger as a room's canonical ruleset on the server.
 /// The format of [`ToyRules`]' saved state.
 const TOY_STATE_FORMAT: u8 = 1;
+
+/// The name rooms played by [`ToyRules`] record.
+pub const TOY_RULES: &str = "toy";
+
+/// What a toy server offers: the toy's ledger by default, and the game's
+/// own rules for hosts who pick them.
+pub fn toy_rules_menu() -> RulesMenu {
+    let native = RulesMenu::native();
+    let native = native.find(None).expect("the native rules").clone();
+    RulesMenu::single(RulesChoice {
+        name: Text::new(TOY_RULES).expect("short name"),
+        description: Text::new("The toy's canonical ledger.").expect("short description"),
+        factory: Arc::new(|| Box::new(ToyRules::default())),
+    })
+    .with(native)
+}
 
 #[derive(Debug, Default)]
 pub struct ToyRules {

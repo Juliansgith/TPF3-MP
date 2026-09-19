@@ -599,6 +599,7 @@ impl<L: HookLink> Bridge<L> {
                     self.begun = true;
                     let saves = self.saves_dir();
                     self.outbox.push_back(ToHook::Begin {
+                        rules: start.rules.clone(),
                         steps_per_second: start.steps_per_second,
                         checkpoint_interval: start.checkpoint_interval,
                         saves: path_text(&saves)?,
@@ -955,7 +956,7 @@ impl Outbox {
                 ..
             }) => payload.len(),
             ToHook::Load { file, .. } => file.as_ref().map_or(0, |file| file.as_str().len()),
-            ToHook::Begin { saves, .. } => saves.as_str().len(),
+            ToHook::Begin { rules, saves, .. } => rules.as_str().len() + saves.as_str().len(),
             ToHook::Diverged { lanes, .. } => lanes.len() * 2,
             ToHook::Chat { from, text } => from.as_str().len() + text.as_str().len(),
             ToHook::End { reason } => reason.as_str().len(),
@@ -1213,6 +1214,7 @@ mod tests {
     fn start() -> TurnStart {
         TurnStart {
             room: RoomId(FixedBytes([0; 16])),
+            rules: Text::new("native").unwrap(),
             next_turn: 1,
             next_event: 1,
             sealed_through: 0,

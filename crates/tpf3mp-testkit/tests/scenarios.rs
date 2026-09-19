@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use tokio::{sync::oneshot, task::JoinHandle};
 use tpf3mp_net::tunnel::TunnelUrl;
@@ -17,7 +17,7 @@ use tpf3mp_testkit::{
     scenario::{
         BridgedPlan, BridgedPlayer, RoomPlan, latency_summary, play_bridged_room, play_room,
     },
-    toy::{ToyRules, lane},
+    toy::{lane, toy_rules_menu},
 };
 
 struct TestServer {
@@ -76,7 +76,7 @@ impl TestServer {
             config.secret = secret;
         }
         config.snapshots = snapshots;
-        config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
+        config.rules = toy_rules_menu();
         // Compact logs every second or two of play, so restarts restore the
         // canonical ledger from a compacted log's base.
         config.compact_log_at = 1 << 10;

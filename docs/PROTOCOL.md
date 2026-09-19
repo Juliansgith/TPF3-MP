@@ -83,6 +83,13 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
 
 - **Creating.** Any player can create a room and becomes its owner. One
   network address can have at most 8 rooms open (`TooManyRooms`).
+- **Rules.** `Welcome` lists the rules the server offers (`RulesOffer`: a
+  name of up to 32 bytes and a description), the default first. `CreateRoom`
+  names one, or none for the default; a name the server does not offer is
+  refused (`UnknownRules`). `native` is the game's own rules and economy:
+  the server orders commands without judging them. The room view and every
+  `TurnStart` name the room's rules, and they never change for the life of
+  the room.
 - **Closing.** A room closes when its last member leaves. A running game
   also closes when nobody has been connected to it for 10 minutes; until
   then, disconnected players keep their seats and can resume.

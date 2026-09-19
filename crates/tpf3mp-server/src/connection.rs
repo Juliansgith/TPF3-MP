@@ -205,6 +205,7 @@ async fn handshake(
     let welcome = ServerMessage::Welcome(Welcome {
         server_version: shared.server_version.clone(),
         session_id,
+        rules: shared.directory.offers(),
     });
     write_message(&mut send, &welcome, CONTROL_MAX_FRAME).await?;
     Ok(Admitted {

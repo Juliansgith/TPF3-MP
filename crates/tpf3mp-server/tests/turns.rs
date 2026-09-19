@@ -13,9 +13,9 @@ use tpf3mp_agent::ClientError;
 use tpf3mp_net::close;
 use tpf3mp_proto::{
     Event, EventBody, FixedBytes, IntentRejection, Invite, JoinRoom, LaneDigest, Payload, PlayerId,
-    RequestError, Resume, RoomSettings, Speed,
+    RequestError, Resume, RoomSettings, Speed, Text,
 };
-use tpf3mp_server::Ruleset;
+use tpf3mp_server::{RulesChoice, RulesMenu, Ruleset};
 
 fn payload(bytes: &[u8]) -> Payload {
     Payload::new(bytes.to_vec()).unwrap()
@@ -257,7 +257,11 @@ impl Ruleset for RefuseFf {
 #[tokio::test]
 async fn ruleset_refusals_reach_only_the_sender() {
     let server = RunningServer::start(|config| {
-        config.ruleset = Arc::new(|| Box::new(RefuseFf));
+        config.rules = RulesMenu::single(RulesChoice {
+            name: Text::new("refuse-ff").unwrap(),
+            description: Text::new("Refuses intents starting with 0xff").unwrap(),
+            factory: Arc::new(|| Box::new(RefuseFf)),
+        });
     })
     .await;
     let clients = vec![server.client("ann").await, server.client("bob").await];

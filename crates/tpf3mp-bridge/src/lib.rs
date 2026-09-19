@@ -27,14 +27,14 @@ mod session;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tpf3mp_proto::{ChatText, Event, IntentRejection, LaneDigest, Payload, Speed, Text};
+use tpf3mp_proto::{ChatText, Event, IntentRejection, LaneDigest, Payload, RulesName, Speed, Text};
 
 pub use gate::{Gate, GateError, Gated};
 pub use session::{Begin, Game, Load, Notice, Session, SessionError, StepGate};
 
 /// Version of these messages. Both sides send it first and refuse a peer
 /// that speaks another.
-pub const BRIDGE_VERSION: u32 = 2;
+pub const BRIDGE_VERSION: u32 = 3;
 /// The link name the agent creates and the hook opens, unless told
 /// otherwise.
 pub const DEFAULT_LINK: &str = "tpf3mp.default";
@@ -52,8 +52,10 @@ pub enum ToHook {
     Hello { version: u32 },
     /// A game begins. A [`ToHook::Load`] follows. The hook writes the saves
     /// the room asks for into `saves`, a directory the agent made for this
-    /// game.
+    /// game. `rules` names the rules the room is played by: with `native`,
+    /// the game's own economy runs as in single player.
     Begin {
+        rules: RulesName,
         steps_per_second: u16,
         checkpoint_interval: u32,
         saves: Text<MAX_PATH>,

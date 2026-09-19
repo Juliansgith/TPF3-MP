@@ -142,6 +142,10 @@ Persistence details:
   they hold invite and password tags and every command.
 - **Invite key.** Restored games are rejoined with their original invites,
   which only verify with the same `invite.key`.
+- **Rules.** Each game's log records the rules its host chose. A server that
+  no longer offers those rules sets the log aside rather than restoring
+  the game with others, so keep offering rules while games use them.
+  `native`, the game's own economy, is always offered.
 
 ## Tunnels
 
