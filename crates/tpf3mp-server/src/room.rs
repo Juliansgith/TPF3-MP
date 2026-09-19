@@ -30,7 +30,7 @@ use crate::{
     directory::Directory,
     metrics::{self, Metrics},
     pacing::Pacer,
-    persist::{self, RoomLog, StartMember, StartRecord},
+    persist::{self, LogError, RoomLog, StartMember, StartRecord},
     ruleset::Ruleset,
     verdict::{self, Report, Verdict},
 };
@@ -45,6 +45,11 @@ const MAX_AHEAD: Duration = Duration::from_secs(2);
 /// Intents per second a player may send, and the burst allowed on top.
 const INTENTS_PER_SECOND: u32 = 20;
 const INTENT_BURST: u32 = 40;
+/// Intent payload bytes per second a player may send, and the burst allowed
+/// on top. A build command is a few hundred bytes; this leaves room for
+/// large ones without letting one player grow a room's log quickly.
+const PAYLOAD_BYTES_PER_SECOND: u32 = 32 * 1024;
+const PAYLOAD_BURST: u32 = 256 * 1024;
 /// A checkpoint round waits this long for every pacing member before
 /// deciding with the reports it has.
 const CHECKPOINT_DEADLINE: Duration = Duration::from_secs(30);
@@ -52,9 +57,15 @@ const CHECKPOINT_DEADLINE: Duration = Duration::from_secs(30);
 const DECIDED_ROUNDS_KEPT: usize = 8;
 /// Undecided rounds at once; no client can make the server hold more.
 const MAX_OPEN_ROUNDS: usize = 64;
-/// Turns kept in memory for resuming: an hour at the default tick. A player
-/// away longer needs a world snapshot instead.
+/// Turns kept in memory for resuming: an hour at the default tick, and at
+/// most this many bytes. A player away longer needs a world snapshot
+/// instead.
 const RESUME_WINDOW: usize = 36_000;
+const RESUME_WINDOW_BYTES: usize = 64 << 20;
+/// No honest log seals further than this: centuries of play at the fastest
+/// settings. Recovery refuses logs that do, so arithmetic on steps never
+/// overflows.
+const MAX_FRONTIER: u64 = 1 << 48;
 
 /// The channels to one connection of a member.
 #[derive(Clone)]
@@ -232,6 +243,7 @@ struct Member {
     /// When this member's progress last moved forward.
     advanced: Instant,
     intents: TokenBucket,
+    payload_bytes: TokenBucket,
 }
 
 /// How long the room waits for a member before it stops holding everyone
@@ -276,6 +288,8 @@ struct Game {
     /// [`RESUME_WINDOW`] of them, starting with turn `log_first_turn`.
     log: VecDeque<LoggedTurn>,
     log_first_turn: u64,
+    /// Bytes of the turns in `log`.
+    log_bytes: usize,
     resume_window: usize,
     last_tick: Instant,
     /// When the game started (or was restored), for the load timeout.
@@ -333,16 +347,24 @@ pub(crate) struct RoomEnv {
 pub(crate) enum RecoverError {
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Log(#[from] LogError),
     #[error("the log has no start record")]
     Empty,
     #[error("the start record is unreadable: {0}")]
     Start(postcard::Error),
     #[error("the log's format version {0} is not supported")]
     Version(u16),
+    #[error("the start record's room settings are out of range")]
+    Settings,
+    #[error("the log's file name does not match its room")]
+    Misnamed,
     #[error("turn record {0} is unreadable")]
     Turn(usize),
     #[error("turn record {0} breaks the log's continuity")]
     Continuity(usize),
+    #[error("turn record {0} seals implausibly far")]
+    Frontier(usize),
 }
 
 pub(crate) struct RoomSpec {
@@ -390,15 +412,23 @@ impl Room {
         mut ruleset: Box<dyn Ruleset>,
         env: RoomEnv,
     ) -> Result<Option<Self>, RecoverError> {
-        let (log, records) = RoomLog::open(path)?;
-        let (first, turns) = records.split_first().ok_or(RecoverError::Empty)?;
-        let start: StartRecord = postcard::from_bytes(first).map_err(RecoverError::Start)?;
+        let mut reader = RoomLog::read(path)?;
+        let first = reader.next_record()?.ok_or(RecoverError::Empty)?;
+        let start: StartRecord = postcard::from_bytes(&first).map_err(RecoverError::Start)?;
         if start.version != persist::FORMAT_VERSION {
             return Err(RecoverError::Version(start.version));
         }
+        if !start.settings.is_valid() {
+            return Err(RecoverError::Settings);
+        }
+        let expected = start.id.to_string();
+        if path.file_stem() != Some(std::ffi::OsStr::new(&expected)) {
+            return Err(RecoverError::Misnamed);
+        }
         let mut game = Game::new(start.settings);
         let mut departed = BTreeSet::new();
-        for (index, frame) in turns.iter().enumerate() {
+        let mut index = 0;
+        while let Some(frame) = reader.next_record()? {
             let turn = match frame
                 .get(FRAME_HEADER_LEN..)
                 .map(decode_frame::<TurnMessage>)
@@ -408,6 +438,9 @@ impl Room {
             };
             if turn.number != game.next_turn || turn.sealed_through < game.sealed_through {
                 return Err(RecoverError::Continuity(index));
+            }
+            if turn.sealed_through > MAX_FRONTIER {
+                return Err(RecoverError::Frontier(index));
             }
             let first_event = turn
                 .events
@@ -431,12 +464,13 @@ impl Room {
             }
             game.remember(LoggedTurn {
                 first_event,
-                frame: Arc::from(frame.as_slice()),
+                frame: Arc::from(frame),
             });
             game.next_turn += 1;
             game.sealed_through = turn.sealed_through;
             game.speed = turn.speed;
             game.announced_speed = turn.speed;
+            index += 1;
         }
         game.pacer.resume_at(game.sealed_through);
         let members: Vec<Member> = start
@@ -454,12 +488,15 @@ impl Room {
                 pace: Pace::CatchingUp(None),
                 advanced: Instant::now(),
                 intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
+                payload_bytes: TokenBucket::new(PAYLOAD_BYTES_PER_SECOND, PAYLOAD_BURST),
             })
             .collect();
         if members.is_empty() {
-            log.delete()?;
+            reader.delete()?;
             return Ok(None);
         }
+        // Only now, with the room rebuilt, may a torn final record be cut.
+        let log = reader.into_log()?;
         // The live room hands ownership to the earliest remaining member at
         // each departure, which leaves the same owner as this.
         let owner = if members.iter().any(|member| member.player == start.owner) {
@@ -849,7 +886,10 @@ impl Room {
         let rejection = match &mut self.phase {
             Phase::Lobby => Some(IntentRejection::GameNotRunning),
             Phase::Running(game) => {
-                if !self.members[index].intents.take(now) {
+                let member = &mut self.members[index];
+                if !member.intents.take(now, 1)
+                    || !member.payload_bytes.take(now, payload.len() as u64)
+                {
                     Some(IntentRejection::RateLimited)
                 } else if let Err(code) = self.ruleset.validate(&player, &payload) {
                     Some(IntentRejection::Refused { code })
@@ -1197,6 +1237,7 @@ impl Member {
             pace: Pace::CatchingUp(None),
             advanced: Instant::now(),
             intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
+            payload_bytes: TokenBucket::new(PAYLOAD_BYTES_PER_SECOND, PAYLOAD_BURST),
         }
     }
 }
@@ -1249,6 +1290,7 @@ impl Game {
             pending: Vec::new(),
             log: VecDeque::new(),
             log_first_turn: 1,
+            log_bytes: 0,
             resume_window: RESUME_WINDOW,
             last_tick: Instant::now(),
             started: Instant::now(),
@@ -1331,11 +1373,17 @@ impl Game {
     }
 
     /// Keeps a sealed turn for resuming, dropping the oldest beyond the
-    /// window.
+    /// window's turns or bytes. The newest turn always stays.
     fn remember(&mut self, turn: LoggedTurn) {
+        self.log_bytes += turn.frame.len();
         self.log.push_back(turn);
-        if self.log.len() > self.resume_window {
-            self.log.pop_front();
+        while self.log.len() > self.resume_window
+            || (self.log_bytes > RESUME_WINDOW_BYTES && self.log.len() > 1)
+        {
+            let Some(oldest) = self.log.pop_front() else {
+                break;
+            };
+            self.log_bytes -= oldest.frame.len();
             self.log_first_turn += 1;
         }
     }
@@ -1398,7 +1446,8 @@ impl TokenBucket {
         }
     }
 
-    fn take(&mut self, now: Instant) -> bool {
+    /// Takes `cost` tokens if the bucket holds them.
+    fn take(&mut self, now: Instant, cost: u64) -> bool {
         let elapsed_ms =
             u64::try_from(now.saturating_duration_since(self.last).as_millis()).unwrap_or(u64::MAX);
         self.last = now;
@@ -1406,8 +1455,9 @@ impl TokenBucket {
             .milli
             .saturating_add(elapsed_ms.saturating_mul(u64::from(self.per_second)))
             .min(self.capacity_milli);
-        if self.milli >= 1000 {
-            self.milli -= 1000;
+        let cost_milli = cost.saturating_mul(1000);
+        if self.milli >= cost_milli {
+            self.milli -= cost_milli;
             true
         } else {
             false
@@ -1454,11 +1504,36 @@ mod tests {
         let start = Instant::now();
         let mut bucket = TokenBucket::new(10, 3);
         bucket.last = start;
-        assert!((0..3).all(|_| bucket.take(start)));
-        assert!(!bucket.take(start));
+        assert!((0..3).all(|_| bucket.take(start, 1)));
+        assert!(!bucket.take(start, 1));
         // 100 ms at 10 per second refills exactly one token.
-        assert!(bucket.take(start + Duration::from_millis(100)));
-        assert!(!bucket.take(start + Duration::from_millis(100)));
+        assert!(bucket.take(start + Duration::from_millis(100), 1));
+        assert!(!bucket.take(start + Duration::from_millis(100), 1));
+    }
+
+    #[test]
+    fn a_bucket_of_bytes_takes_whole_payloads() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new(1000, 5000);
+        bucket.last = start;
+        assert!(bucket.take(start, 4000));
+        assert!(!bucket.take(start, 2000), "only 1000 bytes left");
+        assert!(bucket.take(start + Duration::from_secs(1), 2000));
+    }
+
+    #[test]
+    fn the_resume_window_is_bounded_in_bytes_too() {
+        let mut game = Game::new(RoomSettings::DEFAULT);
+        let big = RESUME_WINDOW_BYTES / 4 + 1;
+        for _ in 0..8 {
+            game.remember(LoggedTurn {
+                first_event: 1,
+                frame: vec![0; big].into(),
+            });
+        }
+        assert_eq!(game.log.len(), 3, "four would exceed the bytes");
+        assert_eq!(game.log_first_turn, 6);
+        assert_eq!(game.log_bytes, 3 * big);
     }
 
     #[test]
@@ -1497,6 +1572,7 @@ mod tests {
             pace: Pace::Loading,
             advanced: Instant::now(),
             intents: TokenBucket::new(1, 1),
+            payload_bytes: TokenBucket::new(1, 1),
         }
     }
 }

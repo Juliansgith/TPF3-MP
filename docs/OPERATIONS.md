@@ -99,8 +99,18 @@ Persistence details:
   sealed, so a process crash loses nothing. A power loss or kernel crash can
   lose the last few turns; a client that saw them is told
   `ResumeUnavailable`.
-- **Damaged logs.** A log the server cannot restore is renamed to `*.broken`
-  and kept for diagnosis. Nothing is deleted.
+- **Damaged logs.** Recovery reads a log without changing it. A damaged final
+  record is what a crash leaves behind, so it is cut off once the room is
+  rebuilt. Any other damage leaves the log exactly as it was, renamed to
+  `*.broken` (or `*.1.broken` and so on, never replacing an earlier one) and
+  kept for diagnosis. Symbolic links are ignored.
+- **Size limits.** A room's log stops growing at 1 GiB; the game continues
+  but would not survive a restart. Each player may send 32 KiB of commands
+  per second, with a 256 KiB burst, so an honest game takes days to get
+  there. Recovery streams a log and holds at most the last 64 MiB of turns
+  per room in memory.
+- **Permissions.** On Linux, logs are readable by the server's user only:
+  they hold invite and password tags and every command.
 - **Invite key.** Restored games are rejoined with their original invites,
   which only verify with the same `invite.key`.
 

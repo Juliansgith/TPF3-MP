@@ -542,7 +542,6 @@ async fn logged_game(dir: &Path, secret: [u8; 32]) {
 /// promises the opposite: "renamed to `*.broken` and kept for diagnosis.
 /// Nothing is deleted."
 #[tokio::test]
-#[ignore = "security PoC: fails until a damaged log is kept intact"]
 async fn a_damaged_log_is_kept_for_diagnosis() {
     let dir = data_dir("broken-start");
     let secret = [4; 32];
@@ -569,7 +568,6 @@ async fn a_damaged_log_is_kept_for_diagnosis() {
 /// damaged turn silently deletes every later turn from disk, and the room is
 /// restored at the damage instead of being set aside.
 #[tokio::test]
-#[ignore = "security PoC: fails until a damaged turn stops truncating the log"]
 async fn one_damaged_turn_does_not_erase_the_rest_of_the_log() {
     let dir = data_dir("broken-middle");
     let secret = [6; 32];

@@ -194,8 +194,8 @@ the stream continues its log exactly (`TurnFollower::restart`).
   - a first message that is not `Hello`, or a second `Hello`;
   - progress beyond the sealed frontier;
   - a checkpoint with too many lanes.
-- **Rate limits.** Intents are limited per player (20 per second with a
-  burst of 40). Excess intents are answered with
-  `IntentRejected(RateLimited)`.
+- **Rate limits.** Intents are limited per player: 20 per second with a
+  burst of 40, and 32 KiB of payload per second with a burst of 256 KiB.
+  Excess intents are answered with `IntentRejected(RateLimited)`.
 - **Rejected requests** are answered with a typed error and leave the
   connection open.

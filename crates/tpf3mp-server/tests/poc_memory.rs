@@ -1,14 +1,8 @@
-//! Memory proofs of concept from the security review. A counting global
-//! allocator measures what the server keeps alive; server and clients share
-//! the process, so each test only measures after the client side has
-//! settled (all its data acknowledged and freed).
-//!
-//! These tests *demonstrate* a finding and pass while it exists. Run them one
-//! at a time, since the allocator counts the whole process:
-//!
-//! ```sh
-//! cargo test -p tpf3mp-server --test poc_memory -- --ignored --test-threads=1 --nocapture
-//! ```
+//! Memory bounds, from the security review's proofs of concept. A counting
+//! global allocator measures what the server keeps alive; server and
+//! clients share the process, so each test only measures after the client
+//! side has settled (all its data acknowledged and freed), and the tests
+//! take turns.
 
 #![allow(unsafe_code, clippy::unwrap_used)]
 
@@ -176,16 +170,13 @@ async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
     assert!(held < 2 * 1024 * 1024, "one connection held {held} bytes");
 }
 
-/// FINDING: a room keeps every sealed turn in memory (`Game::log`) and on
-/// disk for as long as it runs, with no cap. One player alone in a room of
-/// its own (anyone can create one) orders 20 intents per second of
-/// `MAX_PAYLOAD` (48 KiB): about 1 MB/s of server memory and disk, never
-/// released. At restart `RoomLog::open` and `Room::recover` read every log
-/// back into memory, briefly twice over, so once the logs outgrow the
-/// container's memory the server cannot start again.
+/// Review finding H2: a room kept every sealed turn in memory and on disk
+/// with no cap. One player sending 20 intents of `MAX_PAYLOAD` (48 KiB) per
+/// second grew the server by about 1 MB/s, and recovery read every log back
+/// into memory twice over. Payload bytes are now budgeted per player, the
+/// resume window is bounded in bytes, and recovery streams the log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "security PoC (demonstration, passes while the finding exists)"]
-async fn poc_one_player_grows_server_memory_and_disk_without_bound() {
+async fn one_player_cannot_grow_a_room_quickly() {
     let _serial = SERIAL.lock().await;
     let dir = data_dir("growth");
     let secret = [9; 32];
@@ -233,24 +224,22 @@ async fn poc_one_player_grows_server_memory_and_disk_without_bound() {
     let _ = std::fs::remove_dir_all(&dir);
 
     println!(
-        "{seq} intents in {seconds:.1} s: server heap +{:.1} MiB, log +{:.1} MiB \
-         ({:.2} MiB/s, {:.1} GiB/hour per attacking room; 2 GiB after {:.0} min)",
+        "{seq} intents in {seconds:.1} s: server heap +{:.2} MiB, log +{:.2} MiB",
         mib(heap),
         mib(disk),
-        mib(disk) / seconds,
-        mib(disk) / seconds * 3600.0 / 1024.0,
-        2048.0 / (mib(disk) / seconds) / 60.0,
     );
     println!(
-        "restart with a {:.1} MiB log: recovery peak {:.1} MiB, {:.1} MiB stays resident",
+        "restart with a {:.2} MiB log: recovery peak {:.2} MiB, {:.2} MiB stays resident",
         mib(log_bytes),
         mib(peak),
         mib(resident),
     );
-    assert!(disk > 4.0 * 1024.0 * 1024.0, "log grew {disk} bytes");
-    assert!(heap > 4.0 * 1024.0 * 1024.0, "heap grew {heap} bytes");
+    // The burst (256 KiB) and 32 KiB per second, plus turn overhead.
+    let mib = 1024.0 * 1024.0;
+    assert!(disk < 1.0 * mib, "log grew {disk} bytes in {seconds:.1} s");
+    assert!(heap < 2.0 * mib, "heap grew {heap} bytes");
     assert!(
-        peak > 1.5 * log_bytes,
-        "recovery peak {peak} for {log_bytes}"
+        peak < log_bytes + 2.0 * mib,
+        "recovery peak {peak} for a {log_bytes}-byte log"
     );
 }

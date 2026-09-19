@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
 };
 
@@ -48,8 +48,8 @@ impl Directory {
     }
 
     /// Restores every running room logged in the data directory. A log that
-    /// cannot be recovered is renamed to `*.broken` and kept for diagnosis,
-    /// never deleted. Returns how many rooms were restored.
+    /// cannot be recovered is renamed to `*.broken`, unmodified, and kept
+    /// for diagnosis, never deleted. Returns how many rooms were restored.
     pub(crate) fn recover(self: &Arc<Self>) -> usize {
         let Some(dir) = &self.env.data_dir else {
             return 0;
@@ -57,8 +57,11 @@ impl Directory {
         let Ok(entries) = fs::read_dir(dir) else {
             return 0;
         };
+        // Only regular files: a planted link must not lead recovery, which
+        // may cut a torn record, to some other file.
         let mut paths: Vec<PathBuf> = entries
             .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
             .collect();
@@ -76,7 +79,7 @@ impl Directory {
                 Ok(None) => {}
                 Err(error) => {
                     warn!(path = %path.display(), %error, "cannot restore a room; keeping its log aside");
-                    let _ = fs::rename(&path, path.with_extension("broken"));
+                    set_aside(&path);
                 }
             }
         }
@@ -169,6 +172,26 @@ impl Directory {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Renames a log that cannot be restored to `<room>.broken`, or
+/// `<room>.<n>.broken` if that exists, so an earlier one is never replaced.
+fn set_aside(path: &Path) {
+    for attempt in 0..1000 {
+        let aside = if attempt == 0 {
+            path.with_extension("broken")
+        } else {
+            path.with_extension(format!("{attempt}.broken"))
+        };
+        if aside.exists() {
+            continue;
+        }
+        if let Err(error) = fs::rename(path, &aside) {
+            warn!(path = %path.display(), %error, "cannot set a broken log aside");
+        }
+        return;
+    }
+    warn!(path = %path.display(), "too many broken logs of one room; leaving this one in place");
 }
 
 fn random<const N: usize>() -> [u8; N] {
