@@ -12,10 +12,14 @@ use std::{
 
 use thiserror::Error;
 use tpf3mp_bridge::{BridgeError, MAX_MESSAGE, ToAgent, ToHook, check_version, decode, encode};
-use tpf3mp_proto::{Speed, Text};
-use tracing::info;
+use tpf3mp_net::close;
+use tpf3mp_proto::{Invite, JoinRoom, RequestError, Resume, Speed, Text};
+use tracing::{debug, info, warn};
 
-use crate::{Action, Client, ClientError, ClientEvent, Events, FollowError, Playout, TurnFollower};
+use crate::{
+    Action, Client, ClientError, ClientEvent, ConnectOptions, Events, FollowError, Playout,
+    TurnFollower, connect,
+};
 
 /// The agent's end of the link to the hook.
 pub trait HookLink: Send {
@@ -104,6 +108,8 @@ pub enum BridgeFault {
     Client(#[from] ClientError),
     #[error("the server broke a turn invariant: {0}")]
     Follow(#[from] FollowError),
+    #[error("lost the server and could not rejoin: {0}")]
+    Rejoin(String),
 }
 
 /// How a bridged session ended.
@@ -130,7 +136,10 @@ pub struct Bridge<L> {
     speed: Speed,
     /// Commands the hook has sent; numbers each one's intent.
     commands: u64,
-    ran: Option<u64>,
+    /// The last step the game ran, or before any, the step before its
+    /// first: the progress to report.
+    progress: Option<u64>,
+    /// The progress last reported on the current connection.
     reported: Option<u64>,
     last_report: Instant,
     wait_until: Option<Instant>,
@@ -153,7 +162,7 @@ impl<L: HookLink> Bridge<L> {
             loaded: false,
             speed: Speed::NORMAL,
             commands: 0,
-            ran: None,
+            progress: None,
             reported: None,
             last_report: now,
             wait_until: None,
@@ -161,10 +170,13 @@ impl<L: HookLink> Bridge<L> {
         }
     }
 
-    /// Runs the session until the connection closes or something breaks.
-    /// Waits for the hook to attach first; the room may start before it.
+    /// Runs the session on one connection until it closes or something
+    /// breaks. Waits for the hook to attach first; the room may start before
+    /// it. The bridge keeps its state, so after a lost connection it can run
+    /// again on a new one that resumes the room (see [`play`]). The hook
+    /// is not told the session ended; [`Bridge::end`] does that.
     pub async fn run(
-        mut self,
+        &mut self,
         client: &Client,
         events: &mut Events,
     ) -> Result<BridgeEnd, BridgeFault> {
@@ -186,14 +198,33 @@ impl<L: HookLink> Bridge<L> {
                         return Ok(BridgeEnd::EventsEnded);
                     };
                     if let Some(end) = self.on_event(event)? {
-                        // Tell the game; it may already be gone.
-                        let _ = self.flush();
                         return Ok(end);
                     }
                 }
                 () = tokio::time::sleep_until(wake.into()) => {}
             }
         }
+    }
+
+    /// Tells the hook the session is over, as far as the link still takes
+    /// messages.
+    pub fn end(&mut self, reason: &str) {
+        self.outbox.push_back(ToHook::End {
+            reason: Text::lossy(reason),
+        });
+        let _ = self.flush();
+    }
+
+    /// Keeps the hook waiting while the agent has no connection: without a
+    /// beat it would give up on the agent.
+    pub fn keep_alive(&mut self) {
+        self.link.heartbeat();
+    }
+
+    /// Where to resume the room after reconnecting, or `None` before the
+    /// first turn.
+    pub fn resume_point(&self) -> Option<Resume> {
+        self.follower.as_ref().and_then(TurnFollower::resume_point)
     }
 
     fn check_hook(&mut self, now: Instant) -> Result<(), BridgeFault> {
@@ -232,8 +263,11 @@ impl<L: HookLink> Bridge<L> {
                     });
                 }
                 ToAgent::Loaded { next_step } => {
+                    // Loaded counts as progress: the server holds the room
+                    // until every member has loaded.
                     let progress = next_step.saturating_sub(1);
                     client.report_progress(progress).await?;
+                    self.progress = Some(progress);
                     self.reported = Some(progress);
                     self.loaded = true;
                 }
@@ -241,7 +275,7 @@ impl<L: HookLink> Bridge<L> {
                     client.send_intent(self.commands, payload).await?;
                     self.commands += 1;
                 }
-                ToAgent::Ran { step } => self.ran = Some(step),
+                ToAgent::Ran { step } => self.progress = Some(step),
                 ToAgent::Checkpoint { step, lanes } => {
                     client.report_checkpoint(step, lanes).await?;
                 }
@@ -251,15 +285,22 @@ impl<L: HookLink> Bridge<L> {
         Ok(())
     }
 
-    /// Reports how far the game has run, at most every `progress_every`.
+    /// Reports how far the game has run, at most every `progress_every`,
+    /// and at once on a new connection, which knows nothing yet.
     async fn report_progress(&mut self, client: &Client, now: Instant) -> Result<(), BridgeFault> {
-        let Some(ran) = self.ran else {
+        let Some(progress) = self.progress else {
+            return Ok(());
+        };
+        let Some(reported) = self.reported else {
+            client.report_progress(progress).await?;
+            self.reported = Some(progress);
+            self.last_report = now;
             return Ok(());
         };
         let due = now.saturating_duration_since(self.last_report) >= self.options.progress_every;
-        if due && self.reported.is_none_or(|reported| ran > reported) {
-            client.report_progress(ran).await?;
-            self.reported = Some(ran);
+        if due && progress > reported {
+            client.report_progress(progress).await?;
+            self.reported = Some(progress);
             self.last_report = now;
         }
         Ok(())
@@ -274,6 +315,9 @@ impl<L: HookLink> Bridge<L> {
                     Some(follower) => follower.restart(&start)?,
                     None => self.follower = Some(TurnFollower::new(&start)),
                 }
+                // A new stream, perhaps on a new connection: tell it where
+                // the game stands.
+                self.reported = None;
                 self.playout = Some(Playout::new(
                     start.steps_per_second,
                     self.options.playout_margin,
@@ -311,12 +355,7 @@ impl<L: HookLink> Bridge<L> {
                 self.outbox.push_back(ToHook::Diverged { step, lanes });
             }
             ClientEvent::RoomUpdate(_) => {}
-            ClientEvent::Closed(reason) => {
-                self.outbox.push_back(ToHook::End {
-                    reason: Text::lossy(&reason.to_string()),
-                });
-                return Ok(Some(BridgeEnd::Closed(reason)));
-            }
+            ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
         }
         Ok(None)
     }
@@ -335,6 +374,127 @@ impl<L: HookLink> Bridge<L> {
             self.outbox.pop_front();
         }
         Ok(())
+    }
+}
+
+/// Where to find the room again after the connection drops.
+#[derive(Debug, Clone)]
+pub struct Rejoin {
+    pub options: ConnectOptions,
+    pub invite: Invite,
+    pub password: Option<Text<64>>,
+    /// Stop trying after this long without a connection.
+    pub give_up_after: Duration,
+}
+
+/// Plays the room through the hook until it ends. After a lost connection
+/// (a network drop, or the server restarting) it reconnects and resumes
+/// the room where the game stands, so the game sees only a pause. Tells
+/// the hook when the session is over.
+pub async fn play<L: HookLink>(
+    bridge: &mut Bridge<L>,
+    mut client: Client,
+    mut events: Events,
+    rejoin: &Rejoin,
+) -> Result<BridgeEnd, BridgeFault> {
+    loop {
+        let reason = match bridge.run(&client, &mut events).await {
+            Ok(BridgeEnd::Closed(reason)) if worth_rejoining(&reason) => reason,
+            Ok(end) => {
+                bridge.end(&format!("{end:?}"));
+                return Ok(end);
+            }
+            Err(fault) => {
+                bridge.end(&fault.to_string());
+                return Err(fault);
+            }
+        };
+        warn!(%reason, "lost the server; rejoining the room");
+        drop(client);
+        match rejoin_room(bridge, rejoin).await {
+            Ok((new_client, new_events)) => {
+                info!("rejoined the room");
+                client = new_client;
+                events = new_events;
+            }
+            Err(error) => {
+                bridge.end(&error);
+                return Err(BridgeFault::Rejoin(error));
+            }
+        }
+    }
+}
+
+/// Whether a lost connection is worth rejoining after: not when this side
+/// closed it, another connection replaced it, or the protocol broke.
+fn worth_rejoining(reason: &quinn::ConnectionError) -> bool {
+    match reason {
+        quinn::ConnectionError::LocallyClosed | quinn::ConnectionError::VersionMismatch => false,
+        quinn::ConnectionError::ApplicationClosed(closed) => ![
+            close::REPLACED,
+            close::PROTOCOL_VIOLATION,
+            close::VERSION_MISMATCH,
+            close::IDLE,
+        ]
+        .contains(&closed.error_code),
+        _ => true,
+    }
+}
+
+/// Reconnects and rejoins, backing off between attempts and beating for
+/// the hook all the while.
+async fn rejoin_room<L: HookLink>(
+    bridge: &mut Bridge<L>,
+    rejoin: &Rejoin,
+) -> Result<(Client, Events), String> {
+    let deadline = Instant::now() + rejoin.give_up_after;
+    let mut backoff = Duration::from_millis(250);
+    let resume = bridge.resume_point();
+    loop {
+        let attempt = async {
+            let (client, events) = connect(rejoin.options.clone())
+                .await
+                .map_err(|error| (error.to_string(), false))?;
+            client
+                .join_room(JoinRoom {
+                    invite: rejoin.invite.clone(),
+                    password: rejoin.password.clone(),
+                    resume,
+                })
+                .await
+                .map_err(|error| {
+                    // The room can no longer give these turns back.
+                    let hopeless = error == ClientError::Refused(RequestError::ResumeUnavailable);
+                    (error.to_string(), hopeless)
+                })?;
+            Ok::<_, (String, bool)>((client, events))
+        };
+        let outcome = keeping_alive(bridge, attempt).await;
+        match outcome {
+            Ok(rejoined) => return Ok(rejoined),
+            Err((error, true)) => return Err(error),
+            Err((error, false)) if Instant::now() + backoff >= deadline => return Err(error),
+            Err((error, false)) => {
+                debug!(%error, "rejoining failed; trying again");
+                keeping_alive(bridge, tokio::time::sleep(backoff)).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+/// Runs `work` while beating for the hook.
+async fn keeping_alive<L: HookLink, T>(
+    bridge: &mut Bridge<L>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let mut work = std::pin::pin!(work);
+    let mut beat = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            done = &mut work => return done,
+            _ = beat.tick() => bridge.keep_alive(),
+        }
     }
 }
 

@@ -13,13 +13,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tpf3mp_agent::{
     Client, ConnectOptions, Events,
-    bridge::{Bridge, BridgeOptions},
+    bridge::{self, Bridge, BridgeOptions, Rejoin},
     connect,
 };
 use tpf3mp_ipc::{Config as LinkConfig, Link, Role};
 use tpf3mp_net::{Identity, ServerTrust};
 use tpf3mp_proto::{
-    ContentFingerprint, CreateRoom, FixedBytes, JoinRoom, RoomSettings, Speed, Text,
+    ContentFingerprint, CreateRoom, FixedBytes, Invite, JoinRoom, RoomSettings, Speed, Text,
 };
 
 use crate::{
@@ -49,7 +49,8 @@ pub async fn play_room(plan: RoomPlan) -> Result<Vec<BotReport>> {
     }
     let names: Vec<&str> = plan.bots.iter().map(|bot| bot.name.as_str()).collect();
     let clients = connect_all(plan.server, &plan.server_name, &plan.trust, &names).await?;
-    seat_and_start(&clients, plan.settings).await?;
+    let seated: Vec<&Client> = clients.iter().map(|(client, _)| client).collect();
+    seat_and_start(&seated, plan.settings).await?;
     if plan.speed != Speed::NORMAL {
         clients[0].0.set_speed(plan.speed).await?;
     }
@@ -89,23 +90,32 @@ async fn connect_all(
 ) -> Result<Vec<(Client, Events)>> {
     let mut clients = Vec::with_capacity(names.len());
     for name in names {
-        let identity = Arc::new(Identity::generate()?.0);
-        let options = ConnectOptions::new(
-            server,
-            server_name,
-            trust.clone(),
-            identity,
-            Text::new(*name).context("player name")?,
-        );
+        let options = player_options(server, server_name, trust, name)?;
         clients.push(connect(options).await.context("connecting a player")?);
     }
     Ok(clients)
 }
 
+/// How a player with a fresh identity connects.
+fn player_options(
+    server: SocketAddr,
+    server_name: &str,
+    trust: &ServerTrust,
+    name: &str,
+) -> Result<ConnectOptions> {
+    Ok(ConnectOptions::new(
+        server,
+        server_name,
+        trust.clone(),
+        Arc::new(Identity::generate()?.0),
+        Text::new(name).context("player name")?,
+    ))
+}
+
 /// Seats every client in one room, the first as its owner, and starts the
-/// game.
-async fn seat_and_start(clients: &[(Client, Events)], settings: RoomSettings) -> Result<()> {
-    let Some(((owner, _), others)) = clients.split_first() else {
+/// game. Returns the room's invite.
+async fn seat_and_start(clients: &[&Client], settings: RoomSettings) -> Result<Invite> {
+    let Some((owner, others)) = clients.split_first() else {
         bail!("a room needs at least one player");
     };
     let (invite, _) = owner
@@ -116,7 +126,7 @@ async fn seat_and_start(clients: &[(Client, Events)], settings: RoomSettings) ->
             settings,
         })
         .await?;
-    for (client, _) in others {
+    for client in others {
         client
             .join_room(JoinRoom {
                 invite: invite.clone(),
@@ -125,12 +135,12 @@ async fn seat_and_start(clients: &[(Client, Events)], settings: RoomSettings) ->
             })
             .await?;
     }
-    for (client, _) in clients {
+    for client in clients {
         client.declare_content(TOY_CONTENT).await?;
         client.set_ready(true).await?;
     }
     owner.start_game().await?;
-    Ok(())
+    Ok(invite)
 }
 
 pub struct BridgedPlan {
@@ -155,15 +165,29 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
 
 /// Plays one room through the whole stack a game uses: each player is a
 /// fake hook (the toy game behind the step gate) on a shared-memory link to
-/// its agent's bridge. Returns the hooks' reports in seat order.
+/// its agent's bridge. An agent that loses the server rejoins the room and
+/// resumes, as the real one does. Returns the hooks' reports in seat order.
 pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
-    let names: Vec<&str> = plan.players.iter().map(|p| p.name.as_str()).collect();
-    let clients = connect_all(plan.server, &plan.server_name, &plan.trust, &names).await?;
-    seat_and_start(&clients, plan.settings).await?;
+    let mut connected = Vec::with_capacity(plan.players.len());
+    for player in &plan.players {
+        let options = player_options(plan.server, &plan.server_name, &plan.trust, &player.name)?;
+        let (client, events) = connect(options.clone())
+            .await
+            .context("connecting a player")?;
+        connected.push((options, client, events));
+    }
+    let seated: Vec<&Client> = connected.iter().map(|(_, client, _)| client).collect();
+    let invite = seat_and_start(&seated, plan.settings).await?;
 
-    let mut hooks = Vec::with_capacity(clients.len());
-    let mut bridges = Vec::with_capacity(clients.len());
-    for ((client, mut events), player) in clients.into_iter().zip(&plan.players) {
+    let mut hooks = Vec::with_capacity(connected.len());
+    let mut bridges = Vec::with_capacity(connected.len());
+    for ((options, client, events), player) in connected.into_iter().zip(&plan.players) {
+        let rejoin = Rejoin {
+            options,
+            invite: invite.clone(),
+            password: None,
+            give_up_after: plan.deadline,
+        };
         let link_name = format!(
             "tpf3mp-bridged-{}-{}",
             std::process::id(),
@@ -180,10 +204,8 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
             patience: plan.deadline,
         }));
         bridges.push(tokio::spawn(async move {
-            let ended = Bridge::new(link, BridgeOptions::default())
-                .run(&client, &mut events)
-                .await;
-            (client, ended)
+            let mut bridge = Bridge::new(link, BridgeOptions::default());
+            bridge::play(&mut bridge, client, events, &rejoin).await
         }));
     }
 
@@ -197,7 +219,7 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
     }
     for bridge in bridges {
         if bridge.is_finished() {
-            let (_, ended) = bridge.await.context("a bridge panicked")?;
+            let ended = bridge.await.context("a bridge panicked")?;
             bail!("a bridge ended before its game: {ended:?}");
         }
         bridge.abort();

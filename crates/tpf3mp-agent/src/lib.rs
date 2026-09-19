@@ -49,6 +49,7 @@ const EVENT_QUEUE: usize = 1024;
 /// a hostile server could make the client hold gigabytes.
 const EVENT_BYTES: usize = 64 << 20;
 
+#[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub server: SocketAddr,
     /// The name the server's certificate must be valid for.

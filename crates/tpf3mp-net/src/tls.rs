@@ -43,6 +43,15 @@ pub struct ServerIdentity {
     key: PrivateKeyDer<'static>,
 }
 
+impl Clone for ServerIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            chain: self.chain.clone(),
+            key: self.key.clone_key(),
+        }
+    }
+}
+
 impl ServerIdentity {
     /// Loads a PEM certificate chain (leaf first) and its PEM private key,
     /// such as the files an ACME client writes.

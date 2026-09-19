@@ -1,10 +1,10 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use tpf3mp_agent::{
     Client, ClientEvent, ConnectOptions, Events,
-    bridge::{Bridge, BridgeOptions},
+    bridge::{self, Bridge, BridgeOptions, Rejoin},
     connect,
 };
 use tpf3mp_net::{CertificateDer, Identity, ServerTrust};
@@ -115,12 +115,14 @@ async fn main() -> Result<()> {
             max_players,
             start_with,
         } => {
-            let (client, mut events) = open(&server).await?;
+            let options = options(&server).await?;
+            let (client, mut events) = connect(options.clone()).await?;
+            let password = password.map(Text::new).transpose().context("password")?;
             let (invite, room) = client
                 .create_room(CreateRoom {
                     name: Text::new(room_name).context("room name")?,
                     max_players,
-                    password: password.map(Text::new).transpose().context("password")?,
+                    password: password.clone(),
                     settings: RoomSettings::DEFAULT,
                 })
                 .await?;
@@ -130,7 +132,13 @@ async fn main() -> Result<()> {
             if let Some(players) = start_with {
                 start_when_ready(&client, &mut events, players).await?;
             }
-            play(client, events, game.game_link).await?;
+            let rejoin = Rejoin {
+                options,
+                invite,
+                password,
+                give_up_after: REJOIN_PATIENCE,
+            };
+            play(client, events, game.game_link, rejoin).await?;
         }
         Command::Join {
             server,
@@ -139,21 +147,33 @@ async fn main() -> Result<()> {
             password,
         } => {
             let invite: Invite = invite.parse()?;
-            let (client, events) = open(&server).await?;
+            let options = options(&server).await?;
+            let (client, events) = connect(options.clone()).await?;
+            let password = password.map(Text::new).transpose().context("password")?;
             let room = client
                 .join_room(JoinRoom {
-                    invite,
-                    password: password.map(Text::new).transpose().context("password")?,
+                    invite: invite.clone(),
+                    password: password.clone(),
                     resume: None,
                 })
                 .await?;
             print_room(&room);
             get_ready(&client, &game).await?;
-            play(client, events, game.game_link).await?;
+            let rejoin = Rejoin {
+                options,
+                invite,
+                password,
+                give_up_after: REJOIN_PATIENCE,
+            };
+            play(client, events, game.game_link, rejoin).await?;
         }
     }
     Ok(())
 }
+
+/// How long the agent keeps trying to rejoin a room after losing the
+/// server, for example while it restarts.
+const REJOIN_PATIENCE: Duration = Duration::from_secs(300);
 
 /// Declares this player's content and readiness.
 async fn get_ready(client: &Client, game: &Game) -> Result<()> {
@@ -189,8 +209,9 @@ async fn start_when_ready(client: &Client, events: &mut Events, players: usize) 
     }
 }
 
-/// Follows the room, through the game when a link name is given.
-async fn play(client: Client, mut events: Events, link: Option<String>) -> Result<()> {
+/// Follows the room, through the game when a link name is given. Through
+/// the game, a lost server is rejoined and the room resumed.
+async fn play(client: Client, events: Events, link: Option<String>, rejoin: Rejoin) -> Result<()> {
     let Some(name) = link else {
         follow(client, events).await;
         return Ok(());
@@ -198,19 +219,22 @@ async fn play(client: Client, mut events: Events, link: Option<String>) -> Resul
     let link = tpf3mp_ipc::Link::create(&tpf3mp_ipc::Config::new(&name), tpf3mp_ipc::Role::Agent)
         .with_context(|| format!("creating the game link {name}"))?;
     println!("waiting for the game on link {name}");
-    let bridge = Bridge::new(link, BridgeOptions::default());
+    let mut bridge = Bridge::new(link, BridgeOptions::default());
     tokio::select! {
-        ended = bridge.run(&client, &mut events) => match ended {
+        ended = bridge::play(&mut bridge, client, events, &rejoin) => match ended {
             Ok(end) => println!("the session ended: {end:?}"),
             Err(fault) => eprintln!("the bridge to the game failed: {fault}"),
         },
-        _ = tokio::signal::ctrl_c() => {}
+        _ = tokio::signal::ctrl_c() => bridge.end("the agent was stopped"),
     }
-    client.close().await;
     Ok(())
 }
 
 async fn open(server: &Server) -> Result<(Client, Events)> {
+    Ok(connect(options(server).await?).await?)
+}
+
+async fn options(server: &Server) -> Result<ConnectOptions> {
     let (host, _port) = server
         .server
         .rsplit_once(':')
@@ -236,7 +260,7 @@ async fn open(server: &Server) -> Result<(Client, Events)> {
     };
     let identity = Arc::new(Identity::load_or_create(&identity_path)?);
     let name = Text::new(server.name.clone()).context("player name")?;
-    Ok(connect(ConnectOptions::new(address, host, trust, identity, name)).await?)
+    Ok(ConnectOptions::new(address, host, trust, identity, name))
 }
 
 fn print_room(room: &RoomView) {

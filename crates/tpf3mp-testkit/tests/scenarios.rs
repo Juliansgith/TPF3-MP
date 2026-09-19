@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::{sync::oneshot, task::JoinHandle};
 use tpf3mp_net::{ServerIdentity, ServerTrust};
@@ -31,8 +31,22 @@ impl TestServer {
     /// ledger, as TPF3 rooms will with the canonical rules.
     async fn start() -> Self {
         let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+        Self::start_with("127.0.0.1:0".parse().unwrap(), identity, None).await
+    }
+
+    /// A server at `listen` with this identity, logging its rooms in `data`
+    /// under the given secret, so a restart restores them.
+    async fn start_with(
+        listen: SocketAddr,
+        identity: ServerIdentity,
+        data: Option<(PathBuf, [u8; 32])>,
+    ) -> Self {
         let trust = ServerTrust::Pinned(identity.leaf().clone());
-        let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), identity);
+        let mut config = ServerConfig::new(listen, identity);
+        if let Some((dir, secret)) = data {
+            config.data_dir = Some(dir);
+            config.secret = secret;
+        }
         config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
         config.tick = Duration::from_millis(25);
         // Every bot connects from loopback, one address.
@@ -222,6 +236,59 @@ async fn games_behind_the_bridge_and_gate_agree() {
     let commands: u64 = reports.iter().map(|report| report.commands).sum();
     assert!(commands > 60, "the players were busy: {commands} commands");
     server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn games_ride_out_a_server_restart() {
+    let dir = std::env::temp_dir().join(format!("tpf3mp-ride-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let secret = [7; 32];
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let first = TestServer::start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        identity.clone(),
+        Some((dir.clone(), secret)),
+    )
+    .await;
+    let address = first.address;
+    let settings = RoomSettings {
+        steps_per_second: 50,
+        input_delay_ms: 60,
+        checkpoint_interval: 25,
+    };
+    let players = (0..2)
+        .map(|index| BridgedPlayer {
+            name: format!("game{index}"),
+            seed: index,
+            world_seed: 7,
+            act_every: 9 + index,
+            target_step: 400,
+        })
+        .collect();
+    let game = tokio::spawn(play_bridged_room(BridgedPlan {
+        server: address,
+        server_name: "localhost".into(),
+        trust: first.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(60),
+    }));
+
+    // Mid-game, the server is upgraded: it stops, and a new process takes
+    // over the same address and data directory.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    first.stop().await;
+    let second = TestServer::start_with(address, identity, Some((dir.clone(), secret))).await;
+
+    let reports = game.await.unwrap().unwrap();
+    assert_eq!(reports[0].lanes, reports[1].lanes, "the worlds agree");
+    for report in &reports {
+        assert_eq!(report.ran, 400, "played on after the restart");
+        assert!(!report.ended);
+        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
+    }
+    second.stop().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
