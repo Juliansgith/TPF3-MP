@@ -405,6 +405,55 @@ fn inconsistent_manifests_are_dropped() {
     assert!(chunk_files(&setup.client_root).is_empty());
 }
 
+/// A server passes snapshots on without loading them: it verifies and keeps
+/// one without writing the file.
+#[test]
+fn a_snapshot_can_be_retained_without_writing_its_file() {
+    let setup = setup();
+    let data = repetitive_bytes(17, 400_000);
+    let manifest = setup.publish(&data);
+    let mut sink = ChunkSink::open(&setup.client, manifest.clone()).unwrap();
+    assert!(matches!(sink.retain(), Err(SinkError::Incomplete { .. })));
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+    sink.retain().unwrap();
+    assert!(!setup.out.exists());
+    assert_eq!(setup.client.retained().unwrap(), [manifest.id()]);
+    assert_eq!(setup.client.pending().unwrap(), []);
+    assert!(matches!(sink.retain(), Err(SinkError::Finished)));
+    // What was retained assembles to the original.
+    setup.client.assemble(&manifest, &setup.out).unwrap();
+    assert!(fs::read(&setup.out).unwrap() == data);
+}
+
+/// A manifest whose chunks contradict it is dropped by `retain` as by
+/// `finish`, so an uploader cannot pin chunks on a server forever.
+#[test]
+fn retaining_an_inconsistent_manifest_drops_it() {
+    let setup = setup();
+    let real = setup.publish(&random_bytes(18, 300_000));
+    let bytes = encode_manifest(
+        [16 << 10, 64 << 10, 256 << 10],
+        real.total_size(),
+        FileHash([9; 32]),
+        real.chunks(),
+    );
+    let lying = Manifest::from_bytes(&bytes).unwrap();
+    let mut sink = ChunkSink::open(&setup.client, lying).unwrap();
+    let missing = sink.missing();
+    serve(&setup.server, &mut sink, &missing);
+    let error = sink.retain().unwrap_err();
+    assert!(
+        matches!(error, SinkError::Inconsistent(StoreError::FileHashMismatch)),
+        "{error}"
+    );
+    assert_eq!(setup.client.retained().unwrap(), []);
+    assert_eq!(setup.client.pending().unwrap(), []);
+    drop(sink);
+    setup.client.gc([]).unwrap();
+    assert!(chunk_files(&setup.client_root).is_empty());
+}
+
 #[test]
 fn one_transfer_per_snapshot_at_a_time() {
     let setup = setup();

@@ -15,8 +15,13 @@ ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tpf3mp-proto.workspace = true
+tpf3mp-snapshot.workspace = true
 webpki-roots.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

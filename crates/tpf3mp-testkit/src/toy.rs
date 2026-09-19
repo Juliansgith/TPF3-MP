@@ -59,13 +59,13 @@ impl ToyCommand {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Track {
     owner: PlayerId,
     length: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Train {
     owner: PlayerId,
     track: u32,
@@ -79,7 +79,7 @@ pub enum Effect {
 }
 
 /// The canonical state: companies, money and ownership.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     money: BTreeMap<PlayerId, i64>,
     tracks: BTreeMap<u32, Track>,
@@ -148,7 +148,7 @@ impl Ledger {
                 self.money.entry(*player).or_insert(START_MONEY);
                 None
             }
-            EventBody::PlayerLeft { .. } => None,
+            EventBody::PlayerLeft { .. } | EventBody::Save => None,
             EventBody::Command {
                 player, payload, ..
             } => {
@@ -209,7 +209,7 @@ impl Ruleset for ToyRules {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct TrainState {
     position: u32,
     forward: bool,
@@ -242,6 +242,30 @@ impl ToyWorld {
     pub fn with_drift(mut self, step: u64) -> Self {
         self.drift_at = Some(step);
         self
+    }
+
+    /// The world as a save file holds it. A drift to come is a property of
+    /// this replica, not of the world, and is not saved.
+    pub fn save(&self) -> Vec<u8> {
+        let saved = SavedWorld {
+            ledger: self.ledger.clone(),
+            trains: self.trains.clone(),
+            rng: self.rng.state(),
+            delivered: self.delivered,
+        };
+        postcard::to_stdvec(&saved).expect("toy state always encodes")
+    }
+
+    /// A world from a save file.
+    pub fn load(bytes: &[u8]) -> Option<Self> {
+        let saved: SavedWorld = postcard::from_bytes(bytes).ok()?;
+        Some(Self {
+            ledger: saved.ledger,
+            trains: saved.trains,
+            rng: SplitMix64::new(saved.rng),
+            delivered: saved.delivered,
+            drift_at: None,
+        })
     }
 
     pub fn apply(&mut self, event: &Event) {
@@ -308,6 +332,15 @@ impl ToyWorld {
     }
 }
 
+/// What a toy save file holds.
+#[derive(Serialize, Deserialize)]
+struct SavedWorld {
+    ledger: Ledger,
+    trains: BTreeMap<u32, TrainState>,
+    rng: u64,
+    delivered: u64,
+}
+
 fn lane_digest<T: Serialize>(lane: u16, value: &T) -> LaneDigest {
     let bytes = postcard::to_stdvec(value).expect("toy state always encodes");
     let hash = digest(&SHA256, &bytes);
@@ -321,7 +354,7 @@ fn lane_digest<T: Serialize>(lane: u16, value: &T) -> LaneDigest {
 
 #[cfg(test)]
 mod tests {
-    use tpf3mp_proto::Text;
+    use tpf3mp_proto::{Platform, Text};
 
     use super::*;
 
@@ -336,6 +369,7 @@ mod tests {
             body: EventBody::PlayerJoined {
                 player: player(id),
                 name: Text::new("p").unwrap(),
+                platform: Platform::current(),
             },
         }
     }
@@ -397,5 +431,24 @@ mod tests {
         assert_eq!(lanes_a[0], lanes_c[0], "drift never touches the ledger");
         assert_ne!(lanes_a[1], lanes_c[1], "the trains move differently");
         assert_ne!(lanes_a[2], lanes_c[2], "the generator state differs");
+    }
+
+    #[test]
+    fn a_loaded_save_continues_exactly_where_the_world_was() {
+        let mut world = ToyWorld::new(9);
+        world.apply(&joined(1, 1));
+        world.apply(&command(2, 1, &ToyCommand::BuildTrack { length: 30 }));
+        world.apply(&command(3, 1, &ToyCommand::BuyTrain { track: 0 }));
+        for step in 1..=100 {
+            world.step(step);
+        }
+        let mut loaded = ToyWorld::load(&world.save()).unwrap();
+        assert_eq!(loaded.lanes(), world.lanes());
+        for step in 101..=200 {
+            world.step(step);
+            loaded.step(step);
+        }
+        assert_eq!(loaded.lanes(), world.lanes());
+        assert!(ToyWorld::load(b"not a save").is_none());
     }
 }

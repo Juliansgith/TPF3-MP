@@ -199,7 +199,34 @@ impl ChunkSink {
         }
         let store = &self.store;
         let manifest = &self.manifest;
-        match store.assemble_then(manifest, dest, || store.promote(manifest)) {
+        let published = store.assemble_then(manifest, dest, || store.promote(manifest));
+        self.settle(published)
+    }
+
+    /// Verifies the whole snapshot against its file hash, as [`finish`]
+    /// does, and retains it in the store, without writing the file anywhere.
+    /// For a server, which passes snapshots on but never loads them. On
+    /// failure it behaves as [`finish`] does.
+    ///
+    /// [`finish`]: Self::finish
+    pub fn retain(&mut self) -> Result<(), SinkError> {
+        if self.finished {
+            return Err(SinkError::Finished);
+        }
+        if !self.missing.is_empty() {
+            return Err(SinkError::Incomplete {
+                missing: self.missing.len(),
+            });
+        }
+        let store = &self.store;
+        let manifest = &self.manifest;
+        let verified = store.verify_then(manifest, || store.promote(manifest));
+        self.settle(verified)
+    }
+
+    /// Ends the transfer after a final verification, however it went.
+    fn settle(&mut self, verified: Result<(), StoreError>) -> Result<(), SinkError> {
+        match verified {
             Ok(()) => {
                 self.end();
                 Ok(())

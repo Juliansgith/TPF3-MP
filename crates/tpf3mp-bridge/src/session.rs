@@ -4,13 +4,17 @@
 //! implements [`Game`] and calls the session from its detours:
 //! [`Session::poll_step`] or [`Session::before_step`] before each simulation
 //! step, [`Session::after_step`] after it, and [`Session::command`] when the
-//! player acts.
+//! player acts. When the gate says [`StepGate::Load`], the game loads that
+//! world and calls [`Session::loaded`].
 
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use tpf3mp_ipc::{IpcError, Link, Role, SendError};
-use tpf3mp_proto::{Event, IntentRejection, LaneDigest, Payload, Speed, Text};
+use tpf3mp_proto::{Event, EventBody, IntentRejection, LaneDigest, Payload, Speed, Text};
 
 use crate::{
     BRIDGE_VERSION, BridgeError, Gate, GateError, Gated, MAX_MESSAGE, ToAgent, ToHook,
@@ -22,10 +26,15 @@ const POLL: Duration = Duration::from_micros(200);
 
 /// What the session needs from the game.
 pub trait Game {
-    /// Applies an event the room ordered. Called only between steps.
+    /// Applies an event the room ordered. Called only between steps. Save
+    /// events never get here: the session calls [`Game::save`] for them.
     fn apply(&mut self, event: &Event);
-    /// The world's lane digests, taken at a checkpoint step.
+    /// The world's lane digests, taken at a checkpoint step or a save.
     fn lanes(&mut self) -> Vec<LaneDigest>;
+    /// Saves the world as it stands, between two steps, to `file`. A save
+    /// the room agrees on is what players who join later load, so it must
+    /// hold everything needed to continue from here.
+    fn save(&mut self, file: &Path) -> Result<(), String>;
     /// Something to show the player.
     fn notice(&mut self, notice: Notice) {
         let _ = notice;
@@ -51,7 +60,7 @@ pub enum Notice {
 }
 
 /// What the game does about its next step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepGate {
     /// Run it.
     Run,
@@ -59,13 +68,27 @@ pub enum StepGate {
     Wait,
     /// The session is over; stop following the room.
     Ended,
+    /// Replace the world with this one, then call [`Session::loaded`].
+    Load(Load),
+}
+
+/// A world to load: see [`ToHook::Load`](crate::ToHook::Load).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Load {
+    /// The save to load, or `None` for the world every player starts from.
+    pub file: Option<PathBuf>,
+    /// The first step the loaded world runs: pass it to
+    /// [`Session::loaded`].
+    pub next_step: u64,
 }
 
 /// A game the room began.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Begin {
     pub steps_per_second: u16,
     pub checkpoint_interval: u32,
+    /// Where the game's saves go.
+    pub saves: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -82,12 +105,19 @@ pub enum SessionError {
     Unexpected(&'static str),
     #[error("the agent stopped responding")]
     AgentGone,
+    #[error("the world was loaded to run step {got} next, but step {expected} was ordered")]
+    LoadedElsewhere { expected: u64, got: u64 },
+    #[error("the game loaded a world nobody ordered")]
+    NotLoading,
 }
 
 /// The hook's end of one session with the agent.
 pub struct Session {
     link: Link,
     gate: Gate,
+    /// A load the agent ordered that the game has not finished.
+    pending_load: Option<Load>,
+    saves: PathBuf,
     checkpoint_interval: u64,
     /// How long the agent's heartbeat may stand still.
     patience: Duration,
@@ -113,6 +143,8 @@ impl Session {
             agent_beat: (link.peer_heartbeat(), Instant::now()),
             link,
             gate: Gate::new(1),
+            pending_load: None,
+            saves: PathBuf::new(),
             checkpoint_interval: u64::MAX,
             patience,
             buf: vec![0; MAX_MESSAGE],
@@ -129,28 +161,42 @@ impl Session {
         Ok(session)
     }
 
-    /// Waits for the room to begin a game. The game then loads its world,
-    /// beating [`Session::heartbeat`] meanwhile, and calls
-    /// [`Session::loaded`].
+    /// Waits for the room to begin a game. The first thing the gate then
+    /// says is which world to load ([`StepGate::Load`]).
     pub fn wait_for_begin(&mut self) -> Result<Begin, SessionError> {
         match self.recv_blocking()? {
             ToHook::Begin {
                 steps_per_second,
                 checkpoint_interval,
+                saves,
             } => {
                 self.checkpoint_interval = u64::from(checkpoint_interval).max(1);
+                self.saves = PathBuf::from(saves.as_str());
                 Ok(Begin {
                     steps_per_second,
                     checkpoint_interval,
+                    saves: self.saves.clone(),
                 })
             }
             _ => Err(SessionError::Unexpected("something before the game began")),
         }
     }
 
-    /// The world is loaded, and `next_step` is the first step it will run.
+    /// The world the gate ordered ([`StepGate::Load`]) is loaded, and
+    /// `next_step` is the first step it will run. Beat
+    /// [`Session::heartbeat`] while loading.
     pub fn loaded(&mut self, next_step: u64) -> Result<(), SessionError> {
-        self.gate = Gate::new(next_step);
+        let Some(load) = &self.pending_load else {
+            return Err(SessionError::NotLoading);
+        };
+        if load.next_step != next_step {
+            return Err(SessionError::LoadedElsewhere {
+                expected: load.next_step,
+                got: next_step,
+            });
+        }
+        self.pending_load = None;
+        self.gate.loaded(next_step);
         self.send(&ToAgent::Loaded { next_step })
     }
 
@@ -162,6 +208,9 @@ impl Session {
         loop {
             if self.gate.ended() {
                 return Ok(StepGate::Ended);
+            }
+            if let Some(load) = &self.pending_load {
+                return Ok(StepGate::Load(load.clone()));
             }
             if self.gate.may_run() {
                 return Ok(StepGate::Run);
@@ -175,8 +224,8 @@ impl Session {
     }
 
     /// Blocks until the game may run its next step, applying events
-    /// meanwhile. A pause can hold the game here for as long as it lasts;
-    /// only an agent that stops beating ends the wait.
+    /// meanwhile, or must load a world. A pause can hold the game here for
+    /// as long as it lasts; only an agent that stops beating ends the wait.
     pub fn before_step(&mut self, game: &mut impl Game) -> Result<StepGate, SessionError> {
         loop {
             match self.poll_step(game)? {
@@ -226,7 +275,16 @@ impl Session {
 
     fn handle(&mut self, message: ToHook, game: &mut impl Game) -> Result<(), SessionError> {
         match self.gate.on_message(message)? {
+            Gated::Apply(event) if matches!(event.body, EventBody::Save) => {
+                self.save(event.seq, game)?;
+            }
             Gated::Apply(event) => game.apply(&event),
+            Gated::Load { file, next_step } => {
+                self.pending_load = Some(Load {
+                    file: file.map(|file| PathBuf::from(file.as_str())),
+                    next_step,
+                });
+            }
             Gated::Speed(speed) => game.notice(Notice::Speed(speed)),
             Gated::Diverged { step, lanes } => game.notice(Notice::Diverged { step, lanes }),
             Gated::Refused { command, reason } => {
@@ -236,6 +294,32 @@ impl Session {
             Gated::Nothing => {}
         }
         Ok(())
+    }
+
+    /// Saves the world at the save event `event` and reports it, with the
+    /// world's lanes there. A failed save is reported too: the room decides
+    /// without it.
+    fn save(&mut self, event: u64, game: &mut impl Game) -> Result<(), SessionError> {
+        let file = self.saves.join(format!("save-{event}.sav"));
+        let saved = game.save(&file);
+        let lanes = game.lanes();
+        let file = match saved {
+            Ok(()) => match Text::new(file.to_string_lossy().into_owned()) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    self.log(&format!(
+                        "cannot report the save {}: {error}",
+                        file.display()
+                    ))?;
+                    None
+                }
+            },
+            Err(reason) => {
+                self.log(&format!("saving the world failed: {reason}"))?;
+                None
+            }
+        };
+        self.send(&ToAgent::Saved { event, lanes, file })
     }
 
     fn send(&mut self, message: &ToAgent) -> Result<(), SessionError> {

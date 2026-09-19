@@ -11,6 +11,7 @@ mod pacing;
 mod persist;
 mod room;
 mod ruleset;
+mod snapshots;
 mod verdict;
 
 use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -23,13 +24,18 @@ use tpf3mp_proto::Text;
 pub use crate::{
     admin::serve_admin,
     ruleset::{AcceptAll, Ruleset, RulesetFactory},
+    snapshots::SnapshotConfig,
 };
 use crate::{
     admission::{Admission, Decision, Origin},
     directory::{Directory, DirectoryConfig},
     metrics::{Gauges, Metrics},
     room::{RoomEnv, Timeouts},
+    snapshots::Snapshots,
 };
+
+/// How long a shutdown waits for connections to finish ending.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 pub struct ServerConfig {
     pub listen: SocketAddr,
@@ -77,6 +83,10 @@ pub struct ServerConfig {
     /// A member still loading the world this long after the start stops
     /// holding its room until it catches up.
     pub load_timeout: Duration,
+    /// Where and how running games keep world snapshots. `None` keeps none:
+    /// nobody can then join a running game, and a player who can no longer
+    /// resume replays the game from its first turn.
+    pub snapshots: Option<SnapshotConfig>,
 }
 
 impl ServerConfig {
@@ -108,6 +118,7 @@ impl ServerConfig {
             stall_timeout: Duration::from_secs(20),
             // Large worlds take minutes to load.
             load_timeout: Duration::from_secs(300),
+            snapshots: None,
         }
     }
 }
@@ -131,6 +142,7 @@ impl fmt::Debug for ServerConfig {
             .field("abandoned_timeout", &self.abandoned_timeout)
             .field("tick", &self.tick)
             .field("data_dir", &self.data_dir)
+            .field("snapshots", &self.snapshots)
             .finish_non_exhaustive()
     }
 }
@@ -141,6 +153,8 @@ pub enum ServerError {
     Tls(#[from] TlsError),
     #[error("cannot open the UDP socket: {0}")]
     Bind(#[from] io::Error),
+    #[error("cannot open the snapshot store: {0}")]
+    Snapshots(#[from] tpf3mp_snapshot::StoreError),
 }
 
 /// State shared by every connection.
@@ -153,15 +167,22 @@ pub(crate) struct Shared {
     pub(crate) directory: Arc<Directory>,
     pub(crate) server_version: Text<64>,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) snapshots: Option<Arc<Snapshots>>,
 }
 
 pub struct Server {
     endpoint: quinn::Endpoint,
     shared: Arc<Shared>,
+    /// Cloned into every connection's task; counts the ones still running.
+    connections: Arc<()>,
 }
 
 impl Server {
     pub fn bind(config: ServerConfig) -> Result<Self, ServerError> {
+        let snapshots = match &config.snapshots {
+            Some(snapshots) => Some(Arc::new(Snapshots::open(snapshots)?)),
+            None => None,
+        };
         let quic = tpf3mp_net::server_config(config.identity)?;
         let endpoint = quinn::Endpoint::server(quic, config.listen)?;
         let metrics = Arc::new(Metrics::default());
@@ -178,6 +199,7 @@ impl Server {
                     load: config.load_timeout,
                     abandoned: config.abandoned_timeout,
                 },
+                snapshots: snapshots.clone(),
             },
         }));
         let restored = directory.recover();
@@ -199,8 +221,13 @@ impl Server {
             server_version: Text::new(env!("CARGO_PKG_VERSION"))
                 .expect("the crate version is short printable text"),
             metrics,
+            snapshots,
         });
-        Ok(Self { endpoint, shared })
+        Ok(Self {
+            endpoint,
+            shared,
+            connections: Arc::new(()),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -230,6 +257,17 @@ impl Server {
         self.endpoint
             .close(close::SHUTTING_DOWN, b"server shutting down");
         self.endpoint.wait_idle().await;
+        self.shared.directory.shut_down().await;
+        // Once every connection's task has ended, and the server with them,
+        // nothing holds the snapshot store for the next process.
+        let drained = async {
+            while Arc::strong_count(&self.connections) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN, drained).await.is_err() {
+            tracing::warn!("connections were still ending at shutdown");
+        }
     }
 
     fn admit(&self, incoming: quinn::Incoming) {
@@ -241,11 +279,12 @@ impl Server {
         );
         match decision {
             Decision::Accept(handshake) => {
-                tokio::spawn(connection::serve(
-                    incoming,
-                    handshake,
-                    Arc::clone(&self.shared),
-                ));
+                let shared = Arc::clone(&self.shared);
+                let running = Arc::clone(&self.connections);
+                tokio::spawn(async move {
+                    connection::serve(incoming, handshake, shared).await;
+                    drop(running);
+                });
             }
             Decision::Retry => {
                 metrics::increment(&self.shared.metrics.retries_sent);

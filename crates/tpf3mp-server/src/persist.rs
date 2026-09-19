@@ -27,8 +27,10 @@ use tpf3mp_proto::{
 
 /// Version of the log's layout. Version 2 added histories: the start
 /// record names the first, and each recovery logs a turn-stream start
-/// naming the next.
-pub(crate) const FORMAT_VERSION: u16 = 2;
+/// naming the next. Version 3 has the events of protocol snapshots: joins
+/// name the player's platform, departures say whether it was a kick, and
+/// saves appear in the log.
+pub(crate) const FORMAT_VERSION: u16 = 3;
 /// Largest record a log may hold: a turn frame at its cap.
 const MAX_RECORD: usize = TURN_MAX_FRAME + 64;
 const HEADER: usize = 8;

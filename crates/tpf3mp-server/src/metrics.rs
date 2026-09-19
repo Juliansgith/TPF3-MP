@@ -22,6 +22,12 @@ pub(crate) struct Metrics {
     pub(crate) retries_sent: AtomicU64,
     pub(crate) idle_sessions_closed: AtomicU64,
     pub(crate) rooms_abandoned: AtomicU64,
+    pub(crate) saves: AtomicU64,
+    pub(crate) snapshots_agreed: AtomicU64,
+    pub(crate) uploads_failed: AtomicU64,
+    pub(crate) late_joins: AtomicU64,
+    pub(crate) rebases: AtomicU64,
+    pub(crate) snapshot_bytes_served: AtomicU64,
 }
 
 /// Values measured at scrape time rather than counted.
@@ -40,7 +46,7 @@ pub(crate) fn add(counter: &AtomicU64, amount: u64) {
 
 impl Metrics {
     pub(crate) fn render(&self, gauges: &Gauges) -> String {
-        let counters: [(&str, &str, &AtomicU64); 15] = [
+        let counters: [(&str, &str, &AtomicU64); 21] = [
             (
                 "sessions_opened",
                 "Sessions that completed the handshake.",
@@ -103,6 +109,36 @@ impl Metrics {
                 "rooms_abandoned",
                 "Running games closed because nobody returned to them.",
                 &self.rooms_abandoned,
+            ),
+            (
+                "saves",
+                "World saves sealed into running games.",
+                &self.saves,
+            ),
+            (
+                "snapshots_agreed",
+                "Saves the room agreed on and the server received.",
+                &self.snapshots_agreed,
+            ),
+            (
+                "uploads_failed",
+                "Saves a player was asked for and did not deliver.",
+                &self.uploads_failed,
+            ),
+            (
+                "late_joins",
+                "Players who joined a game already running.",
+                &self.late_joins,
+            ),
+            (
+                "rebases",
+                "Diverged replicas given the agreed world again.",
+                &self.rebases,
+            ),
+            (
+                "snapshot_bytes_served",
+                "Compressed snapshot bytes sent to players.",
+                &self.snapshot_bytes_served,
             ),
         ];
         let mut out = String::new();

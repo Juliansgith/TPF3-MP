@@ -2,23 +2,36 @@
 //!
 //! Turns from the server become the messages the hook's
 //! [`Gate`](tpf3mp_bridge::Gate) expects, released at the pace
-//! [`Playout`] sets. What the hook reports becomes intents, progress and
-//! checkpoints for the room.
+//! [`Playout`] sets. What the hook reports becomes intents, progress,
+//! checkpoints and saves for the room.
+//!
+//! A turn stream may start from a world the room agreed on (a player
+//! joining a running game, one who could no longer resume, one rebased
+//! after diverging). The bridge then fetches that world, has the game load
+//! it, and only then lets the stream's turns through.
 
 use std::{
     collections::VecDeque,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use thiserror::Error;
-use tpf3mp_bridge::{BridgeError, MAX_MESSAGE, ToAgent, ToHook, check_version, decode, encode};
+use tokio::{sync::mpsc, task::AbortHandle};
+use tpf3mp_bridge::{
+    BridgeError, MAX_MESSAGE, MAX_PATH, ToAgent, ToHook, check_version, decode, encode,
+};
 use tpf3mp_net::close;
-use tpf3mp_proto::{Invite, JoinRoom, RequestError, Resume, Speed, Text};
+use tpf3mp_proto::{
+    ContentFingerprint, Invite, JoinRoom, LaneDigest, RequestError, Resume, SavedWorld, SnapshotId,
+    Speed, Text, WorldOffer,
+};
+use tpf3mp_snapshot::ManifestId;
 use tracing::{debug, info, warn};
 
 use crate::{
     Action, Client, ClientError, ClientEvent, ConnectOptions, Events, FollowError, Playout,
-    TurnFollower, connect,
+    TurnFollower, Worlds, connect, transfer,
 };
 
 /// The agent's end of the link to the hook.
@@ -79,6 +92,9 @@ pub struct BridgeOptions {
     pub load_timeout: Duration,
     /// The least time between two progress reports to the server.
     pub progress_every: Duration,
+    /// Where worlds are kept. Without it, saves are reported as failed and
+    /// a world the room offers cannot be loaded.
+    pub worlds: Option<Worlds>,
 }
 
 impl Default for BridgeOptions {
@@ -90,6 +106,7 @@ impl Default for BridgeOptions {
             hook_timeout: Duration::from_secs(60),
             load_timeout: Duration::from_secs(600),
             progress_every: Duration::from_millis(20),
+            worlds: None,
         }
     }
 }
@@ -110,6 +127,12 @@ pub enum BridgeFault {
     Follow(#[from] FollowError),
     #[error("lost the server and could not rejoin: {0}")]
     Rejoin(String),
+    #[error("the game loaded its world to run step {got} next, but step {expected} was ordered")]
+    LoadedElsewhere { expected: u64, got: u64 },
+    #[error("the room sent a world to load, but this agent keeps no worlds")]
+    NoWorlds,
+    #[error("the path {0} is too long for the link to the game")]
+    PathTooLong(PathBuf),
 }
 
 /// How a bridged session ended.
@@ -121,7 +144,47 @@ pub enum BridgeEnd {
     Kicked,
     /// The client's events ended.
     EventsEnded,
+    /// The world to load could not be fetched. Rejoining gets a new offer.
+    WorldUnavailable,
 }
+
+/// Where the game's world stands with respect to the turn stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum World {
+    /// The game runs the stream's world.
+    Ready,
+    /// The stream starts from this world, which is being fetched. Nothing
+    /// reaches the game until it has loaded it.
+    Fetching {
+        offer: WorldOffer,
+        next_step: u64,
+        attempt: u64,
+    },
+    /// The game is loading a world, after which it runs `next_step`.
+    Loading { next_step: u64 },
+}
+
+/// Work the bridge handed off, finished.
+#[derive(Debug)]
+enum Done {
+    Ingested {
+        event: u64,
+        lanes: Vec<LaneDigest>,
+        result: Result<(ManifestId, SavedWorld), String>,
+    },
+    Fetched {
+        attempt: u64,
+        result: Result<(PathBuf, ManifestId), String>,
+    },
+    Uploaded {
+        snapshot: SnapshotId,
+        result: Result<u64, String>,
+    },
+}
+
+/// Saves of this game the store keeps, newest last: the room asks for the
+/// newest, and the one before may still be in flight.
+const SAVES_KEPT: usize = 2;
 
 /// Couples one game's hook to one client.
 pub struct Bridge<L> {
@@ -133,7 +196,8 @@ pub struct Bridge<L> {
     outbox: VecDeque<ToHook>,
     hook_ready: bool,
     begun: bool,
-    /// Whether the game has loaded its world.
+    world: World,
+    /// Whether the game has loaded a world since the last load was ordered.
     loaded: bool,
     speed: Speed,
     /// Commands the hook has sent; numbers each one's intent.
@@ -147,11 +211,22 @@ pub struct Bridge<L> {
     wait_until: Option<Instant>,
     hook_beat: (u64, Instant),
     buf: Vec<u8>,
+    done_tx: mpsc::UnboundedSender<Done>,
+    done_rx: mpsc::UnboundedReceiver<Done>,
+    /// Counts fetches, so a result that arrives after a newer offer is
+    /// ignored.
+    attempts: u64,
+    fetch: Option<AbortHandle>,
+    /// Snapshots of the game's own saves, newest last.
+    saved: VecDeque<ManifestId>,
+    /// The world last received.
+    received: Option<ManifestId>,
 }
 
 impl<L: HookLink> Bridge<L> {
     pub fn new(link: L, options: BridgeOptions) -> Self {
         let now = Instant::now();
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
             hook_beat: (link.peer_heartbeat(), now),
             link,
@@ -161,6 +236,7 @@ impl<L: HookLink> Bridge<L> {
             outbox: VecDeque::new(),
             hook_ready: false,
             begun: false,
+            world: World::Ready,
             loaded: false,
             speed: Speed::NORMAL,
             commands: 0,
@@ -169,6 +245,12 @@ impl<L: HookLink> Bridge<L> {
             last_report: now,
             wait_until: None,
             buf: Vec::new(),
+            done_tx,
+            done_rx,
+            attempts: 0,
+            fetch: None,
+            saved: VecDeque::new(),
+            received: None,
         }
     }
 
@@ -188,7 +270,10 @@ impl<L: HookLink> Bridge<L> {
             self.check_hook(now)?;
             self.read_hook(client).await?;
             self.report_progress(client, now).await?;
-            if let (Some(follower), Some(playout)) = (&mut self.follower, &mut self.playout) {
+            // Turns wait while the world they continue is being fetched.
+            if !matches!(self.world, World::Fetching { .. })
+                && let (Some(follower), Some(playout)) = (&mut self.follower, &mut self.playout)
+            {
                 self.wait_until = pump(follower, playout, now, &mut self.outbox);
             }
             self.flush()?;
@@ -199,7 +284,12 @@ impl<L: HookLink> Bridge<L> {
                     let Some(event) = event else {
                         return Ok(BridgeEnd::EventsEnded);
                     };
-                    if let Some(end) = self.on_event(event)? {
+                    if let Some(end) = self.on_event(event, client)? {
+                        return Ok(end);
+                    }
+                }
+                Some(done) = self.done_rx.recv() => {
+                    if let Some(end) = self.on_done(done, client).await? {
                         return Ok(end);
                     }
                 }
@@ -211,6 +301,9 @@ impl<L: HookLink> Bridge<L> {
     /// Tells the hook the session is over, as far as the link still takes
     /// messages.
     pub fn end(&mut self, reason: &str) {
+        if let Some(fetch) = self.fetch.take() {
+            fetch.abort();
+        }
         self.outbox.push_back(ToHook::End {
             reason: Text::lossy(reason),
         });
@@ -223,10 +316,14 @@ impl<L: HookLink> Bridge<L> {
         self.link.heartbeat();
     }
 
-    /// Where to resume the room after reconnecting, or `None` before the
-    /// first turn.
+    /// Where to resume the room after reconnecting. `None` before the first
+    /// turn stream, and while the world a stream starts from is still being
+    /// fetched: the room then offers a world again.
     pub fn resume_point(&self) -> Option<Resume> {
-        self.follower.as_ref().and_then(TurnFollower::resume_point)
+        if matches!(self.world, World::Fetching { .. }) {
+            return None;
+        }
+        self.follower.as_ref().map(TurnFollower::resume_point)
     }
 
     fn check_hook(&mut self, now: Instant) -> Result<(), BridgeFault> {
@@ -250,6 +347,9 @@ impl<L: HookLink> Bridge<L> {
             if !self.hook_ready && !matches!(message, ToAgent::Hello { .. }) {
                 return Err(BridgeFault::Unexpected("a message before its hello"));
             }
+            // What the game reports of a world that is being replaced
+            // describes nothing the room plays.
+            let current = self.world == World::Ready;
             match message {
                 ToAgent::Hello { version, build } => {
                     if self.hook_ready {
@@ -265,6 +365,19 @@ impl<L: HookLink> Bridge<L> {
                     });
                 }
                 ToAgent::Loaded { next_step } => {
+                    let World::Loading {
+                        next_step: expected,
+                    } = self.world
+                    else {
+                        return Err(BridgeFault::Unexpected("a world nobody ordered"));
+                    };
+                    if next_step != expected {
+                        return Err(BridgeFault::LoadedElsewhere {
+                            expected,
+                            got: next_step,
+                        });
+                    }
+                    self.world = World::Ready;
                     // Loaded counts as progress: the server holds the room
                     // until every member has loaded.
                     let progress = next_step.saturating_sub(1);
@@ -277,13 +390,46 @@ impl<L: HookLink> Bridge<L> {
                     client.send_intent(self.commands, payload).await?;
                     self.commands += 1;
                 }
-                ToAgent::Ran { step } => self.progress = Some(step),
-                ToAgent::Checkpoint { step, lanes } => {
+                ToAgent::Ran { step } if current => self.progress = Some(step),
+                ToAgent::Checkpoint { step, lanes } if current => {
                     client.report_checkpoint(step, lanes).await?;
                 }
+                ToAgent::Saved { event, lanes, file } if current => {
+                    self.saved_world(event, lanes, file, client).await?;
+                }
+                ToAgent::Ran { .. } | ToAgent::Checkpoint { .. } | ToAgent::Saved { .. } => {}
                 ToAgent::Log { message } => info!(hook = %message),
             }
         }
+        Ok(())
+    }
+
+    /// The game saved its world at a save event: cut the save into the
+    /// store off this task, then report it (see [`Bridge::on_done`]).
+    async fn saved_world(
+        &mut self,
+        event: u64,
+        lanes: Vec<LaneDigest>,
+        file: Option<Text<MAX_PATH>>,
+        client: &Client,
+    ) -> Result<(), BridgeFault> {
+        let file = file.map(|file| PathBuf::from(file.as_str()));
+        let (Some(worlds), Some(file)) = (self.options.worlds.clone(), file) else {
+            client.report_saved(event, lanes, None).await?;
+            return Ok(());
+        };
+        let done = self.done_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = worlds
+                .ingest(&file)
+                .map(|(manifest, world)| (manifest.id(), world))
+                .map_err(|error| format!("cannot keep the save {}: {error}", file.display()));
+            let _ = done.send(Done::Ingested {
+                event,
+                lanes,
+                result,
+            });
+        });
         Ok(())
     }
 
@@ -310,13 +456,13 @@ impl<L: HookLink> Bridge<L> {
 
     /// Handles one event from the server. Returns how the session ended, if
     /// it did.
-    fn on_event(&mut self, event: ClientEvent) -> Result<Option<BridgeEnd>, BridgeFault> {
+    fn on_event(
+        &mut self,
+        event: ClientEvent,
+        client: &Client,
+    ) -> Result<Option<BridgeEnd>, BridgeFault> {
         match event {
             ClientEvent::TurnStream(start) => {
-                match &mut self.follower {
-                    Some(follower) => follower.restart(&start)?,
-                    None => self.follower = Some(TurnFollower::new(&start)),
-                }
                 // A new stream, perhaps on a new connection: tell it where
                 // the game stands.
                 self.reported = None;
@@ -327,10 +473,35 @@ impl<L: HookLink> Bridge<L> {
                 ));
                 if !self.begun {
                     self.begun = true;
+                    let saves = self.saves_dir();
                     self.outbox.push_back(ToHook::Begin {
                         steps_per_second: start.steps_per_second,
                         checkpoint_interval: start.checkpoint_interval,
+                        saves: path_text(&saves)?,
                     });
+                }
+                let next_step = start.sealed_through.saturating_add(1);
+                match (start.world, &mut self.follower) {
+                    (Some(offer), _) => {
+                        self.follower = Some(TurnFollower::new(&start));
+                        self.fetch_world(offer, next_step, client)?;
+                    }
+                    (None, None) => {
+                        // A new game: every player loads the world it starts
+                        // from.
+                        self.follower = Some(TurnFollower::new(&start));
+                        self.order_load(None, next_step)?;
+                    }
+                    (None, Some(follower)) => match follower.restart(&start) {
+                        Ok(()) => {}
+                        // The game from its first turn, from a server that
+                        // keeps no worlds: start over from the first world.
+                        Err(_) if start.next_event == 1 && start.sealed_through == 0 => {
+                            self.follower = Some(TurnFollower::new(&start));
+                            self.order_load(None, next_step)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    },
                 }
             }
             ClientEvent::Turn(turn) => {
@@ -356,11 +527,172 @@ impl<L: HookLink> Bridge<L> {
             ClientEvent::Diverged { step, lanes } => {
                 self.outbox.push_back(ToHook::Diverged { step, lanes });
             }
+            ClientEvent::Upload { event, snapshot } => self.upload(event, snapshot, client),
             ClientEvent::RoomUpdate(_) => {}
             ClientEvent::Kicked => return Ok(Some(BridgeEnd::Kicked)),
             ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
         }
         Ok(None)
+    }
+
+    /// Handles work that finished off the bridge's task.
+    async fn on_done(
+        &mut self,
+        done: Done,
+        client: &Client,
+    ) -> Result<Option<BridgeEnd>, BridgeFault> {
+        match done {
+            Done::Ingested {
+                event,
+                lanes,
+                result,
+            } => {
+                let world = match result {
+                    Ok((id, world)) => {
+                        self.saved.push_back(id);
+                        while self.saved.len() > SAVES_KEPT {
+                            self.saved.pop_front();
+                        }
+                        self.tidy();
+                        Some(world)
+                    }
+                    Err(error) => {
+                        warn!(%error, "a save of the game could not be kept");
+                        None
+                    }
+                };
+                client.report_saved(event, lanes, world).await?;
+            }
+            Done::Fetched { attempt, result } => {
+                let World::Fetching {
+                    next_step,
+                    attempt: current,
+                    ..
+                } = self.world
+                else {
+                    return Ok(None);
+                };
+                if attempt != current {
+                    return Ok(None);
+                }
+                self.fetch = None;
+                match result {
+                    Ok((file, id)) => {
+                        info!(file = %file.display(), "fetched the world to load");
+                        self.received = Some(id);
+                        self.tidy();
+                        self.order_load(Some(&file), next_step)?;
+                    }
+                    Err(error) => {
+                        warn!(%error, "fetching the world to load failed");
+                        return Ok(Some(BridgeEnd::WorldUnavailable));
+                    }
+                }
+            }
+            Done::Uploaded { snapshot, result } => match result {
+                Ok(bytes) => info!(%snapshot, bytes, "uploaded a save the room asked for"),
+                Err(error) => warn!(%snapshot, %error, "uploading a save failed"),
+            },
+        }
+        Ok(None)
+    }
+
+    /// Starts fetching the world a stream starts from. Whatever the game
+    /// was sent for the world it replaces is void.
+    fn fetch_world(
+        &mut self,
+        offer: WorldOffer,
+        next_step: u64,
+        client: &Client,
+    ) -> Result<(), BridgeFault> {
+        let worlds = self.options.worlds.clone().ok_or(BridgeFault::NoWorlds)?;
+        self.void_world();
+        self.attempts += 1;
+        let attempt = self.attempts;
+        self.world = World::Fetching {
+            offer,
+            next_step,
+            attempt,
+        };
+        info!(snapshot = %offer.snapshot, bytes = offer.size, "fetching the world to load");
+        let opener = client.bulk();
+        let done = self.done_tx.clone();
+        let task = tokio::spawn(async move {
+            let result = transfer::fetch_world(&opener, &worlds, offer, |_| {})
+                .await
+                .map(|(file, manifest)| (file, manifest.id()))
+                .map_err(|error| error.to_string());
+            let _ = done.send(Done::Fetched { attempt, result });
+        });
+        self.fetch = Some(task.abort_handle());
+        Ok(())
+    }
+
+    /// Has the game load a world, then run `next_step`.
+    fn order_load(&mut self, file: Option<&Path>, next_step: u64) -> Result<(), BridgeFault> {
+        let file = file.map(path_text).transpose()?;
+        self.void_world();
+        self.outbox.push_back(ToHook::Load { file, next_step });
+        self.world = World::Loading { next_step };
+        Ok(())
+    }
+
+    /// Forgets what the game was sent for its current world and how far it
+    /// got: a new one replaces it.
+    fn void_world(&mut self) {
+        if let Some(fetch) = self.fetch.take() {
+            fetch.abort();
+        }
+        self.outbox.retain(|message| {
+            !matches!(
+                message,
+                ToHook::Apply(_) | ToHook::Release { .. } | ToHook::Load { .. }
+            )
+        });
+        self.progress = None;
+        self.loaded = false;
+    }
+
+    /// Uploads a save the room asked for.
+    fn upload(&mut self, event: u64, snapshot: SnapshotId, client: &Client) {
+        let Some(worlds) = self.options.worlds.clone() else {
+            warn!(
+                event,
+                "the room asked for a save, but this agent keeps no worlds"
+            );
+            return;
+        };
+        let opener = client.bulk();
+        let done = self.done_tx.clone();
+        tokio::spawn(async move {
+            let result = transfer::upload_world(&opener, &worlds, snapshot)
+                .await
+                .map(|served| served.bytes)
+                .map_err(|error| error.to_string());
+            let _ = done.send(Done::Uploaded { snapshot, result });
+        });
+    }
+
+    /// Keeps only the snapshots still useful: the game's newest saves and
+    /// the world last received. Off the bridge's task.
+    fn tidy(&self) {
+        let Some(worlds) = self.options.worlds.clone() else {
+            return;
+        };
+        let keep: Vec<ManifestId> = self.saved.iter().copied().chain(self.received).collect();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = worlds.keep_only(&keep) {
+                debug!(%error, "cannot tidy the world store");
+            }
+        });
+    }
+
+    /// Where the game writes its saves.
+    fn saves_dir(&self) -> PathBuf {
+        match &self.options.worlds {
+            Some(worlds) => worlds.saves().to_owned(),
+            None => std::env::temp_dir().join("tpf3mp-saves"),
+        }
     }
 
     /// Sends what the hook will take now, in order. Nothing goes out before
@@ -380,12 +712,20 @@ impl<L: HookLink> Bridge<L> {
     }
 }
 
+fn path_text(path: &Path) -> Result<Text<MAX_PATH>, BridgeFault> {
+    Text::new(path.to_string_lossy().into_owned())
+        .map_err(|_| BridgeFault::PathTooLong(path.to_owned()))
+}
+
 /// Where to find the room again after the connection drops.
 #[derive(Debug, Clone)]
 pub struct Rejoin {
     pub options: ConnectOptions,
     pub invite: Invite,
     pub password: Option<Text<64>>,
+    /// This player's game build and mods, for joining the running game
+    /// afresh when it can no longer be resumed.
+    pub content: Option<ContentFingerprint>,
     /// Stop trying after this long without a connection.
     pub give_up_after: Duration,
 }
@@ -401,8 +741,13 @@ pub async fn play<L: HookLink>(
     rejoin: &Rejoin,
 ) -> Result<BridgeEnd, BridgeFault> {
     loop {
-        let reason = match bridge.run(&client, &mut events).await {
-            Ok(BridgeEnd::Closed(reason)) if worth_rejoining(&reason) => reason,
+        match bridge.run(&client, &mut events).await {
+            Ok(BridgeEnd::Closed(reason)) if worth_rejoining(&reason) => {
+                warn!(%reason, "lost the server; rejoining the room");
+            }
+            Ok(BridgeEnd::WorldUnavailable) => {
+                warn!("the world to load was not available; rejoining the room for another");
+            }
             Ok(end) => {
                 bridge.end(&format!("{end:?}"));
                 return Ok(end);
@@ -411,8 +756,7 @@ pub async fn play<L: HookLink>(
                 bridge.end(&fault.to_string());
                 return Err(fault);
             }
-        };
-        warn!(%reason, "lost the server; rejoining the room");
+        }
         drop(client);
         match rejoin_room(bridge, rejoin).await {
             Ok((new_client, new_events)) => {
@@ -445,14 +789,15 @@ fn worth_rejoining(reason: &quinn::ConnectionError) -> bool {
 }
 
 /// Reconnects and rejoins, backing off between attempts and beating for
-/// the hook all the while.
+/// the hook all the while. A room that can no longer resume the game where
+/// it stands is joined afresh, and sends a world to load.
 async fn rejoin_room<L: HookLink>(
     bridge: &mut Bridge<L>,
     rejoin: &Rejoin,
 ) -> Result<(Client, Events), String> {
     let deadline = Instant::now() + rejoin.give_up_after;
     let mut backoff = Duration::from_millis(250);
-    let resume = bridge.resume_point();
+    let mut resume = bridge.resume_point();
     loop {
         let attempt = async {
             let (client, events) = connect(rejoin.options.clone())
@@ -463,21 +808,26 @@ async fn rejoin_room<L: HookLink>(
                     invite: rejoin.invite.clone(),
                     password: rejoin.password.clone(),
                     resume,
+                    content: rejoin.content,
                 })
                 .await
                 .map_err(|error| {
-                    // The room can no longer give these turns back.
-                    let hopeless = error == ClientError::Refused(RequestError::ResumeUnavailable);
-                    (error.to_string(), hopeless)
+                    let gone = error == ClientError::Refused(RequestError::ResumeUnavailable);
+                    (error.to_string(), gone)
                 })?;
             Ok::<_, (String, bool)>((client, events))
         };
         let outcome = keeping_alive(bridge, attempt).await;
         match outcome {
             Ok(rejoined) => return Ok(rejoined),
-            Err((error, true)) => return Err(error),
-            Err((error, false)) if Instant::now() + backoff >= deadline => return Err(error),
-            Err((error, false)) => {
+            // The room no longer has these turns: join without them, for a
+            // world to load. Joining without them cannot be refused so.
+            Err((error, true)) if resume.is_some() => {
+                debug!(%error, "the room cannot resume here; joining afresh");
+                resume = None;
+            }
+            Err((error, _)) if Instant::now() + backoff >= deadline => return Err(error),
+            Err((error, _)) => {
                 debug!(%error, "rejoining failed; trying again");
                 keeping_alive(bridge, tokio::time::sleep(backoff)).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -552,9 +902,11 @@ mod tests {
             room: RoomId(FixedBytes([0; 16])),
             next_turn: 1,
             next_event: 1,
+            sealed_through: 0,
             steps_per_second: 10,
             checkpoint_interval: 10,
             history: 1,
+            world: None,
         }
     }
 
@@ -564,6 +916,7 @@ mod tests {
             step,
             body: EventBody::PlayerLeft {
                 player: PlayerId(FixedBytes([1; 32])),
+                kicked: false,
             },
         }
     }

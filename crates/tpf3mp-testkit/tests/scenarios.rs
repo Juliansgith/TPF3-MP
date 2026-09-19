@@ -9,7 +9,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
 use tpf3mp_net::{ServerIdentity, ServerTrust};
 use tpf3mp_proto::{RoomSettings, Speed};
-use tpf3mp_server::{Server, ServerConfig};
+use tpf3mp_server::{Server, ServerConfig, SnapshotConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -41,12 +41,37 @@ impl TestServer {
         identity: ServerIdentity,
         data: Option<(PathBuf, [u8; 32])>,
     ) -> Self {
+        Self::start_configured(listen, identity, data, None).await
+    }
+
+    /// A server that keeps world snapshots in `snapshots`, so players can
+    /// join running games and diverged replicas are rebased. Games save
+    /// only when someone needs a world, and at most every second.
+    async fn start_saving(
+        listen: SocketAddr,
+        identity: ServerIdentity,
+        data: Option<(PathBuf, [u8; 32])>,
+        snapshots: PathBuf,
+    ) -> Self {
+        let mut config = SnapshotConfig::new(snapshots);
+        config.every = Duration::from_secs(3600);
+        config.min_gap = Duration::from_secs(1);
+        Self::start_configured(listen, identity, data, Some(config)).await
+    }
+
+    async fn start_configured(
+        listen: SocketAddr,
+        identity: ServerIdentity,
+        data: Option<(PathBuf, [u8; 32])>,
+        snapshots: Option<SnapshotConfig>,
+    ) -> Self {
         let trust = ServerTrust::Pinned(identity.leaf().clone());
         let mut config = ServerConfig::new(listen, identity);
         if let Some((dir, secret)) = data {
             config.data_dir = Some(dir);
             config.secret = secret;
         }
+        config.snapshots = snapshots;
         config.ruleset = Arc::new(|| Box::new(ToyRules::default()));
         config.tick = Duration::from_millis(25);
         // Every bot connects from loopback, one address.
@@ -210,6 +235,8 @@ async fn games_behind_the_bridge_and_gate_agree() {
             world_seed: 42,
             act_every: 7 + index,
             target_step: 300,
+            drift_at: None,
+            join_after: None,
         })
         .collect();
     let reports = play_bridged_room(BridgedPlan {
@@ -219,6 +246,7 @@ async fn games_behind_the_bridge_and_gate_agree() {
         settings,
         players,
         deadline: Duration::from_secs(60),
+        worlds: None,
     })
     .await
     .unwrap();
@@ -263,6 +291,8 @@ async fn games_ride_out_a_server_restart() {
             world_seed: 7,
             act_every: 9 + index,
             target_step: 400,
+            drift_at: None,
+            join_after: None,
         })
         .collect();
     let game = tokio::spawn(play_bridged_room(BridgedPlan {
@@ -272,6 +302,7 @@ async fn games_ride_out_a_server_restart() {
         settings,
         players,
         deadline: Duration::from_secs(60),
+        worlds: None,
     }));
 
     // Mid-game, the server is upgraded: it stops, and a new process takes
@@ -360,4 +391,172 @@ async fn the_server_refuses_what_a_company_cannot_afford() {
         assert!(money >= 0, "{} went into debt: {money}", report.name);
     }
     server.stop().await;
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tpf3mp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn saving_players(count: u64, target_step: u64) -> Vec<BridgedPlayer> {
+    (0..count)
+        .map(|index| BridgedPlayer {
+            name: format!("game{index}"),
+            seed: index,
+            world_seed: 42,
+            act_every: 7 + index,
+            target_step,
+            drift_at: None,
+            join_after: None,
+        })
+        .collect()
+}
+
+fn assert_worlds_agree(reports: &[tpf3mp_testkit::fake_hook::HookReport]) {
+    let reference = &reports[0];
+    for (index, report) in reports.iter().enumerate() {
+        assert_eq!(
+            report.lanes, reference.lanes,
+            "game {index} ended in another world"
+        );
+        assert_eq!(report.ran, reference.ran, "game {index} stopped elsewhere");
+        assert!(!report.ended, "game {index}'s session ended early");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_player_joins_a_running_game_from_the_rooms_world() {
+    let root = temp_dir("late-join");
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let server = TestServer::start_saving(
+        "127.0.0.1:0".parse().unwrap(),
+        identity,
+        None,
+        root.join("server"),
+    )
+    .await;
+    let settings = RoomSettings {
+        steps_per_second: 100,
+        input_delay_ms: 60,
+        checkpoint_interval: 20,
+    };
+    let mut players = saving_players(3, 700);
+    // The third player arrives two seconds in, after about 200 steps.
+    players[2].join_after = Some(Duration::from_secs(2));
+    let reports = play_bridged_room(BridgedPlan {
+        server: server.address,
+        server_name: "localhost".into(),
+        trust: server.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(60),
+        worlds: Some(root.join("players")),
+    })
+    .await
+    .unwrap();
+
+    assert_worlds_agree(&reports);
+    assert_eq!(
+        reports[2].received, 1,
+        "the newcomer loaded the room's world"
+    );
+    assert!(
+        reports[..2].iter().all(|report| report.saves >= 1),
+        "the room saved for the newcomer"
+    );
+    for report in &reports {
+        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
+    }
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_diverged_replica_is_rebased_onto_the_agreed_world() {
+    let root = temp_dir("rebase");
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let server = TestServer::start_saving(
+        "127.0.0.1:0".parse().unwrap(),
+        identity,
+        None,
+        root.join("server"),
+    )
+    .await;
+    let settings = RoomSettings {
+        steps_per_second: 100,
+        input_delay_ms: 60,
+        checkpoint_interval: 50,
+    };
+    let mut players = saving_players(3, 800);
+    players[2].drift_at = Some(120);
+    let reports = play_bridged_room(BridgedPlan {
+        server: server.address,
+        server_name: "localhost".into(),
+        trust: server.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(60),
+        worlds: Some(root.join("players")),
+    })
+    .await
+    .unwrap();
+
+    // The drifting replica was told, given the agreed world, and ended in
+    // the same world as everyone else.
+    assert!(!reports[2].diverged.is_empty(), "the drift was noticed");
+    assert_eq!(reports[2].received, 1, "the replica was rebased once");
+    assert_worlds_agree(&reports);
+    for report in &reports[..2] {
+        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
+        assert_eq!(report.received, 0);
+    }
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_room_still_hands_on_its_world() {
+    let root = temp_dir("restored-world");
+    let secret = [9; 32];
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let data = Some((root.join("rooms"), secret));
+    let first = TestServer::start_saving(
+        "127.0.0.1:0".parse().unwrap(),
+        identity.clone(),
+        data.clone(),
+        root.join("snapshots"),
+    )
+    .await;
+    let address = first.address;
+    let settings = RoomSettings {
+        steps_per_second: 50,
+        input_delay_ms: 60,
+        checkpoint_interval: 25,
+    };
+    let mut players = saving_players(3, 500);
+    // One player joins early, so the room saves before the restart; the
+    // last joins after it, from the world the restored room kept.
+    players[1].join_after = Some(Duration::from_secs(1));
+    players[2].join_after = Some(Duration::from_secs(6));
+    let game = tokio::spawn(play_bridged_room(BridgedPlan {
+        server: address,
+        server_name: "localhost".into(),
+        trust: first.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(90),
+        worlds: Some(root.join("players")),
+    }));
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    first.stop().await;
+    let second = TestServer::start_saving(address, identity, data, root.join("snapshots")).await;
+
+    let reports = game.await.unwrap().unwrap();
+    assert_worlds_agree(&reports);
+    assert_eq!(reports[1].received, 1);
+    assert_eq!(reports[2].received, 1);
+    second.stop().await;
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -12,6 +12,7 @@
 mod bytes;
 mod control;
 mod ids;
+mod snapshot;
 mod text;
 mod turn;
 
@@ -26,6 +27,10 @@ pub use control::{
     RoomSettings, RoomView, ServerMessage, Speed, Welcome,
 };
 pub use ids::{Invite, InviteError, PlayerId, RoomId, SessionId, Signature};
+pub use snapshot::{
+    BULK_REQUEST_MAX_FRAME, BULK_RESPONSE_MAX_FRAME, BulkOpen, BulkRequest, BulkResponse,
+    ChunkHash, MAX_CHUNKS_PER_REQUEST, SavedWorld, SnapshotId, WorldOffer,
+};
 pub use text::{Text, TextError};
 pub use turn::{Event, EventBody, Turn, TurnMessage, TurnStart};
 

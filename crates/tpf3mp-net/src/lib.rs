@@ -1,6 +1,7 @@
 //! QUIC endpoints, TLS configuration, player identity and framed stream I/O
 //! shared by the server and the agent.
 
+pub mod bulk;
 pub mod close;
 mod identity;
 mod io;

@@ -30,11 +30,11 @@ use thiserror::Error;
 use tpf3mp_proto::{Event, IntentRejection, LaneDigest, Payload, Speed, Text};
 
 pub use gate::{Gate, GateError, Gated};
-pub use session::{Begin, Game, Notice, Session, SessionError, StepGate};
+pub use session::{Begin, Game, Load, Notice, Session, SessionError, StepGate};
 
 /// Version of these messages. Both sides send it first and refuse a peer
 /// that speaks another.
-pub const BRIDGE_VERSION: u32 = 1;
+pub const BRIDGE_VERSION: u32 = 2;
 /// The link name the agent creates and the hook opens, unless told
 /// otherwise.
 pub const DEFAULT_LINK: &str = "tpf3mp.default";
@@ -42,17 +42,21 @@ pub const DEFAULT_LINK: &str = "tpf3mp.default";
 /// (`tpf3mp_ipc::DEFAULT_MAX_MESSAGE`). An event with the largest intent
 /// payload fits.
 pub const MAX_MESSAGE: usize = 60 * 1024;
+/// Longest file path the link carries, in UTF-8 bytes.
+pub const MAX_PATH: usize = 1024;
 
 /// From the agent to the hook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToHook {
     /// The first message after the link opens.
     Hello { version: u32 },
-    /// A game begins. The hook loads the world and answers
-    /// [`ToAgent::Loaded`].
+    /// A game begins. A [`ToHook::Load`] follows. The hook writes the saves
+    /// the room asks for into `saves`, a directory the agent made for this
+    /// game.
     Begin {
         steps_per_second: u16,
         checkpoint_interval: u32,
+        saves: Text<MAX_PATH>,
     },
     /// Apply this event before running step `event.step`.
     Apply(Event),
@@ -72,6 +76,17 @@ pub enum ToHook {
     },
     /// The game session is over; the game stops waiting at the gate.
     End { reason: Text<128> },
+    /// Load a world, then answer [`ToAgent::Loaded`] with `next_step`, the
+    /// first step that world runs. Everything sent before this is void.
+    ///
+    /// The first load of a game may name no file: the game then loads the
+    /// world every player starts from. Otherwise `file` is a save the room
+    /// agreed on, for a player joining a running game, one who could no
+    /// longer resume, or one whose world diverged.
+    Load {
+        file: Option<Text<MAX_PATH>>,
+        next_step: u64,
+    },
 }
 
 /// From the hook to the agent.
@@ -89,6 +104,13 @@ pub enum ToAgent {
     Checkpoint { step: u64, lanes: Vec<LaneDigest> },
     /// A line for the agent's log.
     Log { message: Text<256> },
+    /// The world was saved at the save event `event`, into `file`, or
+    /// `None` if saving failed. `lanes` are its digests there.
+    Saved {
+        event: u64,
+        lanes: Vec<LaneDigest>,
+        file: Option<Text<MAX_PATH>>,
+    },
 }
 
 #[derive(Debug, Error)]

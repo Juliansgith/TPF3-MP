@@ -22,6 +22,9 @@ const SERVER_CONNECTION_WINDOW: u32 = 512 * 1024;
 /// Turn streams the server may have open to a client at once. There is one
 /// per game the client enters; the rest leave room for one that is ending.
 const TURN_STREAMS: u32 = 4;
+/// Streams a client may have open to the server at once: its control stream
+/// and one bulk stream, for a snapshot.
+const BIDI_STREAMS: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -135,13 +138,13 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// What a client may make the server hold. A client opens exactly one
-/// stream, the control stream, and sends no datagrams; anything else would
-/// only sit in the server's buffers unread.
+/// What a client may make the server hold. A client opens its control
+/// stream and at most one bulk stream at a time, and sends no datagrams;
+/// anything else would only sit in the server's buffers unread.
 fn server_transport() -> quinn::TransportConfig {
     let mut transport = base_transport();
     transport
-        .max_concurrent_bidi_streams(1u32.into())
+        .max_concurrent_bidi_streams(BIDI_STREAMS.into())
         .max_concurrent_uni_streams(0u32.into())
         .stream_receive_window(SERVER_STREAM_WINDOW.into())
         .receive_window(SERVER_CONNECTION_WINDOW.into())

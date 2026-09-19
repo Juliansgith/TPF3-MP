@@ -807,6 +807,38 @@ impl ChunkStore {
             .create_new(true)
             .open(partial)
             .map_err(io_error("create", partial))?;
+        self.stream_file(manifest, &mut file, partial)?;
+        file.sync_all().map_err(io_error("flush", partial))
+    }
+
+    /// Checks a complete snapshot the way assembling it would, without
+    /// writing the file anywhere, then runs `then`. The caller need not hold
+    /// the shared lock.
+    pub(crate) fn verify_then(
+        &self,
+        manifest: &Manifest,
+        then: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let _shared = self.shared();
+        let missing = self.missing(manifest)?;
+        if !missing.is_empty() {
+            return Err(StoreError::Incomplete {
+                missing: missing.len(),
+            });
+        }
+        self.stream_file(manifest, &mut io::sink(), Path::new("(verification)"))?;
+        then()
+    }
+
+    /// Writes the snapshot's file to `out`, checking every chunk as it is
+    /// read and the whole against the manifest's hash. `name` names `out` in
+    /// errors.
+    fn stream_file(
+        &self,
+        manifest: &Manifest,
+        out: &mut impl Write,
+        name: &Path,
+    ) -> Result<(), StoreError> {
         let mut decompressor = codec::decompressor().map_err(StoreError::Compression)?;
         let mut hasher = blake3::Hasher::new();
         for entry in manifest.chunks() {
@@ -828,12 +860,12 @@ impl ChunkStore {
                 });
             }
             hasher.update(&raw);
-            file.write_all(&raw).map_err(io_error("write", partial))?;
+            out.write_all(&raw).map_err(io_error("write", name))?;
         }
         if *hasher.finalize().as_bytes() != manifest.file_hash().0 {
             return Err(StoreError::FileHashMismatch);
         }
-        file.sync_all().map_err(io_error("flush", partial))
+        Ok(())
     }
 
     /// Reads every chunk of `manifest`, which removes the damaged ones.

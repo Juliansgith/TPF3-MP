@@ -5,10 +5,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use ring::hmac;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tpf3mp_proto::{
     CreateRoom, FixedBytes, Invite, MAX_ROOM_MEMBERS, RequestError, RoomId, RoomView,
 };
@@ -21,12 +22,21 @@ use crate::{
     ruleset::RulesetFactory,
 };
 
+/// How long a shutdown waits for each room to finish.
+const ROOM_SHUTDOWN: Duration = Duration::from_secs(5);
+
 pub(crate) struct Directory {
-    rooms: Mutex<HashMap<RoomId, RoomHandle>>,
+    rooms: Mutex<HashMap<RoomId, Registered>>,
     max_rooms: usize,
     key: hmac::Key,
     ruleset: RulesetFactory,
     env: RoomEnv,
+}
+
+/// A room the directory knows: the way to reach it, and its task.
+struct Registered {
+    handle: RoomHandle,
+    task: JoinHandle<()>,
 }
 
 pub(crate) struct DirectoryConfig {
@@ -51,6 +61,17 @@ impl Directory {
     /// cannot be recovered is renamed to `*.broken`, unmodified, and kept
     /// for diagnosis, never deleted. Returns how many rooms were restored.
     pub(crate) fn recover(self: &Arc<Self>) -> usize {
+        let mut held = Vec::new();
+        let restored = self.recover_rooms(&mut held);
+        // Snapshots of rooms that are gone would otherwise stay forever.
+        if let Some(snapshots) = &self.env.snapshots {
+            snapshots.release_all_but(&held);
+        }
+        restored
+    }
+
+    /// Restores the logged rooms, noting the snapshots they hold.
+    fn recover_rooms(self: &Arc<Self>, held: &mut Vec<tpf3mp_snapshot::ManifestId>) -> usize {
         let Some(dir) = &self.env.data_dir else {
             return 0;
         };
@@ -73,6 +94,7 @@ impl Directory {
             match recovered {
                 Ok(Some(room)) => {
                     info!(room = %room.id(), "restored a running room from its log");
+                    held.extend(room.held_snapshots());
                     self.register(room);
                     restored += 1;
                 }
@@ -135,20 +157,33 @@ impl Directory {
         let view = room.view();
         let (commands, receiver) = mpsc::channel(ROOM_QUEUE);
         let handle = RoomHandle::new(commands);
-        rooms.insert(id, handle.clone());
+        let task = tokio::spawn(room.run(receiver, Arc::clone(self)));
+        rooms.insert(
+            id,
+            Registered {
+                handle: handle.clone(),
+                task,
+            },
+        );
         drop(rooms);
         metrics::increment(&self.env.metrics.rooms_created);
-        tokio::spawn(room.run(receiver, Arc::clone(self)));
         Ok((handle, Invite { room: id, token }, view))
     }
 
     fn register(self: &Arc<Self>, room: Room) {
         let (commands, receiver) = mpsc::channel(ROOM_QUEUE);
+        let id = room.id();
+        let task = tokio::spawn(room.run(receiver, Arc::clone(self)));
         self.rooms
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(room.id(), RoomHandle::new(commands));
-        tokio::spawn(room.run(receiver, Arc::clone(self)));
+            .insert(
+                id,
+                Registered {
+                    handle: RoomHandle::new(commands),
+                    task,
+                },
+            );
     }
 
     pub(crate) fn get(&self, id: &RoomId) -> Option<RoomHandle> {
@@ -156,7 +191,26 @@ impl Directory {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
-            .cloned()
+            .map(|registered| registered.handle.clone())
+    }
+
+    /// Stops every room once its connections are gone: without the
+    /// directory's handles, a room's queue closes and its task ends, closing
+    /// its log and letting go of the snapshot store. Waits for each a while.
+    pub(crate) async fn shut_down(&self) {
+        let registered: Vec<Registered> = self
+            .rooms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .map(|(_, registered)| registered)
+            .collect();
+        for Registered { handle, task } in registered {
+            drop(handle);
+            if tokio::time::timeout(ROOM_SHUTDOWN, task).await.is_err() {
+                warn!("a room did not stop in time");
+            }
+        }
     }
 
     pub(crate) fn remove(&self, id: &RoomId) {

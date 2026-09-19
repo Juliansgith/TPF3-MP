@@ -5,6 +5,7 @@
 pub mod bridge;
 mod follower;
 mod playout;
+pub mod transfer;
 
 use std::{
     collections::HashMap,
@@ -27,12 +28,13 @@ use tpf3mp_net::{
 use tpf3mp_proto::{
     CONTROL_MAX_FRAME, ClientMessage, ContentFingerprint, CreateRoom, GameMessage, Hello,
     IntentRejection, Invite, JoinRoom, LaneDigest, PROTOCOL_VERSION, Payload, Platform, PlayerId,
-    RejectReason, Request, RequestError, Response, RoomView, ServerMessage, Speed, TURN_MAX_FRAME,
-    Text, Turn, TurnMessage, TurnStart, Welcome,
+    RejectReason, Request, RequestError, Response, RoomView, SavedWorld, ServerMessage, SnapshotId,
+    Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, Welcome,
 };
 
 pub use follower::{Action, FollowError, TurnFollower};
 pub use playout::Playout;
+pub use transfer::{BulkOpener, Worlds};
 
 /// How long connecting and the handshake may take, so a server that never
 /// answers cannot hang the client.
@@ -145,6 +147,12 @@ pub enum ClientEvent {
     Turn(Turn),
     /// The room's owner removed this player, who cannot come back to it.
     Kicked,
+    /// The room asks for the world this client saved at the save event
+    /// `event`.
+    Upload {
+        event: u64,
+        snapshot: SnapshotId,
+    },
     /// The connection ended.
     Closed(quinn::ConnectionError),
 }
@@ -435,6 +443,29 @@ impl Client {
         self.send(GameMessage::Checkpoint { step, lanes }).await
     }
 
+    /// Reports the world saved at the save event `event`: its lanes, and
+    /// the snapshot this client holds of it, if saving worked.
+    pub async fn report_saved(
+        &self,
+        event: u64,
+        lanes: Vec<LaneDigest>,
+        world: Option<SavedWorld>,
+    ) -> Result<(), ClientError> {
+        self.send(GameMessage::Saved {
+            event,
+            lanes,
+            world,
+        })
+        .await
+    }
+
+    /// Opens bulk streams on this connection, for moving worlds.
+    pub fn bulk(&self) -> BulkOpener {
+        BulkOpener {
+            connection: self.connection.clone(),
+        }
+    }
+
     async fn send(&self, message: GameMessage) -> Result<(), ClientError> {
         self.outgoing
             .send(ClientMessage::Game(message))
@@ -509,6 +540,7 @@ async fn read_control(
             }
             ServerMessage::Diverged { step, lanes } => ClientEvent::Diverged { step, lanes },
             ServerMessage::Kicked => ClientEvent::Kicked,
+            ServerMessage::Upload { event, snapshot } => ClientEvent::Upload { event, snapshot },
             ServerMessage::Welcome(_) | ServerMessage::Reject(_) => {
                 connection.close(close::PROTOCOL_VIOLATION, b"unexpected handshake message");
                 break;

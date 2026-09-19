@@ -27,6 +27,8 @@ pub enum FollowError {
     FrontierRegressed { from: u64, to: u64 },
     #[error("the turn stream restarts at turn {got}, but turn {expected} is next")]
     RestartMismatch { expected: u64, got: u64 },
+    #[error("the turn stream restarts after step {got} was sealed, but step {expected} was")]
+    RestartFrontier { expected: u64, got: u64 },
     #[error("a turn or event number is at the end of its range")]
     Overflow,
     #[error("more than {MAX_QUEUED_BYTES} bytes of events are waiting")]
@@ -58,14 +60,16 @@ pub struct TurnFollower {
 }
 
 impl TurnFollower {
-    /// Starts following a new game, with the world loaded at step 0.
+    /// Starts following a stream with the world it starts from loaded: a
+    /// new game's, or the one the stream offered, which has run every step
+    /// up to `start.sealed_through`.
     pub fn new(start: &TurnStart) -> Self {
         Self {
             next_turn: start.next_turn,
             next_event: start.next_event,
-            sealed_through: 0,
+            sealed_through: start.sealed_through,
             speed: Speed::NORMAL,
-            executed: 0,
+            executed: start.sealed_through,
             queue: VecDeque::new(),
             queued_bytes: 0,
             history: start.history,
@@ -88,16 +92,23 @@ impl TurnFollower {
                 got: start.next_event,
             });
         }
+        if start.sealed_through != self.sealed_through {
+            return Err(FollowError::RestartFrontier {
+                expected: self.sealed_through,
+                got: start.sealed_through,
+            });
+        }
         self.history = start.history;
         Ok(())
     }
 
-    /// Where to resume after reconnecting, or `None` before any turn.
-    pub fn resume_point(&self) -> Option<Resume> {
-        self.last_turn().map(|after_turn| Resume {
-            after_turn,
+    /// Where to resume after reconnecting: after the last turn accepted, or
+    /// where the stream started if none was.
+    pub fn resume_point(&self) -> Resume {
+        Resume {
+            after_turn: self.next_turn.saturating_sub(1),
             history: self.history,
-        })
+        }
     }
 
     /// Checks a turn against the invariants and queues its events. On error
@@ -223,9 +234,11 @@ mod tests {
             room: RoomId(FixedBytes([0; 16])),
             next_turn: 1,
             next_event: 1,
+            sealed_through: 0,
             steps_per_second: 5,
             checkpoint_interval: 10,
             history: 7,
+            world: None,
         }
     }
 
@@ -235,6 +248,7 @@ mod tests {
             step,
             body: EventBody::PlayerLeft {
                 player: PlayerId(FixedBytes([seq as u8; 32])),
+                kicked: false,
             },
         }
     }
@@ -344,17 +358,67 @@ mod tests {
         let mut resumed = start();
         resumed.next_turn = 2;
         resumed.next_event = 2;
+        resumed.sealed_through = 3;
         resumed.history = 8;
         assert_eq!(
             follower.resume_point(),
-            Some(Resume {
+            Resume {
                 after_turn: 1,
                 history: 7
-            })
+            }
         );
         assert_eq!(follower.restart(&resumed), Ok(()));
-        assert_eq!(follower.resume_point().map(|r| r.history), Some(8));
+        assert_eq!(follower.resume_point().history, 8);
+        let mut elsewhere = resumed;
+        elsewhere.sealed_through = 4;
+        assert_eq!(
+            follower.restart(&elsewhere),
+            Err(FollowError::RestartFrontier {
+                expected: 3,
+                got: 4
+            })
+        );
         resumed.next_turn = 1;
         assert!(follower.restart(&resumed).is_err());
+    }
+
+    #[test]
+    fn a_stream_from_a_save_starts_where_the_save_stands() {
+        // The save was the last event of turn 40, taken with steps up to 120
+        // run: the stream starts at turn 41 and event 95.
+        let mut from_save = start();
+        from_save.next_turn = 41;
+        from_save.next_event = 95;
+        from_save.sealed_through = 120;
+        let mut follower = TurnFollower::new(&from_save);
+        assert_eq!(follower.executed(), 120);
+        assert_eq!(
+            follower.resume_point(),
+            Resume {
+                after_turn: 40,
+                history: 7
+            },
+            "a rejoin continues right after the save"
+        );
+        assert_eq!(
+            follower.accept(turn(41, 122, vec![event(95, 120)])),
+            Err(FollowError::EventStep {
+                seq: 95,
+                step: 120,
+                expected: 121
+            }),
+            "events for steps the save already ran are refused"
+        );
+        follower
+            .accept(turn(41, 122, vec![event(95, 121)]))
+            .unwrap();
+        assert_eq!(
+            drain(&mut follower),
+            vec![
+                Action::Apply(event(95, 121)),
+                Action::Execute(121),
+                Action::Execute(122),
+            ]
+        );
     }
 }

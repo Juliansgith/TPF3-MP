@@ -21,10 +21,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tpf3mp-net.workspace = true
 tpf3mp-proto.workspace = true
+tpf3mp-snapshot.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tpf3mp-agent.workspace = true
 
 [lints]

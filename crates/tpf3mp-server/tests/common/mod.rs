@@ -141,6 +141,7 @@ pub fn join(invite: &Invite) -> JoinRoom {
         invite: invite.clone(),
         password: None,
         resume: None,
+        content: None,
     }
 }
 
@@ -283,6 +284,7 @@ impl Player {
                 self.rejections.push((client_seq, reason));
             }
             ClientEvent::Diverged { step, lanes } => self.diverged.push((step, lanes)),
+            ClientEvent::Upload { .. } => {}
             ClientEvent::Kicked => self.kicked = true,
             ClientEvent::Closed(_) => self.closed = true,
         }

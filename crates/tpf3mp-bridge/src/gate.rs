@@ -3,7 +3,7 @@
 use thiserror::Error;
 use tpf3mp_proto::{Event, IntentRejection, Speed, Text};
 
-use crate::ToHook;
+use crate::{MAX_PATH, ToHook};
 
 /// Stands before every step the game runs. The game may run its next step
 /// once the agent has released it; until then the hook reads messages and
@@ -27,6 +27,8 @@ pub struct Gate {
     next_step: u64,
     released: u64,
     ended: bool,
+    /// A load was ordered and the world is not loaded yet.
+    loading: bool,
 }
 
 /// What the game should do with a message read at the gate.
@@ -45,6 +47,11 @@ pub enum Gated {
     },
     /// The session is over; stop waiting at the gate.
     Ended(Text<128>),
+    /// Load this world, then call [`Gate::loaded`].
+    Load {
+        file: Option<Text<MAX_PATH>>,
+        next_step: u64,
+    },
     /// Nothing to do but check [`Gate::may_run`] again.
     Nothing,
 }
@@ -59,6 +66,8 @@ pub enum GateError {
     ReleaseBackwards { from: u64, to: u64 },
     #[error("{0} has no place at the gate")]
     Unexpected(&'static str),
+    #[error("a message arrived while the world loads")]
+    Loading,
     #[error("the step counter is at the end of its range")]
     Overflow,
 }
@@ -71,7 +80,21 @@ impl Gate {
             next_step,
             released: next_step.saturating_sub(1),
             ended: false,
+            loading: false,
         }
+    }
+
+    /// The world ordered by the last [`ToHook::Load`] is loaded, and runs
+    /// `next_step` next. Nothing is released for it yet.
+    pub fn loaded(&mut self, next_step: u64) {
+        self.next_step = next_step;
+        self.released = next_step.saturating_sub(1);
+        self.loading = false;
+    }
+
+    /// Whether a load was ordered that has not finished.
+    pub fn loading(&self) -> bool {
+        self.loading
     }
 
     /// The step the game runs next.
@@ -81,7 +104,7 @@ impl Gate {
 
     /// Whether the game may run its next step now.
     pub fn may_run(&self) -> bool {
-        !self.ended && self.released >= self.next_step
+        !self.ended && !self.loading && self.released >= self.next_step
     }
 
     /// Whether the session has ended.
@@ -91,6 +114,9 @@ impl Gate {
 
     /// Handles one message read while the game waits before its next step.
     pub fn on_message(&mut self, message: ToHook) -> Result<Gated, GateError> {
+        if self.loading && !matches!(message, ToHook::End { .. }) {
+            return Err(GateError::Loading);
+        }
         match message {
             ToHook::Apply(event) => {
                 if event.step != self.next_step {
@@ -121,6 +147,10 @@ impl Gate {
                 self.ended = true;
                 Ok(Gated::Ended(reason))
             }
+            ToHook::Load { file, next_step } => {
+                self.loading = true;
+                Ok(Gated::Load { file, next_step })
+            }
             ToHook::Hello { .. } => Err(GateError::Unexpected("a hello")),
             ToHook::Begin { .. } => Err(GateError::Unexpected("the start of a game")),
         }
@@ -146,6 +176,7 @@ mod tests {
             step,
             body: EventBody::PlayerLeft {
                 player: PlayerId(FixedBytes([1; 32])),
+                kicked: false,
             },
         }
     }
@@ -226,6 +257,35 @@ mod tests {
         );
         assert!(gate.ended());
         assert!(!gate.may_run());
+    }
+
+    #[test]
+    fn a_load_voids_the_old_world_until_the_new_one_is_loaded() {
+        let mut gate = Gate::new(1);
+        gate.on_message(ToHook::Release { through: 9 }).unwrap();
+        let file = Text::new("saves/save-40.sav").unwrap();
+        assert_eq!(
+            gate.on_message(ToHook::Load {
+                file: Some(file.clone()),
+                next_step: 300
+            }),
+            Ok(Gated::Load {
+                file: Some(file),
+                next_step: 300
+            })
+        );
+        assert!(gate.loading());
+        assert!(!gate.may_run(), "nothing runs while the world loads");
+        assert_eq!(
+            gate.on_message(ToHook::Release { through: 400 }),
+            Err(GateError::Loading)
+        );
+        gate.loaded(300);
+        assert!(!gate.loading());
+        assert!(!gate.may_run(), "the new world has nothing released yet");
+        gate.on_message(ToHook::Apply(event(7, 300))).unwrap();
+        gate.on_message(ToHook::Release { through: 300 }).unwrap();
+        assert_eq!(gate.ran(), Ok(300));
     }
 
     #[test]

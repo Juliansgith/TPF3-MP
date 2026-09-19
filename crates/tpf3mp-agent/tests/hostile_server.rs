@@ -12,9 +12,11 @@ fn start(next_turn: u64, next_event: u64) -> TurnStart {
         room: RoomId(FixedBytes([0; 16])),
         next_turn,
         next_event,
+        sealed_through: 0,
         steps_per_second: 5,
         checkpoint_interval: 10,
         history: 0,
+        world: None,
     }
 }
 
@@ -24,6 +26,7 @@ fn event(seq: u64, step: u64) -> Event {
         step,
         body: EventBody::PlayerLeft {
             player: PlayerId(FixedBytes([1; 32])),
+            kicked: false,
         },
     }
 }

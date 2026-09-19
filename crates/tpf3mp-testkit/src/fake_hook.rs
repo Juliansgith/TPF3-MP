@@ -1,13 +1,14 @@
 //! A stand-in for the in-game hook: the toy game as a [`Game`] behind the
 //! real [`Session`], on the real shared-memory link, in a thread of its own
 //! as a game would be. With it a whole session runs end to end without the
-//! game: server, client, bridge, link, session, gate and world. The real
-//! hook differs only in what implements [`Game`].
+//! game: server, client, bridge, link, session, gate and world, including
+//! saving the world and loading one the room sends. The real hook differs
+//! only in what implements [`Game`].
 
-use std::{thread::JoinHandle, time::Duration};
+use std::{path::Path, thread::JoinHandle, time::Duration};
 
 use thiserror::Error;
-use tpf3mp_bridge::{Game, Notice, Session, SessionError, StepGate};
+use tpf3mp_bridge::{Game, Load, Notice, Session, SessionError, StepGate};
 use tpf3mp_proto::{Event, LaneDigest, PlayerId};
 
 use crate::{bot::choose, rng::SplitMix64, toy::ToyWorld};
@@ -26,6 +27,9 @@ pub struct FakeHookConfig {
     pub act_every: u64,
     /// The game stops after running this step.
     pub target_step: u64,
+    /// This replica's simulation deviates once at this step, as a
+    /// platform-specific float difference would.
+    pub drift_at: Option<u64>,
     /// How long to wait for the agent to appear, or to beat again.
     pub patience: Duration,
 }
@@ -40,6 +44,10 @@ pub struct HookReport {
     pub refused: usize,
     pub diverged: Vec<(u64, Vec<u16>)>,
     pub money: Option<i64>,
+    /// Worlds loaded from a save the room sent: a late join or a rebase.
+    pub received: usize,
+    /// Saves the room asked for.
+    pub saves: usize,
     /// The session ended before the target step.
     pub ended: bool,
 }
@@ -48,6 +56,8 @@ pub struct HookReport {
 pub enum HookError {
     #[error(transparent)]
     Session(#[from] SessionError),
+    #[error("cannot load the world {0}")]
+    Load(String),
 }
 
 /// The toy game, as the session sees a game.
@@ -55,6 +65,7 @@ struct ToyGame {
     world: ToyWorld,
     applied: usize,
     refused: usize,
+    saves: usize,
     diverged: Vec<(u64, Vec<u16>)>,
 }
 
@@ -66,6 +77,14 @@ impl Game for ToyGame {
 
     fn lanes(&mut self) -> Vec<LaneDigest> {
         self.world.lanes()
+    }
+
+    fn save(&mut self, file: &Path) -> Result<(), String> {
+        self.saves += 1;
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(file, self.world.save()).map_err(|error| error.to_string())
     }
 
     fn notice(&mut self, notice: Notice) {
@@ -85,22 +104,28 @@ pub fn spawn(config: FakeHookConfig) -> JoinHandle<Result<HookReport, HookError>
 fn run(config: &FakeHookConfig) -> Result<HookReport, HookError> {
     let mut session = Session::attach(&config.link_name, "fake hook", config.patience)?;
     session.wait_for_begin()?;
-    // Loading the world takes a moment in the real game.
     let mut game = ToyGame {
         world: ToyWorld::new(config.world_seed),
         applied: 0,
         refused: 0,
+        saves: 0,
         diverged: Vec::new(),
     };
-    session.loaded(1)?;
-
     let mut rng = SplitMix64::new(config.seed);
     let mut ran = 0;
     let mut commands = 0;
+    let mut received = 0;
     let mut ended = false;
     while ran < config.target_step {
         match session.before_step(&mut game)? {
             StepGate::Run => {}
+            StepGate::Load(load) => {
+                received += usize::from(load.file.is_some());
+                game.world = load_world(config, &load)?;
+                session.loaded(load.next_step)?;
+                ran = load.next_step - 1;
+                continue;
+            }
             StepGate::Ended | StepGate::Wait => {
                 ended = true;
                 break;
@@ -122,6 +147,26 @@ fn run(config: &FakeHookConfig) -> Result<HookReport, HookError> {
         refused: game.refused,
         diverged: game.diverged,
         money: game.world.ledger.money(&config.player),
+        received,
+        saves: game.saves,
         ended,
+    })
+}
+
+/// The world a load names: a save the room sent, or the world every player
+/// starts from. A drift still ahead of the loaded world stays ahead.
+fn load_world(config: &FakeHookConfig, load: &Load) -> Result<ToyWorld, HookError> {
+    let world = match &load.file {
+        Some(file) => {
+            let bytes = std::fs::read(file)
+                .map_err(|error| HookError::Load(format!("{}: {error}", file.display())))?;
+            ToyWorld::load(&bytes)
+                .ok_or_else(|| HookError::Load(format!("{}: not a toy save", file.display())))?
+        }
+        None => ToyWorld::new(config.world_seed),
+    };
+    Ok(match config.drift_at {
+        Some(step) if step >= load.next_step => world.with_drift(step),
+        _ => world,
     })
 }

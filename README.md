@@ -49,19 +49,30 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
   46,048 of TPF2MP's parity vectors replay identically against the original
   Lua.
 - **Snapshots.** A deduplicating chunk store for world saves: 100 scattered
-  edits to a 120 MiB save transfer 8.9 MiB.
+  edits to a 120 MiB save transfer 8.9 MiB. Rooms save together, agree on a
+  save by its lane digests, and hand it to players who join a running game,
+  return too late to resume, or diverge. The saved world survives a server
+  restart.
+- **Game bridge.** The agent drives the game through a step gate on the
+  shared-memory link: events between exactly the right steps, steps on the
+  jitter-buffered schedule, saves and loads on the room's word, and a rejoin
+  after a lost server that the game sees only as a pause.
 - **Hook engine.** Signature resolution with per-build profiles, an x86-64
   detour engine, a shared-memory link to the agent, and a proxy-DLL
   generator. All five known TPF2 targets resolve uniquely.
 - **Test kit.** A toy game whose canonical rules run on the server, bots
-  that play it through the real client, a lossy-network emulator and a load
-  tester. 8 bots over a 150 ms, 2%-loss link agree on every lane, and 400
-  bots in 50 rooms run without a divergence.
+  that play it through the real client, a fake hook that plays it through
+  the real bridge, a lossy-network emulator and a load tester. 8 bots over
+  a 150 ms, 2%-loss link agree on every lane, and 400 bots in 50 rooms run
+  without a divergence. Fake games join running rooms, get rebased after a
+  drift and ride out a server restart, and end in the same world.
 - **Operations.** Prometheus metrics, a hardened container image and a
   deployment runbook.
 
-**In progress:** the agent-side game bridge, snapshot transfer for joining
-running games, and the release-day RE kit.
+**Waiting for the game:** the TPF3-specific hook (build profile, detours,
+the real `Game`), and the release-day measurements in
+[docs/DAY_ONE.md](docs/DAY_ONE.md). **Still to build:** a WebSocket fallback
+for networks that block UDP, and compacting old room logs.
 
 ## Layout
 
@@ -121,7 +132,9 @@ cargo run -p tpf3mp-agent -- join 127.0.0.1:29470 <invite> --pin-cert runtime/de
 cargo run -p tpf3mp-testkit --bin tpf3mp-fakegame -- bob --steps 100
 ```
 
-Both games print the same lane digests at the end.
+Both games print the same lane digests at the end. A server with
+`--data-dir` keeps world snapshots, so a third game can join the running
+room (`join ... --game-link cat`); its game loads the room's world first.
 
 Load-test a server with bots:
 

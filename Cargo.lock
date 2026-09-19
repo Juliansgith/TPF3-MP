@@ -1471,6 +1471,7 @@ dependencies = [
  "tpf3mp-ipc",
  "tpf3mp-net",
  "tpf3mp-proto",
+ "tpf3mp-snapshot",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1535,8 +1536,11 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tpf3mp-proto",
+ "tpf3mp-snapshot",
  "webpki-roots",
 ]
 
@@ -1570,11 +1574,13 @@ dependencies = [
  "quinn",
  "ring",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
  "tpf3mp-agent",
  "tpf3mp-net",
  "tpf3mp-proto",
+ "tpf3mp-snapshot",
  "tracing",
  "tracing-subscriber",
 ]

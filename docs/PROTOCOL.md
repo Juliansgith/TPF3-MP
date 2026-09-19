@@ -8,14 +8,16 @@ background is in [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Connection
 
 One QUIC connection per client (ALPN `tpf3mp`, TLS 1.3 only). It carries
-two kinds of stream:
+three kinds of stream:
 
 - **The control stream** is bidirectional and opened by the client first. It
   carries the handshake, requests and responses, room updates, notices, and
-  the client's game messages (intents, progress, checkpoints).
+  the client's game messages (intents, progress, checkpoints, saves).
 - **The turn stream** is unidirectional, server to client. The server opens it
   when the client enters a running game. It carries the room's ordered event
   log and nothing else.
+- **A bulk stream** is bidirectional and opened by the client, one at a time.
+  It moves one world snapshot, in either direction (see "Snapshots").
 
 Every stream starts with the version preamble. Frames and limits are described
 in the `tpf3mp-proto` crate docs.
@@ -63,6 +65,11 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
 - **Starting.** In the lobby, members declare their **content fingerprint**
   (game build plus mod set digest) and toggle **ready**. The owner can start
   the game only when every member is ready and all fingerprints are equal.
+- **Joining a running game.** A newcomer names its content fingerprint in
+  `JoinRoom`, and it must equal the game's. Every replica sees
+  `PlayerJoined` at one step, and the newcomer receives the room's world to
+  load (see "Snapshots"). Only a server that keeps snapshots allows this;
+  others answer `GameRunning`.
 
 ## Turns: the ordered event log
 
@@ -85,6 +92,11 @@ Invariants every client relies on:
    `Start` message and increase by one; event sequence numbers increase by
    one across turns. A client that sees a gap closes the connection with
    `PROTOCOL_VIOLATION` and reconnects.
+
+A stream's `Start` also says where the world it continues stands: every
+step up to `sealed_through` has run, and every event before `next_event` is
+applied. When it names a `world`, the client loads that world first (see
+"Snapshots").
 
 Together these make every replica apply the same events at the same point in
 simulation time, whatever its latency. Clients enforce them strictly
@@ -187,6 +199,12 @@ server opens a turn stream that starts right after that turn. The new
 connection replaces the old one, which is closed with `REPLACED`. A client
 checks that the stream continues its log exactly (`TurnFollower::restart`).
 
+A server that can no longer resume a client there (the turns left its
+window, or were lost in a crash) answers `ResumeUnavailable`. The client
+then joins without a `Resume`, which says it has no world of this game, and
+receives the room's world to load. A server that keeps no snapshots sends
+the game from its first turn instead.
+
 **Histories.** A room restored after a crash may have lost the last turns
 some clients saw, and from then on it numbers different turns the same way.
 Each restore therefore begins a new history, recorded in the log. The server
@@ -194,14 +212,79 @@ resumes a client only on turns its history shares with the current one; a
 client that saw lost turns is told `ResumeUnavailable`, however many turns
 the room has sealed since.
 
+## Snapshots
+
+A snapshot is a native world save, stored and sent as deduplicated chunks
+(`tpf3mp-snapshot`, described in [SNAPSHOTS.md](SNAPSHOTS.md)). A player who
+joins a running game, one who can no longer resume, and one whose world
+diverged all receive the room's latest agreed snapshot, then follow the
+turns since it. Only a server configured with a snapshot store does this.
+
+**Saving.** The room saves every ten minutes of play, sooner when someone
+waits for a world, but never twice within a minute, and not at all while
+nothing has changed.
+1. It orders a `Save` event, sealed as the last event of its own turn,
+   which runs no new steps. The save point is therefore a turn boundary: a
+   stream from the save starts right after that turn.
+2. Every client that plays through the event saves its world, with every
+   earlier event applied and before the event's step runs. It cuts the save
+   into its chunk store and reports `Saved` with the world's lane digests
+   and the snapshot it holds (or none, if saving failed).
+3. Once every member pacing the room whose stream carries the save has
+   reported, or two minutes have passed, the room judges the lanes as it
+   judges a checkpoint's. A lone report stands: that is how a player alone
+   in a room hands its world on. Members whose lanes differ are told
+   `Diverged`.
+4. The room asks a member whose lanes agreed, earliest in join order first,
+   to `Upload` its snapshot. If it does not start within 30 seconds, or the
+   upload fails, the next one is asked. A snapshot the room already holds
+   needs no upload.
+5. The received snapshot becomes the room's current world. The one before
+   stays for downloads that may still run; older ones are released.
+
+**Receiving a world.** The server opens a turn stream whose `Start` names
+the world, starting right after the save's turn. The client fetches the
+snapshot on a bulk stream, has its game load it, and only then applies the
+stream's turns. Until it has caught up, it does not pace the room. A client
+that cannot fetch the world joins again without a `Resume` and is offered
+the current one.
+
+**Rebasing.** A member found diverged, at a checkpoint or a save, receives
+the first world the room agrees on after the divergence, and the room saves
+soon to have one. A member is rebased at most once every five minutes; a
+replica that keeps diverging is told each time.
+
+**Bulk streams.** The client opens one, sends the version preamble and a
+`BulkOpen`, and reads the server's preamble:
+- `Fetch { snapshot }`: the client fetches a snapshot the room offered to
+  this connection. Any other snapshot is answered `Unavailable`, so nobody
+  can probe the server's store for other rooms' worlds.
+- `Serve { snapshot }`: the client serves a save the room asked it for. The
+  server ends a stream it did not ask for without a request.
+
+Then the fetching side asks for the manifest, which must hash to the
+snapshot's name, and for chunks in batches of at most 256, keeping up to
+16 MiB outstanding. Every chunk must be listed in the manifest, is one zstd
+frame, and is checked against its hash before it is stored; the finished
+file is checked against the manifest's file hash. A server stores received
+chunks compressed by itself, never an uploader's frames. Requests are
+capped at 16 KiB per frame and responses at 11 MiB. A side that sends
+nothing for a minute is given up on.
+
+**Persistence.** Next to each room's log, a pointer file names its current
+snapshot and where it stands. A restored room keeps offering that snapshot
+if the store still holds it and the recovered log reaches it. At start, the
+server releases snapshots no restored room refers to.
+
 ## Slow and misbehaving clients
 
 - **Bounded buffers.** Outbound queues are bounded per client. A client that
   cannot keep up with its turn stream is disconnected; it never makes the
   server buffer without limit or stall other players.
-- **Streams.** A client opens exactly one stream, its control stream, and
-  sends no datagrams; QUIC flow control refuses anything more. The server's
-  receive windows are small: 256 KiB per stream, 512 KiB per connection.
+- **Streams.** A client opens its control stream and at most one bulk
+  stream at a time, and sends no datagrams; QUIC flow control refuses
+  anything more. The server's receive windows are small: 256 KiB per
+  stream, 512 KiB per connection.
 - **Per-address limits.** One address, with an IPv6 /64 counting as one,
   holds at most 8 sessions (more are rejected with `TooManyConnections`)
   and has at most 4 handshakes in progress. Once half of the server's

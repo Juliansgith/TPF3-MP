@@ -257,18 +257,26 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
 
 - **From the agent (`ToHook`):**
   - `Hello`: always first.
-  - `Begin`: a game starts; load the world.
-  - `Apply(event)`: apply this event before its step.
+  - `Begin`: a game starts, and saves go in this directory.
+  - `Load { file, next_step }`: load a world, then run `next_step`. The
+    first load of a game names no file (the world every player starts
+    from). Later loads name a save the room agreed on: for a player who
+    joins a running game, one who could no longer resume, one rebased after
+    diverging. Everything sent before a load is void.
+  - `Apply(event)`: apply this event before its step. A `Save` event is not
+    applied: the session saves the world there (see below).
   - `Release { through }`: steps up to and including this one may run.
   - `Speed`: the room's speed, for display only.
   - `Diverged`, `Refused`: tell the player.
   - `End`: the session is over.
 - **From the hook (`ToAgent`):**
   - `Hello`: always first, with the game build.
-  - `Loaded { next_step }`: the world is ready.
+  - `Loaded { next_step }`: the ordered world is loaded.
   - `Command { payload }`: the player acted; the room orders it.
   - `Ran { step }`: the game ran this step.
   - `Checkpoint { step, lanes }`: digests at a checkpoint.
+  - `Saved { event, lanes, file }`: the world as saved at a save event, and
+    its digests there; no file if saving failed.
   - `Log`: a line for the agent's log.
 - **The step gate.** The game asks the hook's `Gate` before every step. Until
   the step is released, the hook reads messages and applies each event the
@@ -295,8 +303,11 @@ game thread. The game-specific part of the hook implements the `Game` trait
 and calls the session from its detours:
 
 - **Startup.** `Session::attach(DEFAULT_LINK, build, patience)`, then
-  `wait_for_begin()`, then load the world and call `loaded(next_step)`.
-  Call `heartbeat()` while loading.
+  `wait_for_begin()`. The gate's first answer is `StepGate::Load`.
+- **Loading.** Whenever `before_step` or `poll_step` answers
+  `StepGate::Load(load)`, replace the world: with the save `load.file`, or
+  without one with the world every player starts from. Then call
+  `loaded(load.next_step)`. Call `heartbeat()` while loading.
 - **Before each simulation step.**
   - `before_step(&mut game)` blocks until the room releases the step,
     calling `Game::apply` for each event on the way. A pause can hold it
@@ -306,6 +317,10 @@ and calls the session from its detours:
     step is released, and the detour skips the step for that frame.
 - **After each step.** `after_step(&mut game)` reports it, and at
   checkpoint steps sends `Game::lanes()`.
+- **Saving.** At a save event the session calls `Game::save(file)`, then
+  `Game::lanes()`, and reports both. The save must hold everything needed
+  to continue from that point, because it is what other players load. The
+  agent cuts it into its chunk store and deletes the file.
 - **When the player acts.** Capture the action before the game applies it
   locally and call `command(payload)`. The action happens only when the
   room's event comes back through `Game::apply`, on every replica alike.
@@ -318,14 +333,18 @@ still for its patience, never merely because a step is withheld.
 `tpf3mp_testkit::fake_hook` implements `Game` for the toy game and runs it
 through `Session`: the exact code the real hook will run, over the real
 link. The `games_behind_the_bridge_and_gate_agree` scenario runs three of
-them in one room end to end. `tpf3mp-fakegame` does the same as a separate
-process, for trying the stack by hand (see the README). On release day,
-what remains for TPF3 is:
+them in one room end to end; others have a player join a running game,
+rebase a replica that drifted, and hand a world on across a server restart.
+`tpf3mp-fakegame` does the same as a separate process, for trying the stack
+by hand (see the README). On release day, what remains for TPF3 is:
 
 - the build profile with its signatures;
 - the detours that call the session;
 - `Game` for the real world: applying an event means executing the player
-  command it carries, and the lanes are digests of the game state.
+  command it carries, the lanes are digests of the game state, and saving
+  and loading use the game's own save format;
+- checking that a save is complete and loads on every platform
+  (DAY_ONE.md).
 
 ## Release-day procedure: adding a target for a new build
 

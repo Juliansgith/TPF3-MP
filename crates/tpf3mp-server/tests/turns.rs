@@ -341,7 +341,7 @@ async fn a_reconnecting_player_resumes_exactly() {
         executed,
         ..
     } = bob;
-    let resume = follower.as_ref().unwrap().resume_point();
+    let resume = Some(follower.as_ref().unwrap().resume_point());
 
     // Ann builds while Bob is away.
     for seq in 0..5u8 {
@@ -363,6 +363,7 @@ async fn a_reconnecting_player_resumes_exactly() {
             invite,
             password: None,
             resume,
+            content: None,
         })
         .await
         .unwrap();
@@ -394,7 +395,7 @@ async fn a_kicked_player_leaves_the_running_game() {
     // Every replica learns of it through the log, at one step.
     ann.play_until(|p| {
         p.applied.iter().any(
-            |event| matches!(&event.body, EventBody::PlayerLeft { player } if *player == bob_id),
+            |event| matches!(&event.body, EventBody::PlayerLeft { player, .. } if *player == bob_id),
         )
     })
     .await;
@@ -411,13 +412,7 @@ async fn resuming_from_the_future_is_refused() {
     let (players, invite) = start(clients, FAST).await;
     let players = play_all(players, |p| p.executed >= 1).await;
     let identity = Arc::clone(&players[1].test.identity);
-    let history = players[1]
-        .follower
-        .as_ref()
-        .unwrap()
-        .resume_point()
-        .unwrap()
-        .history;
+    let history = players[1].follower.as_ref().unwrap().resume_point().history;
     drop(players);
     let bob = server.client_as(identity, "bob").await;
     let error = bob
@@ -429,6 +424,7 @@ async fn resuming_from_the_future_is_refused() {
                 after_turn: 1_000_000,
                 history,
             }),
+            content: None,
         })
         .await
         .unwrap_err();
@@ -459,7 +455,7 @@ async fn leaving_mid_game_is_an_event() {
     let mut ann = players.remove(0);
     ann.play_until(|p| {
         p.applied.iter().any(
-            |event| matches!(&event.body, EventBody::PlayerLeft { player } if *player == bob_id),
+            |event| matches!(&event.body, EventBody::PlayerLeft { player, .. } if *player == bob_id),
         )
     })
     .await;

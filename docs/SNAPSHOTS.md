@@ -1,9 +1,12 @@
 # Snapshots
 
-Status: implemented in `crates/tpf3mp-snapshot`, 2026-09-19. Not yet wired
-into the protocol; [Integrating with the network layer](#integrating-with-the-network-layer)
-describes what the core needs to add. Measured on synthetic data only: real
-TPF3 saves are a release-day item (see [Limitations](#limitations-and-open-questions)).
+Status: implemented in `crates/tpf3mp-snapshot` and wired into the protocol,
+2026-09-19: rooms save, agree on a save, and hand it to players who join
+late, can no longer resume, or diverged. "Snapshots" in
+[PROTOCOL.md](PROTOCOL.md) describes the flow;
+[Integration](#integration) below says where each part lives. Measured on
+synthetic data only: real TPF3 saves are a release-day item (see
+[Limitations](#limitations-and-open-questions)).
 
 The server keeps the latest agreed native save of every room, and players who
 hot-join, reconnect or are rebased download it (see
@@ -422,142 +425,49 @@ for id in store.pending()? {
 }
 ```
 
-## Integrating with the network layer
+## Integration
 
-ARCHITECTURE.md reserves QUIC bulk streams for snapshots, so a 100 MB+
-transfer never delays sealed turns. The crate does no networking; the core
-needs the following.
+The flow is specified under "Snapshots" in [PROTOCOL.md](PROTOCOL.md). The
+parts:
 
-### Messages
+| part | where |
+|---|---|
+| names on the wire (`SnapshotId`, `ChunkHash`), `BulkOpen`, `BulkRequest`, `BulkResponse`, `WorldOffer`, `SavedWorld`, frame caps | `tpf3mp-proto`, `snapshot.rs` |
+| moving one snapshot over one QUIC stream: `bulk::fetch`, `bulk::serve` | `tpf3mp-net`, `bulk.rs` |
+| when games save, save rounds, uploads, offers, rebases, the pointer file | `tpf3mp-server`, `snapshots.rs` and `room.rs` |
+| bulk streams on the server, with their authorization | `tpf3mp-server`, `connection.rs` |
+| the player's store (`Worlds`), fetching and uploading | `tpf3mp-agent`, `transfer.rs` |
+| saving, fetching and loading around the game | `tpf3mp-agent`, `bridge.rs` |
+| the game's side: `Game::save`, `StepGate::Load` | `tpf3mp-bridge`, `session.rs` |
 
-On the control stream (small, existing framing), the server offers a
-snapshot when a player hot-joins, reconnects or is rebased:
+How the duties this crate leaves to its users are met:
 
-```rust
-SnapshotOffer {
-    manifest: ManifestId,
-    file_size: u64,
-    step: u64, // the simulation step the save belongs to
-}
-```
+- **Manifest authenticity.** A fetch checks that the manifest hashes to the
+  snapshot the turn stream offered (`BulkError::WrongManifest`), and the
+  assembled file against the manifest's file hash.
+- **Authorization.** The server serves a connection only the snapshot the
+  room offered to that connection, and only chunks its manifest lists;
+  anything else is `Unavailable` or a protocol violation.
+- **Bounds.** One bulk stream per connection at a time, 32 at once across a
+  server, requests of at most 256 chunks and 16 KiB, responses of at most
+  11 MiB, and a minute of silence ends a stream. The server's store has a
+  size bound (64 GiB by default).
+- **Untrusted uploads.** The server receives a save through a `ChunkSink`
+  with `recompress_received`, and keeps it only after `ChunkSink::retain`
+  verified the whole file. Which save to fetch is decided by the room's
+  save round, from lane digests, never by one client's say.
+- **Blocking work** runs on Tokio's blocking pool.
 
-On a bulk stream: one bidirectional stream per transfer, opened by the client.
-Variants are appended, never reordered:
+Retention:
 
-```rust
-enum BulkRequest {
-    /// The manifest of an offered snapshot.
-    Manifest { id: ManifestId },
-    /// Up to 256 chunk ids, all from that manifest, in the order wanted.
-    Chunks { ids: Vec<ChunkId> },
-}
-
-enum BulkResponse {
-    /// `Manifest::to_bytes()`, at most MAX_MANIFEST_LEN bytes.
-    Manifest { bytes: Vec<u8> },
-    /// A zstd frame from `read_compressed`, at most MAX_COMPRESSED_CHUNK_LEN
-    /// bytes.
-    Chunk { id: ChunkId, frame: Vec<u8> },
-    /// The server no longer has it, for example after a newer snapshot
-    /// replaced this one. The client asks for the current offer.
-    Unavailable { id: ChunkId },
-}
-```
-
-### Framing
-
-Suggested bulk-stream framing, like the control stream: a little-endian `u32`
-length plus a postcard message, with caps per direction.
-
-- **Client to server:** 16 KiB, enough for 256 ids.
-- **Server to client:** `MAX_MANIFEST_LEN + 64`, about 10.3 MiB, which also
-  covers any chunk frame.
-  - Typical frames are far smaller: at the default parameters, about 61 KiB
-    per 256 MiB of save for the manifest and about 77 KiB per chunk frame.
-  - The cap only bounds a hostile peer.
-  - If the core prefers a smaller cap, split the manifest into ranges. Chunk
-    frames need `MAX_COMPRESSED_CHUNK_LEN + 64`, about 4.02 MiB.
-- **WebSocket fallback:** the same messages. Keep chunk frames below a few MiB
-  so they can be interleaved with turn traffic.
-
-### Server duties
-
-- **Serve only what was offered.** Accept a request only for manifests offered
-  to the session, and only ids listed in them. A set built from
-  `manifest.chunks()` works. Anything else is `PROTOCOL_VIOLATION`, which
-  stops cross-room probing.
-- **Bound the work per session.**
-  - At most 256 ids per request.
-  - A bounded number of requested but unsent bytes per session, for example
-    32 MiB of raw chunk length.
-  - One or two bulk transfers per session.
-  - A node-wide bandwidth budget, since snapshot bandwidth sets node capacity.
-- **Run store calls on blocking threads.** If `read_compressed` returns
-  `Corrupt`, answer `Unavailable` and schedule a fresh snapshot: the server's
-  copy is damaged.
-
-### Client duties
-
-- **Check the manifest.** Decode it with `Manifest::from_bytes` and require
-  `id() == offer.manifest`.
-- **Start or resume.** Use `ChunkSink::open`, or `resume` if `pending()`
-  already lists the id.
-- **Keep the pipe full.** Request `missing()` in batches, with enough
-  outstanding (for example 8–16 MiB) to cover the connection's bandwidth-delay
-  product.
-- **Feed every `Chunk` to `put`.**
-  - `SinkError::Rejected` or `NotInManifest` means the peer broke the protocol:
-    close the stream. The chunk left no trace.
-  - `StoreError::Full`: release snapshots that are no longer needed, run `gc`,
-    then retry.
-- **Finish.** When `progress().is_complete()`, call `finish(save_path)`.
-  - If it fails with `Corrupt`, `missing()` now lists every damaged chunk;
-    request them and finish again.
-  - `SinkError::Inconsistent` means the server sent a manifest its own chunks
-    contradict. The transfer is dropped; report it.
-  - Any error means nothing was published.
-- **Handle a changed offer.** On reconnect, if the offer is a different
-  snapshot, `abandon()` the old sink and open a new one. Chunks already
-  received stay in the store and count for the new transfer.
-
-### Uploads from a replica
-
-The server does not run TPF3, so it first obtains each agreed save from a
-replica's agent. That is the same machinery with the roles swapped:
-
-- the agent ingests its save into its own store and serves chunk requests;
-- the server receives the manifest and pulls what it lacks through a
-  `ChunkSink`.
-
-The uploading client is untrusted.
-
-- The bounded decoding and per-chunk verification protect the server as they
-  protect agents.
-- `recompress_received` keeps an uploader's poorly compressed frames from
-  reaching every player who later downloads the save.
-- Which save counts as agreed, and whether its `FileHash` must match the
-  anchor's report, is a decision for the quorum logic. So is validating the
-  save's contents.
-
-Ingest a save only once the game has finished writing it. The manifest
-describes exactly the bytes that were read.
-
-### Retention
-
-Snapshots stay retained until released, so retention is a matter of calling
-`release` and then `gc`.
-
-- **Server:**
-  - `sync_chunks: true` and `recompress_received: true`;
-  - keep the current agreed snapshot of each room, and release the previous
-    one once no transfer of it is in flight;
-  - run `gc` after a new snapshot is agreed.
-- **Agent:**
-  - `sync_chunks: false`, because synced writes almost halve transfer
-    throughput on Windows and a damaged chunk only costs a re-fetch;
-  - keep the latest snapshot of each world it has played, and release older
-    ones;
-  - run `gc` when `used_bytes()` nears `max_bytes`.
+- **Server:** `sync_chunks` and `recompress_received` on. Each room keeps its
+  current snapshot and the one before; promoting a new one releases the
+  oldest and collects garbage. A closed room releases its snapshots, and a
+  starting server releases snapshots no restored room refers to.
+- **Agent:** `sync_chunks` off. It keeps the game's two newest saves and the
+  world it last received, releases the rest after each save or fetch, and
+  collects garbage then. Saves the game writes are deleted once cut into
+  the store.
 
 ## Toolchain
 

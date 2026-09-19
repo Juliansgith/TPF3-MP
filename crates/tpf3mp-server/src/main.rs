@@ -3,12 +3,13 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tpf3mp_net::ServerIdentity;
-use tpf3mp_server::{Server, ServerConfig, serve_admin};
+use tpf3mp_server::{Server, ServerConfig, SnapshotConfig, serve_admin};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -75,6 +76,30 @@ struct Args {
     /// Open rooms created from one network address.
     #[arg(long, default_value_t = 8)]
     max_rooms_per_address: usize,
+
+    /// Directory for world snapshots, which let players join running games
+    /// and repair diverged ones. Defaults to `snapshots` inside --data-dir;
+    /// without either, the server keeps none and nobody can join a game
+    /// that has started.
+    #[arg(long)]
+    snapshot_dir: Option<PathBuf>,
+
+    /// Keep no world snapshots, even with --data-dir.
+    #[arg(long, conflicts_with = "snapshot_dir")]
+    no_snapshots: bool,
+
+    /// Disk the snapshots may take, in GiB.
+    #[arg(long, default_value_t = 64)]
+    snapshot_gib: u64,
+
+    /// How often a running game saves, in seconds.
+    #[arg(long, default_value_t = 600)]
+    save_every_secs: u64,
+
+    /// The least time between two saves of one game, however many players
+    /// wait for a world, in seconds.
+    #[arg(long, default_value_t = 60)]
+    save_gap_secs: u64,
 }
 
 #[tokio::main]
@@ -111,6 +136,22 @@ async fn main() -> Result<()> {
     config.max_rooms = args.max_rooms;
     config.max_rooms_per_address = args.max_rooms_per_address;
     config.data_dir = args.data_dir.clone();
+    let snapshot_dir = match (&args.snapshot_dir, &args.data_dir) {
+        _ if args.no_snapshots => None,
+        (Some(dir), _) => Some(dir.clone()),
+        (None, Some(data)) => Some(data.join("snapshots")),
+        (None, None) => None,
+    };
+    config.snapshots = snapshot_dir.map(|dir| {
+        let mut snapshots = SnapshotConfig::new(dir);
+        snapshots.max_bytes = args.snapshot_gib.saturating_mul(1 << 30);
+        snapshots.every = Duration::from_secs(args.save_every_secs.max(1));
+        snapshots.min_gap = Duration::from_secs(args.save_gap_secs);
+        snapshots
+    });
+    if config.snapshots.is_none() {
+        warn!("no snapshots: players cannot join games that have started");
+    }
     match &args.secret_file {
         Some(path) => config.secret = load_or_create_secret(path)?,
         None => warn!("no --secret-file: invites will not survive a restart"),

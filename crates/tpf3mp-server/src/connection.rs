@@ -12,19 +12,21 @@ use std::{
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc},
+    sync::{OwnedSemaphorePermit, mpsc, watch},
     time::Instant,
 };
 use tpf3mp_net::{
-    NetError, close, read_message, read_preamble, verify_proof, write_frame, write_message,
-    write_preamble,
+    NetError,
+    bulk::{self, BulkError, Completion},
+    close, read_message, read_preamble, verify_proof, write_frame, write_message, write_preamble,
 };
 use tpf3mp_proto::{
-    CONTROL_MAX_FRAME, ClientMessage, GameMessage, Hello, IntentRejection, MAX_CHECKPOINT_LANES,
-    PROTOCOL_VERSION, PlayerId, Reject, RejectReason, Request, RequestError, Response,
-    ServerMessage, SessionId, TURN_MAX_FRAME, TurnMessage, TurnStart, Welcome,
+    BULK_REQUEST_MAX_FRAME, BULK_RESPONSE_MAX_FRAME, BulkOpen, BulkResponse, CONTROL_MAX_FRAME,
+    ClientMessage, GameMessage, Hello, IntentRejection, MAX_CHECKPOINT_LANES, PROTOCOL_VERSION,
+    PlayerId, Reject, RejectReason, Request, RequestError, Response, ServerMessage, SessionId,
+    TURN_MAX_FRAME, TurnMessage, TurnStart, Welcome,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     Shared,
@@ -32,6 +34,7 @@ use crate::{
     limit::TokenBucket,
     metrics,
     room::{MemberLink, NewMember, Reply, RoomCommand, RoomHandle, TurnFeed},
+    snapshots::{BULK_IDLE, Snapshots},
 };
 
 /// How long a peer gets to acknowledge a final message (a `Reject`, or the
@@ -62,6 +65,8 @@ const PROGRESS_BURST: u32 = 400;
 /// only keeps a flood out of the room's queue.
 const INTENTS_PER_SECOND: u32 = 40;
 const INTENT_BURST: u32 = 80;
+/// Time a client gets to say what a new bulk stream is for.
+const BULK_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
@@ -242,7 +247,7 @@ enum Violation {
     Stream(NetError),
     #[error("a second Hello")]
     SecondHello,
-    #[error("a checkpoint with more than {MAX_CHECKPOINT_LANES} lanes")]
+    #[error("a checkpoint or save with more than {MAX_CHECKPOINT_LANES} lanes")]
     TooManyLanes,
 }
 
@@ -255,6 +260,8 @@ struct Client {
     hello: Hello,
     link: MemberLink,
     room: Option<RoomHandle>,
+    /// The room, for the task that serves bulk streams.
+    rooms: watch::Sender<Option<RoomHandle>>,
     control: Option<mpsc::Receiver<ServerMessage>>,
     turns: Option<mpsc::Receiver<TurnFeed>>,
     requests: TokenBucket,
@@ -281,6 +288,7 @@ impl Client {
             hello,
             link,
             room: None,
+            rooms: watch::Sender::new(None),
             control: Some(control_rx),
             turns: Some(turns_rx),
             requests: TokenBucket::new(REQUESTS_PER_SECOND, REQUEST_BURST),
@@ -296,13 +304,20 @@ impl Client {
         };
         let control_writer = tokio::spawn(write_control(send, control));
         let turn_writer = tokio::spawn(write_turns(self.connection.clone(), turns));
+        let bulk = tokio::spawn(accept_bulk(BulkPeer {
+            connection: self.connection.clone(),
+            shared: Arc::clone(&self.shared),
+            player: self.player,
+            link: self.link.id,
+            rooms: self.rooms.subscribe(),
+        }));
         if let Err(violation) = self.serve(&mut recv).await {
             debug!(player = %self.player, %violation, "closing a client that broke the protocol");
             metrics::increment(&self.shared.metrics.protocol_violations);
             self.connection
                 .close(close::PROTOCOL_VIOLATION, b"protocol violation");
         }
-        if let Some(room) = self.room.take() {
+        if let Some(room) = self.set_room(None) {
             room.notify(RoomCommand::Disconnected {
                 player: self.player,
                 link: self.link.id,
@@ -310,6 +325,13 @@ impl Client {
         }
         control_writer.abort();
         turn_writer.abort();
+        bulk.abort();
+    }
+
+    /// Enters or leaves a room, and returns the room left.
+    fn set_room(&mut self, room: Option<RoomHandle>) -> Option<RoomHandle> {
+        self.rooms.send_replace(room.clone());
+        std::mem::replace(&mut self.room, room)
     }
 
     async fn serve(&mut self, recv: &mut RecvStream) -> Result<(), Violation> {
@@ -358,7 +380,9 @@ impl Client {
                     let allowed = match &message {
                         GameMessage::Intent { .. } => self.intents.take(now, 1),
                         GameMessage::Progress { .. } => self.progress.take(now, 1),
-                        GameMessage::Checkpoint { .. } => true,
+                        // Like checkpoints: the room ignores reports of
+                        // saves it is not deciding.
+                        GameMessage::Checkpoint { .. } | GameMessage::Saved { .. } => true,
                     };
                     if allowed {
                         self.game(message)?;
@@ -394,7 +418,7 @@ impl Client {
                     self.shared
                         .directory
                         .create(self.new_member(), create, share)?;
-                self.room = Some(handle);
+                self.set_room(Some(handle));
                 Ok(Response::RoomCreated { invite, room })
             }
             Request::JoinRoom(join) => {
@@ -413,14 +437,15 @@ impl Client {
                         token: join.invite.token,
                         password: join.password,
                         resume: join.resume,
+                        content: join.content,
                         reply,
                     })
                     .await?;
-                self.room = Some(handle);
+                self.set_room(Some(handle));
                 Ok(Response::RoomJoined(view))
             }
             Request::LeaveRoom => {
-                let handle = self.room.take().ok_or(RequestError::NotInRoom)?;
+                let handle = self.set_room(None).ok_or(RequestError::NotInRoom)?;
                 let player = self.player;
                 handle
                     .request(|reply| RoomCommand::Leave { player, reply })
@@ -479,7 +504,7 @@ impl Client {
             .await
             .is_ok();
         if !member {
-            self.room = None;
+            self.set_room(None);
         }
         member
     }
@@ -493,7 +518,7 @@ impl Client {
         let result = handle.request(|reply| make(player, reply)).await;
         if result == Err(RequestError::NotInRoom) {
             // The room closed or no longer counts us as a member.
-            self.room = None;
+            self.set_room(None);
         }
         result.map(|()| Response::Done)
     }
@@ -536,6 +561,22 @@ impl Client {
                     link: self.link.id,
                     step,
                     lanes,
+                });
+            }
+            GameMessage::Saved {
+                event,
+                lanes,
+                world,
+            } => {
+                if lanes.len() > MAX_CHECKPOINT_LANES {
+                    return Err(Violation::TooManyLanes);
+                }
+                room.notify(RoomCommand::Saved {
+                    player: self.player,
+                    link: self.link.id,
+                    event,
+                    lanes,
+                    world,
                 });
             }
         }
@@ -612,4 +653,143 @@ async fn open_turn_stream(
         write_frame(&mut send, frame).await.map_err(|_| ())?;
     }
     Ok(send)
+}
+
+/// What the task serving a client's bulk streams knows of the client.
+struct BulkPeer {
+    connection: quinn::Connection,
+    shared: Arc<Shared>,
+    player: PlayerId,
+    link: u64,
+    rooms: watch::Receiver<Option<RoomHandle>>,
+}
+
+/// Serves the client's bulk streams, one at a time: the transport lets a
+/// client open no more than its control stream and one other.
+async fn accept_bulk(peer: BulkPeer) {
+    while let Ok((send, recv)) = peer.connection.accept_bi().await {
+        if let Err(error) = bulk_stream(&peer, send, recv).await
+            && error.is_violation()
+        {
+            debug!(player = %peer.player, %error, "closing a client that broke the bulk protocol");
+            metrics::increment(&peer.shared.metrics.protocol_violations);
+            peer.connection
+                .close(close::PROTOCOL_VIOLATION, b"protocol violation");
+            return;
+        }
+    }
+}
+
+/// One bulk stream: the client fetches a snapshot the room offered it, or
+/// uploads a save the room asked it for.
+async fn bulk_stream(
+    peer: &BulkPeer,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<(), BulkError> {
+    let opening = async {
+        let version = read_preamble(&mut recv).await?;
+        write_preamble(&mut send, PROTOCOL_VERSION).await?;
+        if version != PROTOCOL_VERSION {
+            return Err(BulkError::Violation("a bulk stream of another version"));
+        }
+        Ok(read_message::<BulkOpen>(&mut recv, BULK_REQUEST_MAX_FRAME).await?)
+    };
+    let open = tokio::time::timeout(BULK_OPEN_TIMEOUT, opening)
+        .await
+        .map_err(|_| BulkError::Idle(BULK_OPEN_TIMEOUT))??;
+    let room = peer.rooms.borrow().clone();
+    let (Some(snapshots), Some(room)) = (&peer.shared.snapshots, room) else {
+        return refuse(&mut send, open).await;
+    };
+    let (player, link) = (peer.player, peer.link);
+    match open {
+        BulkOpen::Fetch { snapshot } => {
+            let manifest = room
+                .ask(|reply| RoomCommand::Fetch {
+                    player,
+                    link,
+                    snapshot,
+                    reply,
+                })
+                .await
+                .flatten();
+            let Some(manifest) = manifest else {
+                return refuse(&mut send, open).await;
+            };
+            let _permit = transfer_permit(snapshots).await;
+            let served =
+                bulk::serve(&mut send, &mut recv, &snapshots.store, &manifest, BULK_IDLE).await;
+            let _ = send.finish();
+            let served = served?;
+            metrics::add(&peer.shared.metrics.snapshot_bytes_served, served.bytes);
+            debug!(%player, %snapshot, chunks = served.chunks, "served a snapshot");
+            Ok(())
+        }
+        BulkOpen::Serve { snapshot } => {
+            let asked = room
+                .ask(|reply| RoomCommand::Upload {
+                    player,
+                    link,
+                    snapshot,
+                    reply,
+                })
+                .await
+                .unwrap_or(false);
+            if !asked {
+                return refuse(&mut send, open).await;
+            }
+            let _permit = transfer_permit(snapshots).await;
+            let fetched = bulk::fetch(
+                &mut send,
+                &mut recv,
+                &snapshots.store,
+                &bulk::manifest_id(&snapshot),
+                Completion::Retain,
+                BULK_IDLE,
+                |_| {},
+            )
+            .await;
+            let violation = fetched.as_ref().err().is_some_and(BulkError::is_violation);
+            let result = match fetched {
+                Ok(manifest) => Ok(Arc::new(manifest)),
+                Err(error) => Err(error.to_string()),
+            };
+            let kept = result.as_ref().ok().map(|manifest| manifest.id());
+            let told = room
+                .tell(RoomCommand::Uploaded {
+                    player,
+                    snapshot,
+                    result,
+                })
+                .await;
+            if !told
+                && let Some(id) = kept
+                && let Err(error) = snapshots.store.release(&id)
+            {
+                // The room closed meanwhile, and nobody else would release
+                // the save.
+                warn!(%error, "cannot release the save of a closed room");
+            }
+            if violation {
+                return Err(BulkError::Violation("a broken upload"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Ends a bulk stream the server will not serve or receive. A client that
+/// wanted to fetch hears that the snapshot is unavailable; one that wanted
+/// to upload sees the stream end without a request.
+async fn refuse(send: &mut SendStream, open: BulkOpen) -> Result<(), BulkError> {
+    if let BulkOpen::Fetch { .. } = open {
+        write_message(send, &BulkResponse::Unavailable, BULK_RESPONSE_MAX_FRAME).await?;
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
+async fn transfer_permit(snapshots: &Snapshots) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(&snapshots.transfers).acquire_owned().await.ok()
 }

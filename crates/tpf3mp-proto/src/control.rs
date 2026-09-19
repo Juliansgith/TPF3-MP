@@ -9,6 +9,7 @@ use crate::{
     Platform, Text,
     bytes::{FixedBytes, Payload},
     ids::{Invite, PlayerId, RoomId, SessionId, Signature},
+    snapshot::{SavedWorld, SnapshotId},
 };
 
 /// Domain separator for the identity proof in [`Hello`].
@@ -49,6 +50,12 @@ pub enum ServerMessage {
     },
     /// The room's owner removed this player, who cannot come back to it.
     Kicked,
+    /// Upload the world this client saved at the save event `event`: open a
+    /// bulk stream and serve `snapshot` on it.
+    Upload {
+        event: u64,
+        snapshot: SnapshotId,
+    },
 }
 
 /// The client's first message after the preamble.
@@ -124,8 +131,14 @@ pub struct JoinRoom {
     pub invite: Invite,
     pub password: Option<Text<64>>,
     /// For a running game: where this client continues, to receive only
-    /// later turns. `None` receives the game from its first turn.
+    /// later turns. `None` means the client has no world of this game: it
+    /// receives one to load (see `TurnStart::world`), or, from a server that
+    /// keeps no snapshots, the game from its first turn.
     pub resume: Option<Resume>,
+    /// The client's game build and mods, which must match the room's to
+    /// join a running game as a new player. In the lobby, players declare
+    /// theirs with [`Request::DeclareContent`] instead.
+    pub content: Option<ContentFingerprint>,
 }
 
 /// Where a returning client continues a running game.
@@ -284,6 +297,13 @@ pub enum GameMessage {
     Checkpoint {
         step: u64,
         lanes: Vec<LaneDigest>,
+    },
+    /// This client saved its world at the save event `event`, where its
+    /// lanes were these. `world` is `None` if the save failed.
+    Saved {
+        event: u64,
+        lanes: Vec<LaneDigest>,
+        world: Option<SavedWorld>,
     },
 }
 

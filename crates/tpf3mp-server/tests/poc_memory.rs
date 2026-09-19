@@ -114,8 +114,9 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Review finding H3: with quinn's default receive buffers, a peer with a
 /// throwaway key pinned about 21 MiB per connection in streams and datagrams
-/// the server never reads. The server now grants a client its one control
-/// stream and nothing else, with small receive windows.
+/// the server never reads. The server now grants a client its control
+/// stream and one bulk stream, with small receive windows, and nothing
+/// else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
     let _serial = SERIAL.lock().await;
@@ -156,11 +157,17 @@ async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
             .is_err(),
         "no unidirectional streams"
     );
+    // One bulk stream, for snapshots, and it only waits for its first
+    // bytes: the server reads what it is for and nothing more.
+    let _bulk = tokio::time::timeout(refused, connection.open_bi())
+        .await
+        .expect("one bulk stream")
+        .unwrap();
     assert!(
         tokio::time::timeout(refused, connection.open_bi())
             .await
             .is_err(),
-        "no second bidirectional stream"
+        "no third bidirectional stream"
     );
     assert_eq!(connection.max_datagram_size(), None, "no datagrams");
     settle().await;

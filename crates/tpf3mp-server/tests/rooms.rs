@@ -60,6 +60,7 @@ async fn every_bad_invite_fails_the_same_way() {
                 invite,
                 password: password.map(|p| Text::new(p).unwrap()),
                 resume: None,
+                content: None,
             })
             .await
             .unwrap_err();
@@ -71,6 +72,7 @@ async fn every_bad_invite_fails_the_same_way() {
             invite,
             password: Some(Text::new("hunter2").unwrap()),
             resume: None,
+            content: None,
         })
         .await
         .unwrap();

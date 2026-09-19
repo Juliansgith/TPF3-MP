@@ -337,6 +337,7 @@ async fn a_room_password_cannot_be_guessed_at_line_rate() {
                 invite: invite.clone(),
                 password: Some(Text::new(format!("{pin:04}")).unwrap()),
                 resume: None,
+                content: None,
             }),
         };
         burst.extend(tpf3mp_proto::encode_frame(&request, CONTROL_MAX_FRAME).unwrap());
@@ -630,7 +631,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let bob_old = players.pop().unwrap();
     let ann_old = players.pop().unwrap();
     let ann_last = ann_old.follower.as_ref().unwrap().last_turn().unwrap();
-    let ann_resume = ann_old.follower.as_ref().unwrap().resume_point();
+    let ann_resume = Some(ann_old.follower.as_ref().unwrap().resume_point());
 
     // Bob is told his turns are gone, reloads and follows from turn 1...
     let mut bob = Player::new(
@@ -643,7 +644,8 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
         .join_room(JoinRoom {
             invite: invite.clone(),
             password: None,
-            resume: bob_old.follower.as_ref().unwrap().resume_point(),
+            resume: Some(bob_old.follower.as_ref().unwrap().resume_point()),
+            content: None,
         })
         .await;
     assert_eq!(
@@ -678,6 +680,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
             invite,
             password: None,
             resume: ann_resume,
+            content: None,
         })
         .await;
     if resumed.is_ok() {

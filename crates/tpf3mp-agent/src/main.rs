@@ -3,13 +3,14 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use tpf3mp_agent::{
-    Client, ClientEvent, ConnectOptions, Events,
+    Client, ClientEvent, ConnectOptions, Events, Worlds,
     bridge::{self, Bridge, BridgeOptions, Rejoin},
     connect,
 };
 use tpf3mp_net::{CertificateDer, Identity, ServerTrust};
 use tpf3mp_proto::{
-    ContentFingerprint, CreateRoom, FixedBytes, Invite, JoinRoom, RoomSettings, RoomView, Text,
+    ContentFingerprint, CreateRoom, FixedBytes, Invite, JoinRoom, RoomPhase, RoomSettings,
+    RoomView, Text,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -67,6 +68,41 @@ struct Game {
     /// room must declare the same.
     #[arg(long, default_value = "tpf3")]
     content: String,
+
+    /// Where worlds are kept: saves the room agreed on, and worlds received
+    /// to join running games. Defaults to a directory per game link in the
+    /// per-user data directory; two agents cannot share one.
+    #[arg(long)]
+    worlds: Option<PathBuf>,
+
+    /// Space worlds may take, in GiB.
+    #[arg(long, default_value_t = 8)]
+    worlds_gib: u64,
+}
+
+impl Game {
+    /// The digest of what this player's game runs.
+    fn fingerprint(&self) -> Result<ContentFingerprint> {
+        let digest = ring::digest::digest(&ring::digest::SHA256, self.content.as_bytes());
+        let bytes: [u8; 32] = digest
+            .as_ref()
+            .try_into()
+            .context("a SHA-256 digest is 32 bytes")?;
+        Ok(ContentFingerprint(FixedBytes(bytes)))
+    }
+
+    fn open_worlds(&self, link: &str) -> Result<Worlds> {
+        let dir = match &self.worlds {
+            Some(dir) => dir.clone(),
+            None => dirs::data_local_dir()
+                .context("no per-user data directory; pass --worlds")?
+                .join("TPF3-MP")
+                .join("worlds")
+                .join(link),
+        };
+        Worlds::open(&dir, self.worlds_gib << 30)
+            .with_context(|| format!("opening the worlds in {}", dir.display()))
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -136,9 +172,10 @@ async fn main() -> Result<()> {
                 options,
                 invite,
                 password,
+                content: Some(game.fingerprint()?),
                 give_up_after: REJOIN_PATIENCE,
             };
-            play(client, events, game.game_link, rejoin).await?;
+            play(client, events, &game, rejoin).await?;
         }
         Command::Join {
             server,
@@ -150,22 +187,28 @@ async fn main() -> Result<()> {
             let options = options(&server).await?;
             let (client, events) = connect(options.clone()).await?;
             let password = password.map(Text::new).transpose().context("password")?;
+            let content = game.fingerprint()?;
             let room = client
                 .join_room(JoinRoom {
                     invite: invite.clone(),
                     password: password.clone(),
                     resume: None,
+                    content: Some(content),
                 })
                 .await?;
             print_room(&room);
-            get_ready(&client, &game).await?;
+            // A running game was joined as it is; a lobby wants readiness.
+            if room.phase == RoomPhase::Lobby {
+                get_ready(&client, &game).await?;
+            }
             let rejoin = Rejoin {
                 options,
                 invite,
                 password,
+                content: Some(content),
                 give_up_after: REJOIN_PATIENCE,
             };
-            play(client, events, game.game_link, rejoin).await?;
+            play(client, events, &game, rejoin).await?;
         }
     }
     Ok(())
@@ -177,14 +220,7 @@ const REJOIN_PATIENCE: Duration = Duration::from_secs(300);
 
 /// Declares this player's content and readiness.
 async fn get_ready(client: &Client, game: &Game) -> Result<()> {
-    let digest = ring::digest::digest(&ring::digest::SHA256, game.content.as_bytes());
-    let bytes: [u8; 32] = digest
-        .as_ref()
-        .try_into()
-        .context("a SHA-256 digest is 32 bytes")?;
-    client
-        .declare_content(ContentFingerprint(FixedBytes(bytes)))
-        .await?;
+    client.declare_content(game.fingerprint()?).await?;
     client.set_ready(true).await?;
     Ok(())
 }
@@ -211,15 +247,19 @@ async fn start_when_ready(client: &Client, events: &mut Events, players: usize) 
 
 /// Follows the room, through the game when a link name is given. Through
 /// the game, a lost server is rejoined and the room resumed.
-async fn play(client: Client, events: Events, link: Option<String>, rejoin: Rejoin) -> Result<()> {
-    let Some(name) = link else {
+async fn play(client: Client, events: Events, game: &Game, rejoin: Rejoin) -> Result<()> {
+    let Some(name) = &game.game_link else {
         follow(client, events).await;
         return Ok(());
     };
-    let link = tpf3mp_ipc::Link::create(&tpf3mp_ipc::Config::new(&name), tpf3mp_ipc::Role::Agent)
+    let link = tpf3mp_ipc::Link::create(&tpf3mp_ipc::Config::new(name), tpf3mp_ipc::Role::Agent)
         .with_context(|| format!("creating the game link {name}"))?;
     println!("waiting for the game on link {name}");
-    let mut bridge = Bridge::new(link, BridgeOptions::default());
+    let options = BridgeOptions {
+        worlds: Some(game.open_worlds(name)?),
+        ..BridgeOptions::default()
+    };
+    let mut bridge = Bridge::new(link, options);
     tokio::select! {
         ended = bridge::play(&mut bridge, client, events, &rejoin) => match ended {
             Ok(end) => println!("the session ended: {end:?}"),

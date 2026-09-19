@@ -14,9 +14,13 @@ hardened container profile.
 - **A data volume** holding:
   - `/data/invite.key`: losing it invalidates every invite, including those
     of restored games.
-  - `/data/rooms/`: one log per running game, so games survive restarts.
+  - `/data/rooms/`: one log per running game, so games survive restarts,
+    and a pointer to each game's current snapshot.
+  - `/data/rooms/snapshots/`: the world snapshots, deduplicated chunks of
+    the games' saves. At most 64 GiB by default (`--snapshot-gib`).
 
-  Back up both.
+  Back up the key and the logs. Snapshots are rebuilt by the next save, so
+  losing them only makes late joiners wait for one.
 
 ## First deployment
 
@@ -62,7 +66,8 @@ certificate that agents pin with `--pin-cert <file>`.
 - **Metrics.** `http://127.0.0.1:9470/metrics` serves Prometheus text on the
   host: sessions and rooms now, plus counters for handshakes refused,
   protocol violations, turns sealed, events ordered, intents refused,
-  divergences and slow consumers.
+  divergences and slow consumers, and for snapshots: saves, snapshots
+  agreed, failed uploads, late joins, rebases and bytes served.
 - **Health.** `/healthz` returns `ok`.
 - **Logs.** Logs go to stdout (`docker compose logs -f`) and never contain
   IP addresses or invite tokens. `RUST_LOG=debug` adds per-connection
@@ -70,7 +75,9 @@ certificate that agents pin with `--pin-cert <file>`.
 
 A rise in `divergences_total` means replicas disagree with verdicts: look
 at the platforms involved. A rise in `slow_consumers_total` means clients
-cannot keep up with their turn streams.
+cannot keep up with their turn streams. `uploads_failed_total` rising
+while `snapshots_agreed_total` stands still means players' saves do not
+reach the server: late joiners then wait.
 
 ## Upgrades
 
@@ -115,6 +122,25 @@ Persistence details:
   they hold invite and password tags and every command.
 - **Invite key.** Restored games are rejoined with their original invites,
   which only verify with the same `invite.key`.
+
+## Snapshots
+
+With `--data-dir`, the server keeps world snapshots in `snapshots/` inside
+it (`--snapshot-dir` puts them elsewhere, `--no-snapshots` turns them off).
+They let players join a game that has started, rejoin one they can no
+longer resume, and repair replicas that diverged. "Snapshots" in
+PROTOCOL.md describes the flow.
+
+- **When games save.** Every 10 minutes of play (`--save-every-secs`),
+  sooner when a player waits for a world, never twice within a minute
+  (`--save-gap-secs`). Every player's game saves at the same step, which
+  the players see as a short pause, like an autosave.
+- **Traffic.** One player uploads each save; successive saves share most of
+  their chunks, so only what changed moves. A player who joins downloads
+  the whole world once, then only changes. Up to 32 transfers run at once.
+- **Disk.** Each game keeps its current snapshot and the one before; chunks
+  both share are stored once. Closed games release theirs, and at start the
+  server releases snapshots of games that are gone.
 
 ## Capacity
 

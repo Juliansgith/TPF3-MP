@@ -3,6 +3,7 @@
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -12,8 +13,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tpf3mp_agent::{
-    Client, ConnectOptions, Events,
-    bridge::{self, Bridge, BridgeOptions, Rejoin},
+    Client, ConnectOptions, Events, Worlds,
+    bridge::{self, Bridge, BridgeEnd, BridgeFault, BridgeOptions, Rejoin},
     connect,
 };
 use tpf3mp_ipc::{Config as LinkConfig, Link, Role};
@@ -50,7 +51,7 @@ pub async fn play_room(plan: RoomPlan) -> Result<Vec<BotReport>> {
     let names: Vec<&str> = plan.bots.iter().map(|bot| bot.name.as_str()).collect();
     let clients = connect_all(plan.server, &plan.server_name, &plan.trust, &names).await?;
     let seated: Vec<&Client> = clients.iter().map(|(client, _)| client).collect();
-    seat_and_start(&seated, plan.settings).await?;
+    seat_and_start(&seated, seated.len(), plan.settings).await?;
     if plan.speed != Speed::NORMAL {
         clients[0].0.set_speed(plan.speed).await?;
     }
@@ -112,16 +113,20 @@ fn player_options(
     ))
 }
 
-/// Seats every client in one room, the first as its owner, and starts the
-/// game. Returns the room's invite.
-async fn seat_and_start(clients: &[&Client], settings: RoomSettings) -> Result<Invite> {
+/// Seats every client in one room of `max_players` seats, the first as its
+/// owner, and starts the game. Returns the room's invite.
+async fn seat_and_start(
+    clients: &[&Client],
+    max_players: usize,
+    settings: RoomSettings,
+) -> Result<Invite> {
     let Some((owner, others)) = clients.split_first() else {
         bail!("a room needs at least one player");
     };
     let (invite, _) = owner
         .create_room(CreateRoom {
             name: Text::new("testkit").context("room name")?,
-            max_players: u8::try_from(clients.len()).context("too many players")?,
+            max_players: u8::try_from(max_players).context("too many players")?,
             password: None,
             settings,
         })
@@ -132,6 +137,7 @@ async fn seat_and_start(clients: &[&Client], settings: RoomSettings) -> Result<I
                 invite: invite.clone(),
                 password: None,
                 resume: None,
+                content: None,
             })
             .await?;
     }
@@ -151,6 +157,9 @@ pub struct BridgedPlan {
     pub players: Vec<BridgedPlayer>,
     /// How long the games may take to reach their target.
     pub deadline: Duration,
+    /// Where each player keeps its worlds, in a directory of its own name.
+    /// Without it, players can neither save for the room nor join late.
+    pub worlds: Option<PathBuf>,
 }
 
 pub struct BridgedPlayer {
@@ -159,6 +168,10 @@ pub struct BridgedPlayer {
     pub world_seed: u64,
     pub act_every: u64,
     pub target_step: u64,
+    /// This player's world deviates once at this step.
+    pub drift_at: Option<u64>,
+    /// Join the game this long after it started, instead of from the lobby.
+    pub join_after: Option<Duration>,
 }
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
@@ -166,56 +179,68 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
 /// Plays one room through the whole stack a game uses: each player is a
 /// fake hook (the toy game behind the step gate) on a shared-memory link to
 /// its agent's bridge. An agent that loses the server rejoins the room and
-/// resumes, as the real one does. Returns the hooks' reports in seat order.
+/// resumes, as the real one does; a player who joins late receives the
+/// world from the room. Returns the hooks' reports in plan order.
 pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
-    let mut connected = Vec::with_capacity(plan.players.len());
-    for player in &plan.players {
+    let mut starting = Vec::new();
+    for player in plan.players.iter().filter(|p| p.join_after.is_none()) {
         let options = player_options(plan.server, &plan.server_name, &plan.trust, &player.name)?;
         let (client, events) = connect(options.clone())
             .await
             .context("connecting a player")?;
-        connected.push((options, client, events));
+        starting.push((options, client, events));
     }
-    let seated: Vec<&Client> = connected.iter().map(|(_, client, _)| client).collect();
-    let invite = seat_and_start(&seated, plan.settings).await?;
+    let seated: Vec<&Client> = starting.iter().map(|(_, client, _)| client).collect();
+    let invite = seat_and_start(&seated, plan.players.len(), plan.settings).await?;
+    let started = tokio::time::Instant::now();
 
-    let mut hooks = Vec::with_capacity(connected.len());
-    let mut bridges = Vec::with_capacity(connected.len());
-    for ((options, client, events), player) in connected.into_iter().zip(&plan.players) {
-        let rejoin = Rejoin {
-            options,
-            invite: invite.clone(),
-            password: None,
-            give_up_after: plan.deadline,
-        };
-        let link_name = format!(
-            "tpf3mp-bridged-{}-{}",
-            std::process::id(),
-            NEXT_LINK.fetch_add(1, Ordering::Relaxed)
-        );
-        let link = Link::create(&LinkConfig::new(&link_name), Role::Agent)?;
-        hooks.push(fake_hook::spawn(FakeHookConfig {
-            link_name,
-            player: client.player(),
-            seed: player.seed,
-            world_seed: player.world_seed,
-            act_every: player.act_every,
-            target_step: player.target_step,
-            patience: plan.deadline,
-        }));
-        bridges.push(tokio::spawn(async move {
-            let mut bridge = Bridge::new(link, BridgeOptions::default());
-            bridge::play(&mut bridge, client, events, &rejoin).await
-        }));
+    let mut games: Vec<Option<(Hook, BridgeTask)>> = plan.players.iter().map(|_| None).collect();
+    let starters = plan
+        .players
+        .iter()
+        .enumerate()
+        .filter(|(_, player)| player.join_after.is_none());
+    for ((index, player), (options, client, events)) in starters.zip(starting) {
+        games[index] = Some(play_through_hook(
+            &plan, player, &invite, options, client, events,
+        )?);
+    }
+    let mut late: Vec<(usize, &BridgedPlayer, Duration)> = plan
+        .players
+        .iter()
+        .enumerate()
+        .filter_map(|(index, player)| player.join_after.map(|after| (index, player, after)))
+        .collect();
+    late.sort_by_key(|(_, _, after)| *after);
+    for (index, player, after) in late {
+        tokio::time::sleep_until(started + after).await;
+        let options = player_options(plan.server, &plan.server_name, &plan.trust, &player.name)?;
+        let (client, events) = connect(options.clone())
+            .await
+            .context("connecting a late player")?;
+        client
+            .join_room(JoinRoom {
+                invite: invite.clone(),
+                password: None,
+                resume: None,
+                content: Some(TOY_CONTENT),
+            })
+            .await
+            .context("joining the running game")?;
+        games[index] = Some(play_through_hook(
+            &plan, player, &invite, options, client, events,
+        )?);
     }
 
-    let mut reports = Vec::with_capacity(hooks.len());
-    for hook in hooks {
+    let mut reports = Vec::with_capacity(games.len());
+    let mut bridges = Vec::with_capacity(games.len());
+    for (hook, bridge) in games.into_iter().flatten() {
         let report = tokio::task::spawn_blocking(move || hook.join())
             .await
             .context("waiting for a game")?
             .map_err(|_| anyhow::anyhow!("a game panicked"))?;
         reports.push(report.context("a game failed")?);
+        bridges.push(bridge);
     }
     for bridge in bridges {
         if bridge.is_finished() {
@@ -225,6 +250,58 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
         bridge.abort();
     }
     Ok(reports)
+}
+
+type Hook = std::thread::JoinHandle<Result<HookReport, fake_hook::HookError>>;
+type BridgeTask = tokio::task::JoinHandle<Result<BridgeEnd, BridgeFault>>;
+
+/// Starts a player's fake game and the bridge between it and its client.
+fn play_through_hook(
+    plan: &BridgedPlan,
+    player: &BridgedPlayer,
+    invite: &Invite,
+    options: ConnectOptions,
+    client: Client,
+    events: Events,
+) -> Result<(Hook, BridgeTask)> {
+    let rejoin = Rejoin {
+        options,
+        invite: invite.clone(),
+        password: None,
+        content: Some(TOY_CONTENT),
+        give_up_after: plan.deadline,
+    };
+    let worlds = match &plan.worlds {
+        Some(dir) => Some(
+            Worlds::open(&dir.join(&player.name), 1 << 30).context("opening a player's worlds")?,
+        ),
+        None => None,
+    };
+    let link_name = format!(
+        "tpf3mp-bridged-{}-{}",
+        std::process::id(),
+        NEXT_LINK.fetch_add(1, Ordering::Relaxed)
+    );
+    let link = Link::create(&LinkConfig::new(&link_name), Role::Agent)?;
+    let hook = fake_hook::spawn(FakeHookConfig {
+        link_name,
+        player: client.player(),
+        seed: player.seed,
+        world_seed: player.world_seed,
+        act_every: player.act_every,
+        target_step: player.target_step,
+        drift_at: player.drift_at,
+        patience: plan.deadline,
+    });
+    let bridge = tokio::spawn(async move {
+        let options = BridgeOptions {
+            worlds,
+            ..BridgeOptions::default()
+        };
+        let mut bridge = Bridge::new(link, options);
+        bridge::play(&mut bridge, client, events, &rejoin).await
+    });
+    Ok((hook, bridge))
 }
 
 /// Latency percentiles over every report, in milliseconds: p50, p95, p99, max.

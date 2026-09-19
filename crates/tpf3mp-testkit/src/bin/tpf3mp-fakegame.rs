@@ -41,17 +41,20 @@ fn main() -> Result<()> {
         world_seed: args.world_seed,
         act_every: args.act_every,
         target_step: args.steps,
+        drift_at: None,
         patience: Duration::from_secs(3600),
     })
     .join()
     .map_err(|_| anyhow::anyhow!("the game panicked"))?
     .context("the game stopped")?;
     println!(
-        "ran {} steps, applied {} events, sent {} commands ({} refused), {} divergences{}",
+        "ran {} steps, applied {} events, sent {} commands ({} refused), saved {} times, loaded {} worlds from the room, {} divergences{}",
         report.ran,
         report.applied,
         report.commands,
         report.refused,
+        report.saves,
+        report.received,
         report.diverged.len(),
         if report.ended {
             "; the session ended"

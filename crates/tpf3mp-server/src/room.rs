@@ -16,13 +16,14 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::MissedTickBehavior,
 };
-use tpf3mp_net::close;
+use tpf3mp_net::{bulk, close};
 use tpf3mp_proto::{
     ContentFingerprint, Event, EventBody, FRAME_HEADER_LEN, FixedBytes, IntentRejection,
     LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError, Resume, RoomId, RoomPhase,
-    RoomSettings, RoomView, ServerMessage, Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage,
-    TurnStart, decode_frame, encode_frame,
+    RoomSettings, RoomView, SavedWorld, ServerMessage, SnapshotId, Speed, TURN_MAX_FRAME, Text,
+    Turn, TurnMessage, TurnStart, WorldOffer, decode_frame, encode_frame,
 };
+use tpf3mp_snapshot::{Manifest, ManifestId};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -33,6 +34,10 @@ use crate::{
     pacing::Pacer,
     persist::{self, LogError, RoomLog, StartMember, StartRecord},
     ruleset::Ruleset,
+    snapshots::{
+        self, Agreed, Candidates, Pointer, SAVE_DEADLINE, SavePoint, SaveReport, SaveRound, Saves,
+        Snapshots, UPLOAD_START, Upload,
+    },
     verdict::{self, Report, Verdict},
 };
 
@@ -70,6 +75,10 @@ const RESUME_WINDOW_BYTES: usize = 64 << 20;
 /// settings. Recovery refuses logs that do, so arithmetic on steps never
 /// overflows.
 const MAX_FRONTIER: u64 = 1 << 48;
+/// The least time between two rebases of one member. A replica that keeps
+/// diverging is told so every time, but reloading it more often would only
+/// keep its player out of the game.
+const REBASE_GAP: Duration = Duration::from_secs(300);
 
 /// The channels to one connection of a member.
 #[derive(Clone)]
@@ -110,6 +119,7 @@ pub(crate) enum RoomCommand {
         token: FixedBytes<32>,
         password: Option<Text<64>>,
         resume: Option<Resume>,
+        content: Option<ContentFingerprint>,
         reply: Reply<RoomView>,
     },
     Leave {
@@ -166,6 +176,37 @@ pub(crate) enum RoomCommand {
         step: u64,
         lanes: Vec<LaneDigest>,
     },
+    Saved {
+        player: PlayerId,
+        link: u64,
+        event: u64,
+        lanes: Vec<LaneDigest>,
+        world: Option<SavedWorld>,
+    },
+    /// A member's connection wants to fetch a snapshot. The room answers
+    /// with its manifest only if it offered that snapshot to that
+    /// connection.
+    Fetch {
+        player: PlayerId,
+        link: u64,
+        snapshot: SnapshotId,
+        reply: oneshot::Sender<Option<Arc<Manifest>>>,
+    },
+    /// A member's connection starts to upload a save. The room answers
+    /// whether it asked that member for that save.
+    Upload {
+        player: PlayerId,
+        link: u64,
+        snapshot: SnapshotId,
+        reply: oneshot::Sender<bool>,
+    },
+    /// An upload ended: the save is in the store, verified and retained, or
+    /// it failed.
+    Uploaded {
+        player: PlayerId,
+        snapshot: SnapshotId,
+        result: Result<Arc<Manifest>, String>,
+    },
 }
 
 /// A connection's way to reach a room.
@@ -197,6 +238,23 @@ impl RoomHandle {
     /// or its queue is full.
     pub(crate) fn notify(&self, command: RoomCommand) -> bool {
         self.commands.try_send(command).is_ok()
+    }
+
+    /// Sends a command that carries its own reply channel and waits for the
+    /// answer. `None` when the room is gone.
+    pub(crate) async fn ask<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<T>) -> RoomCommand,
+    ) -> Option<T> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(make(reply)).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Queues a command, waiting while the queue is full: for news the room
+    /// must not miss. Returns false when the room is gone.
+    pub(crate) async fn tell(&self, command: RoomCommand) -> bool {
+        self.commands.send(command).await.is_ok()
     }
 }
 
@@ -314,6 +372,27 @@ struct Member {
     advanced: Instant,
     intents: TokenBucket,
     payload_bytes: TokenBucket,
+    /// What this member must receive before it can follow the game.
+    needs: Needs,
+    /// The snapshot this member's connection may fetch.
+    offered: Option<SnapshotId>,
+    /// When the room last rebased this member.
+    rebased: Option<Instant>,
+    /// The first event of this member's turn stream: it can report only
+    /// saves from there on.
+    stream_from: u64,
+}
+
+/// What a member of a running game must receive before it can follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Needs {
+    Nothing,
+    /// A world: it joined the running game, or could no longer resume.
+    World,
+    /// A world agreed on at or after this step, where its own diverged.
+    Rebase {
+        after: u64,
+    },
 }
 
 /// How long the room waits for a member before it stops holding everyone
@@ -358,6 +437,8 @@ struct Game {
     /// [`RESUME_WINDOW`] of them, starting with turn `log_first_turn`.
     log: VecDeque<LoggedTurn>,
     log_first_turn: u64,
+    /// The frontier of the turn before `log_first_turn`.
+    sealed_before_log: u64,
     /// Bytes of the turns in `log`.
     log_bytes: usize,
     resume_window: usize,
@@ -373,6 +454,7 @@ struct Game {
     /// Every history of the game, oldest first; the last is current. A new
     /// one begins at each recovery, after the last turn logged.
     histories: Vec<History>,
+    saves: Saves,
 }
 
 /// A stretch of a game's turns that clients can resume on.
@@ -390,7 +472,23 @@ struct Round {
 
 struct LoggedTurn {
     first_event: u64,
+    sealed_through: u64,
     frame: Arc<[u8]>,
+}
+
+/// Where a turn stream starts, and the sealed turns it starts with.
+struct Stream {
+    next_turn: u64,
+    next_event: u64,
+    sealed_through: u64,
+    backlog: Vec<Arc<[u8]>>,
+}
+
+/// How a seated member comes back.
+enum Rejoin {
+    Lobby,
+    Stream(TurnFeed),
+    World,
 }
 
 pub(crate) struct Room {
@@ -417,6 +515,12 @@ pub(crate) struct Room {
     /// Counts this room against the address that created it until it
     /// closes. Restored rooms have none.
     _share: Option<RoomShare>,
+    /// The game build and mods of a running game, which players who join
+    /// it must match.
+    content: Option<ContentFingerprint>,
+    /// The server's snapshots; `None` if it keeps none, and then nobody can
+    /// join a running game.
+    snapshots: Option<Arc<Snapshots>>,
     closed: bool,
 }
 
@@ -427,6 +531,7 @@ pub(crate) struct RoomEnv {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) timeouts: Timeouts,
+    pub(crate) snapshots: Option<Arc<Snapshots>>,
 }
 
 /// Why a room log could not be turned back into a room.
@@ -486,6 +591,8 @@ impl Room {
             password_guard: PasswordGuard::new(),
             banned: BTreeSet::new(),
             _share: Some(spec.share),
+            content: None,
+            snapshots: spec.env.snapshots,
             closed: false,
         };
         room.members.push(Member::new(owner));
@@ -515,7 +622,9 @@ impl Room {
             return Err(RecoverError::Misnamed);
         }
         let mut game = Game::new(start.settings, start.history);
-        let mut departed = BTreeSet::new();
+        // Who sits at the table, in join order, and who was removed.
+        let mut seated: Vec<(PlayerId, Text<32>, Platform)> = Vec::new();
+        let mut banned = BTreeSet::new();
         let mut index = 0;
         while let Some(frame) = reader.next_record()? {
             let turn = match frame
@@ -551,17 +660,26 @@ impl Room {
                 game.next_event += 1;
                 ruleset.apply(event);
                 match &event.body {
-                    EventBody::PlayerLeft { player } => {
-                        departed.insert(*player);
+                    EventBody::PlayerLeft { player, kicked } => {
+                        seated.retain(|(seat, ..)| seat != player);
+                        if *kicked {
+                            banned.insert(*player);
+                        }
                     }
-                    EventBody::PlayerJoined { player, .. } => {
-                        departed.remove(player);
+                    EventBody::PlayerJoined {
+                        player,
+                        name,
+                        platform,
+                    } => {
+                        seated.retain(|(seat, ..)| seat != player);
+                        seated.push((*player, name.clone(), *platform));
                     }
-                    EventBody::Command { .. } => {}
+                    EventBody::Command { .. } | EventBody::Save => {}
                 }
             }
             game.remember(LoggedTurn {
                 first_event,
+                sealed_through: turn.sealed_through,
                 frame: Arc::from(frame),
             });
             game.next_turn += 1;
@@ -571,27 +689,39 @@ impl Room {
             index += 1;
         }
         game.pacer.resume_at(game.sealed_through);
-        let members: Vec<Member> = start
-            .members
+        // Every player started with the same content, and players who joined
+        // later had to match it.
+        let content = start.members.first().and_then(|member| member.content);
+        let members: Vec<Member> = seated
             .into_iter()
-            .filter(|member| !departed.contains(&member.player))
-            .map(|member| Member {
-                player: member.player,
-                name: member.name,
-                platform: member.platform,
+            .map(|(player, name, platform)| Member {
+                player,
+                name,
+                platform,
                 ready: true,
-                content: member.content,
+                content,
                 link: None,
                 streaming: false,
                 pace: Pace::CatchingUp(None),
                 advanced: Instant::now(),
                 intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
                 payload_bytes: TokenBucket::new(PAYLOAD_BYTES_PER_SECOND, PAYLOAD_BURST),
+                needs: Needs::Nothing,
+                offered: None,
+                rebased: None,
+                stream_from: 0,
             })
             .collect();
         if members.is_empty() {
             reader.delete()?;
+            if let Some(dir) = &env.data_dir {
+                Pointer::remove(dir, &start.id);
+            }
             return Ok(None);
+        }
+        if let (Some(dir), Some(snapshots)) = (&env.data_dir, &env.snapshots) {
+            game.saves.current = recover_snapshot(dir, &start.id, snapshots, &game);
+            game.saves.last_point = game.saves.current.as_ref().map(|agreed| agreed.point);
         }
         // Only now, with the room rebuilt, may a torn final record be cut.
         let mut log = reader.into_log()?;
@@ -600,12 +730,13 @@ impl Room {
         // way. It begins a new history, so nobody is resumed onto turns that
         // differ from the ones they saw.
         game.begin_history(new_history());
-        let marker = TurnMessage::Start(game.turn_start(
-            start.id,
-            start.settings,
-            game.next_turn,
-            game.next_event,
-        ));
+        let head = Stream {
+            next_turn: game.next_turn,
+            next_event: game.next_event,
+            sealed_through: game.sealed_through,
+            backlog: Vec::new(),
+        };
+        let marker = TurnMessage::Start(game.turn_start(start.id, start.settings, &head, None));
         log.append(&encode_frame(&marker, TURN_MAX_FRAME).map_err(io::Error::other)?)?;
         // The live room hands ownership to the earliest remaining member at
         // each departure, which leaves the same owner as this.
@@ -637,14 +768,24 @@ impl Room {
             // from here.
             unattended_since: None,
             password_guard: PasswordGuard::new(),
-            banned: BTreeSet::new(),
+            banned,
             _share: None,
+            content,
+            snapshots: env.snapshots,
             closed: false,
         }))
     }
 
     pub(crate) fn id(&self) -> RoomId {
         self.id
+    }
+
+    /// The snapshots this room holds in the server's store.
+    pub(crate) fn held_snapshots(&self) -> Vec<ManifestId> {
+        match &self.phase {
+            Phase::Running(game) => game.saves.held(),
+            Phase::Lobby => Vec::new(),
+        }
     }
 
     pub(crate) fn view(&self) -> RoomView {
@@ -702,9 +843,10 @@ impl Room {
                 token,
                 password,
                 resume,
+                content,
                 reply,
             } => {
-                let result = self.join(member, &token, password.as_ref(), resume);
+                let result = self.join(member, &token, password.as_ref(), resume, content);
                 let joined = result.is_ok();
                 let _ = reply.send(result);
                 if joined {
@@ -712,7 +854,7 @@ impl Room {
                 }
             }
             RoomCommand::Leave { player, reply } => {
-                let result = self.leave(player);
+                let result = self.leave(player, false);
                 let _ = reply.send(result);
             }
             RoomCommand::Disconnected { player, link } => self.disconnected(player, link),
@@ -774,6 +916,34 @@ impl Room {
                 step,
                 lanes,
             } => self.checkpoint(player, link, step, lanes, Instant::now()),
+            RoomCommand::Saved {
+                player,
+                link,
+                event,
+                lanes,
+                world,
+            } => self.saved(player, link, event, lanes, world, Instant::now()),
+            RoomCommand::Fetch {
+                player,
+                link,
+                snapshot,
+                reply,
+            } => {
+                let _ = reply.send(self.fetchable(player, link, &snapshot));
+            }
+            RoomCommand::Upload {
+                player,
+                link,
+                snapshot,
+                reply,
+            } => {
+                let _ = reply.send(self.upload_starts(player, link, &snapshot));
+            }
+            RoomCommand::Uploaded {
+                player,
+                snapshot,
+                result,
+            } => self.uploaded(player, snapshot, result, Instant::now()),
         }
     }
 
@@ -818,6 +988,7 @@ impl Room {
         token: &FixedBytes<32>,
         password: Option<&Text<64>>,
         resume: Option<Resume>,
+        content: Option<ContentFingerprint>,
     ) -> Result<RoomView, RequestError> {
         let now = Instant::now();
         if self.banned.contains(&new.player) {
@@ -836,9 +1007,16 @@ impl Room {
             // The same player again, e.g. after reconnecting: the new
             // connection takes over the seat. Validate the resume point
             // before touching the seat, so a failed resume changes nothing.
-            let feed = match &self.phase {
-                Phase::Running(game) => Some(game.resume_feed(self.id, self.settings, resume)?),
-                Phase::Lobby => None,
+            let rejoin = match &self.phase {
+                Phase::Lobby => Rejoin::Lobby,
+                Phase::Running(_) if content.is_some() && content != self.content => {
+                    return Err(RequestError::ContentMismatch);
+                }
+                // Without a world of this game, a player receives one.
+                Phase::Running(_) if resume.is_none() && self.snapshots.is_some() => Rejoin::World,
+                Phase::Running(game) => {
+                    Rejoin::Stream(game.resume_feed(self.id, self.settings, resume)?)
+                }
             };
             let member = &mut self.members[index];
             if let Some(old) = member.link.take()
@@ -850,25 +1028,65 @@ impl Room {
             member.name = new.name;
             member.platform = new.platform;
             member.streaming = false;
-            if let Some(feed) = feed {
-                member.pace = Pace::CatchingUp(None);
-                member.streaming = new.link.turns.try_send(feed).is_ok();
+            member.offered = None;
+            match rejoin {
+                Rejoin::Lobby => {}
+                Rejoin::Stream(feed) => {
+                    member.pace = Pace::CatchingUp(None);
+                    member.needs = Needs::Nothing;
+                    if let TurnFeed::Open { start, .. } = &feed {
+                        member.stream_from = start.next_event;
+                    }
+                    member.streaming = new.link.turns.try_send(feed).is_ok();
+                }
+                Rejoin::World => {
+                    member.pace = Pace::CatchingUp(None);
+                    member.needs = Needs::World;
+                }
             }
             member.link = Some(new.link);
+            self.offer_worlds(now);
             return Ok(self.view());
         }
-        if matches!(self.phase, Phase::Running(_)) {
-            // Joining a running game needs a world snapshot (later milestone).
-            return Err(RequestError::GameRunning);
+        let full = self.members.len() >= usize::from(self.max_players);
+        if let Phase::Running(game) = &mut self.phase {
+            // A newcomer to a running game starts from a snapshot, which
+            // only a server that keeps them can give, of the same content.
+            if self.snapshots.is_none() {
+                return Err(RequestError::GameRunning);
+            }
+            if full {
+                return Err(RequestError::RoomFull);
+            }
+            if content.is_none() || content != self.content {
+                return Err(RequestError::ContentMismatch);
+            }
+            game.append(
+                EventBody::PlayerJoined {
+                    player: new.player,
+                    name: new.name.clone(),
+                    platform: new.platform,
+                },
+                self.ruleset.as_mut(),
+            );
+            info!(room = %self.id, player = %new.player, "a player joins the running game");
+            metrics::increment(&self.metrics.late_joins);
+            let mut member = Member::new(new);
+            member.ready = true;
+            member.content = content;
+            member.needs = Needs::World;
+            self.members.push(member);
+            self.offer_worlds(now);
+            return Ok(self.view());
         }
-        if self.members.len() >= usize::from(self.max_players) {
+        if full {
             return Err(RequestError::RoomFull);
         }
         self.members.push(Member::new(new));
         Ok(self.view())
     }
 
-    fn leave(&mut self, player: PlayerId) -> Result<(), RequestError> {
+    fn leave(&mut self, player: PlayerId, kicked: bool) -> Result<(), RequestError> {
         let index = self
             .members
             .iter()
@@ -881,7 +1099,10 @@ impl Room {
             let _ = link.turns.try_send(TurnFeed::Close);
         }
         if let Phase::Running(game) = &mut self.phase {
-            game.append(EventBody::PlayerLeft { player }, self.ruleset.as_mut());
+            game.append(
+                EventBody::PlayerLeft { player, kicked },
+                self.ruleset.as_mut(),
+            );
         }
         self.after_departure(player);
         Ok(())
@@ -904,7 +1125,7 @@ impl Room {
         info!(room = %self.id, player = %target, "the owner removed a player");
         self.push(index, ServerMessage::Kicked);
         self.banned.insert(target);
-        self.leave(target)
+        self.leave(target, true)
     }
 
     fn disconnected(&mut self, player: PlayerId, link: u64) {
@@ -937,11 +1158,7 @@ impl Room {
     fn after_departure(&mut self, player: PlayerId) {
         if self.members.is_empty() {
             // Everyone left: the game is over, and so is its log.
-            if let Some(log) = self.log.take()
-                && let Err(error) = log.delete()
-            {
-                warn!(room = %self.id, %error, "cannot delete the log of a closed room");
-            }
+            self.discard_game();
             self.closed = true;
             return;
         }
@@ -961,8 +1178,13 @@ impl Room {
         if !self.members.iter().all(|member| member.ready) {
             return Err(RequestError::NotAllReady);
         }
-        let first = self.members[0].content;
-        if first.is_none() || self.members.iter().any(|member| member.content != first) {
+        let first_content = self.members[0].content;
+        if first_content.is_none()
+            || self
+                .members
+                .iter()
+                .any(|member| member.content != first_content)
+        {
             return Err(RequestError::ContentMismatch);
         }
         let mut game = Game::new(self.settings, new_history());
@@ -973,13 +1195,23 @@ impl Room {
                 EventBody::PlayerJoined {
                     player: member.player,
                     name: member.name.clone(),
+                    platform: member.platform,
                 },
                 self.ruleset.as_mut(),
             );
         }
-        let open = game.turn_start(self.id, self.settings, game.next_turn, 1);
+        let first = Stream {
+            next_turn: game.next_turn,
+            next_event: 1,
+            sealed_through: 0,
+            backlog: Vec::new(),
+        };
+        let open = game.turn_start(self.id, self.settings, &first, None);
+        self.content = first_content;
         for member in &mut self.members {
             member.pace = Pace::Loading;
+            member.needs = Needs::Nothing;
+            member.stream_from = 1;
             if let Some(link) = &member.link {
                 member.streaming = link
                     .turns
@@ -1266,14 +1498,415 @@ impl Room {
         }
     }
 
+    /// Tells members their world diverged at `step`, and schedules a rebase
+    /// for each: the first world the room agrees on from there on replaces
+    /// theirs.
     fn announce_divergence(&mut self, step: u64, notices: Vec<(PlayerId, Vec<u16>)>) {
+        if notices.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let rebasing = self.snapshots.is_some();
         for (player, lanes) in notices {
             warn!(room = %self.id, %player, step, ?lanes, "replica diverged from the verdict");
             metrics::increment(&self.metrics.divergences);
             if let Some(index) = self.members.iter().position(|m| m.player == player) {
                 self.push(index, ServerMessage::Diverged { step, lanes });
+                let member = &mut self.members[index];
+                let rested = member
+                    .rebased
+                    .is_none_or(|at| now.saturating_duration_since(at) >= REBASE_GAP);
+                if rebasing && member.needs == Needs::Nothing && rested {
+                    member.needs = Needs::Rebase { after: step };
+                }
             }
         }
+        self.offer_worlds(now);
+    }
+
+    /// A member's report of a save.
+    fn saved(
+        &mut self,
+        player: PlayerId,
+        link: u64,
+        event: u64,
+        mut lanes: Vec<LaneDigest>,
+        world: Option<SavedWorld>,
+        now: Instant,
+    ) {
+        let Some(order) = self
+            .members
+            .iter()
+            .position(|m| m.player == player && m.link.as_ref().is_some_and(|l| l.id == link))
+        else {
+            return;
+        };
+        let platform = self.members[order].platform;
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        // A save decided already, or never made: nothing to add to.
+        let Some(round) = game.saves.rounds.get_mut(&event) else {
+            debug!(room = %self.id, %player, event, "ignoring a report of no open save");
+            return;
+        };
+        if round
+            .reports
+            .iter()
+            .any(|save| save.report.player == player)
+        {
+            return;
+        }
+        lanes.sort_by_key(|lane| lane.lane);
+        lanes.dedup_by_key(|lane| lane.lane);
+        round.reports.push(SaveReport {
+            report: Report {
+                player,
+                platform,
+                order,
+                lanes,
+            },
+            world,
+        });
+        if save_complete(&self.members, round) {
+            self.decide_save(event, now);
+        }
+    }
+
+    /// The manifest a member's connection may fetch: the snapshot the room
+    /// offered that connection, and nothing else, so nobody can probe the
+    /// server's store for other rooms' worlds.
+    fn fetchable(
+        &self,
+        player: PlayerId,
+        link: u64,
+        snapshot: &SnapshotId,
+    ) -> Option<Arc<Manifest>> {
+        let member = self
+            .members
+            .iter()
+            .find(|m| m.player == player && m.link.as_ref().is_some_and(|l| l.id == link))?;
+        if member.offered != Some(*snapshot) {
+            return None;
+        }
+        let Phase::Running(game) = &self.phase else {
+            return None;
+        };
+        game.saves
+            .find(snapshot)
+            .map(|agreed| Arc::clone(&agreed.manifest))
+    }
+
+    /// Whether the room asked this member's connection for this save, and
+    /// has not seen it start uploading yet.
+    fn upload_starts(&mut self, player: PlayerId, link: u64, snapshot: &SnapshotId) -> bool {
+        let linked = self
+            .members
+            .iter()
+            .any(|m| m.player == player && m.link.as_ref().is_some_and(|l| l.id == link));
+        let Phase::Running(game) = &mut self.phase else {
+            return false;
+        };
+        match &mut game.saves.upload {
+            Some(upload)
+                if linked
+                    && upload.from == player
+                    && upload.world.snapshot == *snapshot
+                    && !upload.receiving =>
+            {
+                upload.receiving = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn uploaded(
+        &mut self,
+        player: PlayerId,
+        snapshot: SnapshotId,
+        result: Result<Arc<Manifest>, String>,
+        now: Instant,
+    ) {
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        let Some(upload) = game
+            .saves
+            .upload
+            .take_if(|upload| upload.from == player && upload.world.snapshot == snapshot)
+        else {
+            // An upload the room gave up on; the store keeps nothing of it.
+            if let (Ok(manifest), Some(snapshots)) = (&result, &self.snapshots)
+                && game.saves.find(&snapshot).is_none()
+            {
+                release_in_background(Arc::clone(snapshots), vec![manifest.id()]);
+            }
+            return;
+        };
+        match result {
+            Ok(manifest) => {
+                info!(room = %self.id, %player, %snapshot, "received a save");
+                self.promote(Agreed {
+                    manifest,
+                    point: upload.point,
+                });
+            }
+            Err(error) => {
+                warn!(room = %self.id, %player, %snapshot, %error, "a save's upload failed");
+                metrics::increment(&self.metrics.uploads_failed);
+                self.ask_for_upload(upload.point, upload.rest, now);
+            }
+        }
+    }
+
+    /// Asks the first reachable player of `candidates` to upload its save.
+    /// A save the room already holds needs no upload.
+    fn ask_for_upload(&mut self, point: SavePoint, mut candidates: Candidates, now: Instant) {
+        while let Some((player, world)) = candidates.pop_front() {
+            let held = match &self.phase {
+                Phase::Running(game) => game
+                    .saves
+                    .find(&world.snapshot)
+                    .map(|agreed| Arc::clone(&agreed.manifest)),
+                Phase::Lobby => return,
+            };
+            if let Some(manifest) = held {
+                self.promote(Agreed { manifest, point });
+                return;
+            }
+            let Some(index) = self
+                .members
+                .iter()
+                .position(|m| m.player == player && m.link.is_some())
+            else {
+                continue;
+            };
+            if let Phase::Running(game) = &mut self.phase {
+                game.saves.upload = Some(Upload {
+                    point,
+                    from: player,
+                    world,
+                    rest: candidates,
+                    asked: now,
+                    receiving: false,
+                });
+            }
+            self.push(
+                index,
+                ServerMessage::Upload {
+                    event: point.event,
+                    snapshot: world.snapshot,
+                },
+            );
+            return;
+        }
+        debug!(room = %self.id, event = point.event, "nobody could hand this save on");
+    }
+
+    /// Makes `agreed` the snapshot players who need a world receive. The one
+    /// before stays for downloads that may still run; the one before that
+    /// goes.
+    fn promote(&mut self, agreed: Agreed) {
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        let id = agreed.id();
+        let pointer = Pointer::new(id, agreed.point);
+        info!(
+            room = %self.id,
+            snapshot = %id,
+            step = agreed.point.sealed_through,
+            bytes = agreed.manifest.total_size(),
+            "the room agreed on a snapshot"
+        );
+        metrics::increment(&self.metrics.snapshots_agreed);
+        let dropped = game.saves.previous.take();
+        game.saves.previous = game.saves.current.replace(agreed);
+        let held = game.saves.held();
+        let released: Vec<ManifestId> = dropped
+            .map(|agreed| agreed.manifest.id())
+            .into_iter()
+            .filter(|id| !held.contains(id))
+            .collect();
+        if let Some(snapshots) = &self.snapshots {
+            let snapshots = Arc::clone(snapshots);
+            let dir = self.data_dir.clone();
+            let room = self.id;
+            tokio::task::spawn_blocking(move || {
+                if let Some(dir) = dir
+                    && let Err(error) = pointer.write(&dir, &room)
+                {
+                    warn!(%room, %error, "cannot record the room's snapshot; a restart will forget it");
+                }
+                for id in &released {
+                    if let Err(error) = snapshots.store.release(id) {
+                        warn!(%room, %error, "cannot release an old snapshot");
+                    }
+                }
+                if !released.is_empty() {
+                    snapshots.collect();
+                }
+            });
+        }
+        self.offer_worlds(Instant::now());
+    }
+
+    /// Sends the current snapshot, with the turns since it, to every member
+    /// waiting for a world it serves. Wants a save if someone still waits.
+    fn offer_worlds(&mut self, now: Instant) {
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        let mut waiting = false;
+        let mut feeds = Vec::new();
+        for (index, member) in self.members.iter().enumerate() {
+            let serves = |agreed: &Agreed| match member.needs {
+                Needs::Nothing => false,
+                Needs::World => true,
+                Needs::Rebase { after } => agreed.point.sealed_through >= after,
+            };
+            if member.needs == Needs::Nothing || member.link.is_none() {
+                continue;
+            }
+            let feed = game
+                .saves
+                .current
+                .as_ref()
+                .filter(|agreed| serves(agreed))
+                .and_then(|agreed| game.feed_from(self.id, self.settings, agreed).ok());
+            match feed {
+                Some(feed) => feeds.push((index, feed)),
+                None => waiting = true,
+            }
+        }
+        game.saves.wanted = waiting;
+        let offered = game.saves.current.as_ref().map(Agreed::id);
+        for (index, (feed, stream_from)) in feeds {
+            let member = &mut self.members[index];
+            let Some(link) = &member.link else {
+                continue;
+            };
+            member.streaming = link.turns.try_send(feed).is_ok();
+            if !member.streaming {
+                continue;
+            }
+            if matches!(member.needs, Needs::Rebase { .. }) {
+                info!(room = %self.id, player = %member.player, "rebasing a replica that diverged");
+                metrics::increment(&self.metrics.rebases);
+                member.rebased = Some(now);
+            }
+            member.needs = Needs::Nothing;
+            member.offered = offered;
+            member.pace = Pace::CatchingUp(None);
+            member.stream_from = stream_from;
+        }
+    }
+
+    /// Advances the game's saves: decides rounds that are complete or out of
+    /// time, moves past an upload that never started, and seals a new save
+    /// when one is due.
+    fn run_saves(&mut self, now: Instant) {
+        let Some(snapshots) = self.snapshots.clone() else {
+            return;
+        };
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        let ready: Vec<u64> = game
+            .saves
+            .rounds
+            .iter()
+            .filter(|(_, round)| {
+                now.saturating_duration_since(round.opened) >= SAVE_DEADLINE
+                    || save_complete(&self.members, round)
+            })
+            .map(|(event, _)| *event)
+            .collect();
+        let stalled = game.saves.upload.take_if(|upload| {
+            !upload.receiving && now.saturating_duration_since(upload.asked) >= UPLOAD_START
+        });
+        for event in ready {
+            self.decide_save(event, now);
+        }
+        if let Some(upload) = stalled {
+            warn!(room = %self.id, player = %upload.from, "a player asked for its save did not send it");
+            metrics::increment(&self.metrics.uploads_failed);
+            self.ask_for_upload(upload.point, upload.rest, now);
+        }
+        self.save_if_due(&snapshots, now);
+    }
+
+    /// Decides the save round of the save event `event`, tells members who
+    /// diverged, and asks a member whose save agreed to upload it.
+    fn decide_save(&mut self, event: u64, now: Instant) {
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        let Some(round) = game.saves.rounds.remove(&event) else {
+            return;
+        };
+        let (candidates, diverged) = snapshots::decide(&round.reports);
+        debug!(
+            room = %self.id,
+            event,
+            reports = round.reports.len(),
+            candidates = candidates.len(),
+            "decided a save"
+        );
+        self.announce_divergence(round.point.sealed_through, diverged);
+        self.ask_for_upload(round.point, candidates, now);
+    }
+
+    /// Seals a save when one is due: the save event alone at the end of a
+    /// turn that runs no new steps, so a stream from it starts at a turn
+    /// boundary.
+    fn save_if_due(&mut self, snapshots: &Snapshots, now: Instant) {
+        let playing = self
+            .members
+            .iter()
+            .any(|m| m.streaming && matches!(m.pace, Pace::Following(_)));
+        let Phase::Running(game) = &mut self.phase else {
+            return;
+        };
+        let log = (game.sealed_through, game.next_event);
+        if !playing
+            || !game
+                .saves
+                .due(now, snapshots.every, snapshots.min_gap, game.started, log)
+        {
+            return;
+        }
+        game.append(EventBody::Save, self.ruleset.as_mut());
+        let event = game.next_event - 1;
+        let frontier = game.sealed_through;
+        let frames = match game.seal(frontier) {
+            Ok(frames) => frames,
+            Err(error) => {
+                error!(room = %self.id, %error, "cannot encode a turn; closing the room");
+                self.close_all(close::SHUTTING_DOWN, b"internal error");
+                return;
+            }
+        };
+        let point = SavePoint {
+            event,
+            after_turn: game.next_turn - 1,
+            history: game.history(),
+            sealed_through: frontier,
+        };
+        game.saves.rounds.insert(
+            event,
+            SaveRound {
+                point,
+                opened: now,
+                reports: Vec::new(),
+            },
+        );
+        game.saves.last_save = Some(now);
+        game.saves.last_point = Some(point);
+        info!(room = %self.id, event, step = frontier, "the room saves its world");
+        metrics::increment(&self.metrics.saves);
+        self.publish(frames);
     }
 
     /// Closes a running game nobody has been connected to for the abandon
@@ -1294,12 +1927,24 @@ impl Room {
         }
         info!(room = %self.id, "closing a game nobody returned to");
         metrics::increment(&self.metrics.rooms_abandoned);
+        self.discard_game();
+        self.closed = true;
+    }
+
+    /// Deletes what a finished game kept: its log, its snapshot pointer and
+    /// its snapshots.
+    fn discard_game(&mut self) {
         if let Some(log) = self.log.take()
             && let Err(error) = log.delete()
         {
-            warn!(room = %self.id, %error, "cannot delete the log of an abandoned room");
+            warn!(room = %self.id, %error, "cannot delete the log of a closed room");
         }
-        self.closed = true;
+        if let Some(dir) = &self.data_dir {
+            Pointer::remove(dir, &self.id);
+        }
+        if let (Some(snapshots), Phase::Running(game)) = (&self.snapshots, &self.phase) {
+            release_in_background(Arc::clone(snapshots), game.saves.held());
+        }
     }
 
     /// Frees lobby seats whose connection is gone. A lobby seat is not held
@@ -1326,6 +1971,10 @@ impl Room {
         }
         self.decide_waiting_rounds(now);
         self.demote_stalled(now);
+        self.run_saves(now);
+        if self.closed {
+            return;
+        }
         let Phase::Running(game) = &mut self.phase else {
             return;
         };
@@ -1356,6 +2005,11 @@ impl Room {
                 return;
             }
         };
+        self.publish(frames);
+    }
+
+    /// Logs sealed turns and sends them to every member with a stream.
+    fn publish(&mut self, frames: Vec<Arc<[u8]>>) {
         if let Some(log) = &mut self.log
             && let Err(error) = frames.iter().try_for_each(|frame| log.append(frame))
         {
@@ -1439,6 +2093,10 @@ impl Member {
             advanced: Instant::now(),
             intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
             payload_bytes: TokenBucket::new(PAYLOAD_BYTES_PER_SECOND, PAYLOAD_BURST),
+            needs: Needs::Nothing,
+            offered: None,
+            rebased: None,
+            stream_from: 0,
         }
     }
 }
@@ -1450,6 +2108,70 @@ fn round_complete(members: &[Member], round: &Round) -> bool {
         .iter()
         .filter(|m| m.streaming && matches!(m.pace, Pace::Loading | Pace::Following(_)))
         .all(|m| round.reports.iter().any(|report| report.player == m.player))
+}
+
+/// Whether every member pacing the room whose stream carries this save has
+/// reported it. A member whose stream starts after the save never sees it.
+fn save_complete(members: &[Member], round: &SaveRound) -> bool {
+    members
+        .iter()
+        .filter(|m| {
+            m.streaming
+                && m.stream_from <= round.point.event
+                && matches!(m.pace, Pace::Loading | Pace::Following(_))
+        })
+        .all(|m| {
+            round
+                .reports
+                .iter()
+                .any(|save| save.report.player == m.player)
+        })
+}
+
+/// Stops keeping `ids` in the store and collects their chunks, off the
+/// room's task.
+fn release_in_background(snapshots: Arc<Snapshots>, ids: Vec<ManifestId>) {
+    if ids.is_empty() {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        for id in &ids {
+            if let Err(error) = snapshots.store.release(id) {
+                warn!(%error, "cannot release a snapshot");
+            }
+        }
+        snapshots.collect();
+    });
+}
+
+/// The snapshot a restored room last agreed on, if its pointer is readable,
+/// the store still holds it, and the recovered log can be followed from it.
+fn recover_snapshot(
+    dir: &Path,
+    room: &RoomId,
+    snapshots: &Snapshots,
+    game: &Game,
+) -> Option<Agreed> {
+    let pointer = Pointer::read(dir, room)?;
+    let manifest = match snapshots
+        .store
+        .manifest(&bulk::manifest_id(&pointer.snapshot))
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            warn!(%room, %error, "a restored room's snapshot is gone");
+            return None;
+        }
+    };
+    let agreed = Agreed {
+        manifest: Arc::new(manifest),
+        point: pointer.point,
+    };
+    if game.stream_from_save(&agreed.point).is_err() {
+        warn!(%room, "a restored room's snapshot does not fit its log");
+        return None;
+    }
+    Some(agreed)
 }
 
 fn decide_round(round: &mut Round) -> Vec<(PlayerId, Vec<u16>)> {
@@ -1499,6 +2221,7 @@ impl Game {
             pending: Vec::new(),
             log: VecDeque::new(),
             log_first_turn: 1,
+            sealed_before_log: 0,
             log_bytes: 0,
             resume_window: RESUME_WINDOW,
             last_tick: Instant::now(),
@@ -1509,6 +2232,7 @@ impl Game {
                 id: history,
                 after_turn: 0,
             }],
+            saves: Saves::default(),
         }
     }
 
@@ -1523,21 +2247,23 @@ impl Game {
         self.histories.push(History { id, after_turn });
     }
 
-    /// The start of a turn stream that continues at `next_turn`.
+    /// The start message of `stream`, which starts from `world` if given.
     fn turn_start(
         &self,
         room: RoomId,
         settings: RoomSettings,
-        next_turn: u64,
-        next_event: u64,
+        stream: &Stream,
+        world: Option<WorldOffer>,
     ) -> TurnStart {
         TurnStart {
             room,
-            next_turn,
-            next_event,
+            next_turn: stream.next_turn,
+            next_event: stream.next_event,
+            sealed_through: stream.sealed_through,
             steps_per_second: settings.steps_per_second,
             checkpoint_interval: settings.checkpoint_interval,
             history: self.history(),
+            world,
         }
     }
 
@@ -1597,19 +2323,21 @@ impl Game {
         let mut frames = Vec::with_capacity(batches.len());
         for (index, events) in batches.into_iter().enumerate() {
             let first_event = events.first().map_or(self.next_event, |event| event.seq);
+            let sealed_through = if index == last {
+                frontier
+            } else {
+                self.sealed_through
+            };
             let turn = Turn {
                 number: self.next_turn,
-                sealed_through: if index == last {
-                    frontier
-                } else {
-                    self.sealed_through
-                },
+                sealed_through,
                 speed: self.speed,
                 events,
             };
             let frame: Arc<[u8]> = encode_frame(&TurnMessage::Turn(turn), TURN_MAX_FRAME)?.into();
             self.remember(LoggedTurn {
                 first_event,
+                sealed_through,
                 frame: Arc::clone(&frame),
             });
             self.next_turn += 1;
@@ -1633,6 +2361,7 @@ impl Game {
             };
             self.log_bytes -= oldest.frame.len();
             self.log_first_turn += 1;
+            self.sealed_before_log = oldest.sealed_through;
         }
     }
 
@@ -1646,6 +2375,47 @@ impl Game {
         settings: RoomSettings,
         resume: Option<Resume>,
     ) -> Result<TurnFeed, RequestError> {
+        let stream = self.stream_after(resume)?;
+        Ok(TurnFeed::Open {
+            start: self.turn_start(room, settings, &stream, None),
+            backlog: stream.backlog,
+        })
+    }
+
+    /// The turn feed that starts from an agreed snapshot, and the first
+    /// event it carries.
+    fn feed_from(
+        &self,
+        room: RoomId,
+        settings: RoomSettings,
+        agreed: &Agreed,
+    ) -> Result<(TurnFeed, u64), RequestError> {
+        let stream = self.stream_from_save(&agreed.point)?;
+        let next_event = stream.next_event;
+        let feed = TurnFeed::Open {
+            start: self.turn_start(room, settings, &stream, Some(agreed.offer())),
+            backlog: stream.backlog,
+        };
+        Ok((feed, next_event))
+    }
+
+    /// The stream after a save: it must be in the resume window, and the
+    /// log must still say what the save says about where it stands.
+    fn stream_from_save(&self, point: &SavePoint) -> Result<Stream, RequestError> {
+        let stream = self.stream_after(Some(Resume {
+            after_turn: point.after_turn,
+            history: point.history,
+        }))?;
+        if stream.next_event != point.event.saturating_add(1)
+            || stream.sealed_through != point.sealed_through
+        {
+            return Err(RequestError::ResumeUnavailable);
+        }
+        Ok(stream)
+    }
+
+    /// Where a stream after `resume` starts, with the turns it starts with.
+    fn stream_after(&self, resume: Option<Resume>) -> Result<Stream, RequestError> {
         let from = match resume {
             None => 1,
             Some(resume) => {
@@ -1680,8 +2450,18 @@ impl Game {
             },
             |turn| turn.first_event,
         );
-        Ok(TurnFeed::Open {
-            start: self.turn_start(room, settings, from, next_event),
+        // The frontier of the turn before the stream's first.
+        let sealed_through = match skip.checked_sub(1) {
+            None => self.sealed_before_log,
+            Some(before) => self
+                .log
+                .get(before)
+                .map_or(self.sealed_through, |turn| turn.sealed_through),
+        };
+        Ok(Stream {
+            next_turn: from,
+            next_event,
+            sealed_through,
             backlog: backlog.iter().map(|turn| Arc::clone(&turn.frame)).collect(),
         })
     }
@@ -1773,6 +2553,7 @@ mod tests {
         for _ in 0..8 {
             game.remember(LoggedTurn {
                 first_event: 1,
+                sealed_through: 0,
                 frame: vec![0; big].into(),
             });
         }
@@ -1818,6 +2599,10 @@ mod tests {
             advanced: Instant::now(),
             intents: TokenBucket::new(1, 1),
             payload_bytes: TokenBucket::new(1, 1),
+            needs: Needs::Nothing,
+            offered: None,
+            rebased: None,
+            stream_from: 0,
         }
     }
 }

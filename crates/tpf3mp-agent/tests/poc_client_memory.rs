@@ -111,6 +111,8 @@ async fn a_hostile_server_cannot_fill_the_client_with_turns() {
             steps_per_second: 5,
             checkpoint_interval: 10,
             history: 0,
+            sealed_through: 0,
+            world: None,
         });
         write_message(&mut turns, &start, TURN_MAX_FRAME)
             .await
@@ -125,6 +127,7 @@ async fn a_hostile_server_cannot_fill_the_client_with_turns() {
                         step: 1,
                         body: EventBody::PlayerLeft {
                             player: PlayerId(FixedBytes([7; 32])),
+                            kicked: false,
                         },
                     }
                 })
