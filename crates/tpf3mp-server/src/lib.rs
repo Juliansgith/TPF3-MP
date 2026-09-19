@@ -12,19 +12,25 @@ mod persist;
 mod room;
 mod ruleset;
 mod snapshots;
+mod tunnel;
 mod verdict;
 
 use std::{fmt, future::Future, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+use quinn::Runtime;
 use thiserror::Error;
 use tokio::sync::Semaphore;
-use tpf3mp_net::{ServerIdentity, TlsError, close};
+use tpf3mp_net::{
+    ServerIdentity, TlsError, close,
+    tunnel::{MuxSocket, Tunnels},
+};
 use tpf3mp_proto::Text;
 
 pub use crate::{
     admin::serve_admin,
     ruleset::{AcceptAll, Ruleset, RulesetFactory},
     snapshots::SnapshotConfig,
+    tunnel::TunnelConfig,
 };
 use crate::{
     admission::{Admission, Decision, Origin},
@@ -32,6 +38,7 @@ use crate::{
     metrics::{Gauges, Metrics},
     room::{RoomEnv, Timeouts},
     snapshots::Snapshots,
+    tunnel::{Listener, TunnelEnv},
 };
 
 /// How long a shutdown waits for connections to finish ending.
@@ -93,6 +100,9 @@ pub struct ServerConfig {
     /// each time it grows by as much, or by its compacted size if that is
     /// more. Rules that cannot save their state keep their whole log.
     pub compact_log_at: u64,
+    /// Where the server also accepts QUIC over WebSocket, for players
+    /// whose networks block UDP. `None` accepts UDP only.
+    pub tunnel: Option<TunnelConfig>,
 }
 
 impl ServerConfig {
@@ -126,6 +136,7 @@ impl ServerConfig {
             load_timeout: Duration::from_secs(300),
             snapshots: None,
             compact_log_at: 64 << 20,
+            tunnel: None,
         }
     }
 }
@@ -151,6 +162,7 @@ impl fmt::Debug for ServerConfig {
             .field("data_dir", &self.data_dir)
             .field("snapshots", &self.snapshots)
             .field("compact_log_at", &self.compact_log_at)
+            .field("tunnel", &self.tunnel)
             .finish_non_exhaustive()
     }
 }
@@ -163,6 +175,8 @@ pub enum ServerError {
     Bind(#[from] io::Error),
     #[error("cannot open the snapshot store: {0}")]
     Snapshots(#[from] tpf3mp_snapshot::StoreError),
+    #[error("cannot open the tunnel listener: {0}")]
+    Tunnel(io::Error),
 }
 
 /// State shared by every connection.
@@ -176,6 +190,19 @@ pub(crate) struct Shared {
     pub(crate) server_version: Text<64>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) snapshots: Option<Arc<Snapshots>>,
+    pub(crate) tunnels: Option<Arc<Tunnels>>,
+}
+
+impl Shared {
+    /// Where a QUIC peer at `addr` connects from, as far as limits go: for
+    /// a tunnel, the address of its client.
+    pub(crate) fn origin(&self, addr: SocketAddr) -> Origin {
+        let tunneled = self
+            .tunnels
+            .as_ref()
+            .and_then(|tunnels| tunnels.origin(addr));
+        Origin::of(tunneled.unwrap_or(addr.ip()))
+    }
 }
 
 pub struct Server {
@@ -183,6 +210,7 @@ pub struct Server {
     shared: Arc<Shared>,
     /// Cloned into every connection's task; counts the ones still running.
     connections: Arc<()>,
+    tunnel: Option<(Listener, usize)>,
 }
 
 impl Server {
@@ -191,8 +219,26 @@ impl Server {
             Some(snapshots) => Some(Arc::new(Snapshots::open(snapshots)?)),
             None => None,
         };
+        let listener = match &config.tunnel {
+            Some(tunnel) => Some(Listener::bind(tunnel, config.identity.clone())?),
+            None => None,
+        };
+        let tunnels = listener.as_ref().map(|_| Tunnels::new());
         let quic = tpf3mp_net::server_config(config.identity)?;
-        let endpoint = quinn::Endpoint::server(quic, config.listen)?;
+        let endpoint = match &tunnels {
+            None => quinn::Endpoint::server(quic, config.listen)?,
+            Some(tunnels) => {
+                // One endpoint for UDP and tunnels alike.
+                let runtime = Arc::new(quinn::TokioRuntime);
+                let udp = runtime.wrap_udp_socket(std::net::UdpSocket::bind(config.listen)?)?;
+                quinn::Endpoint::new_with_abstract_socket(
+                    quinn::EndpointConfig::default(),
+                    Some(quic),
+                    Arc::new(MuxSocket::new(udp, Arc::clone(tunnels))),
+                    runtime,
+                )?
+            }
+        };
         let metrics = Arc::new(Metrics::default());
         let directory = Arc::new(Directory::new(DirectoryConfig {
             secret: config.secret,
@@ -223,6 +269,11 @@ impl Server {
                 handshakes_per_address: config.max_handshakes_per_address.max(1),
                 sessions_per_address: config.max_sessions_per_address.max(1),
                 rooms_per_address: config.max_rooms_per_address.max(1),
+                // A tunnel per session, and per handshake that may become one.
+                tunnels_per_address: config
+                    .max_sessions_per_address
+                    .saturating_add(config.max_handshakes_per_address)
+                    .max(1),
             }),
             handshake_timeout: config.handshake_timeout,
             roomless_timeout: config.roomless_timeout,
@@ -231,16 +282,26 @@ impl Server {
                 .expect("the crate version is short printable text"),
             metrics,
             snapshots,
+            tunnels,
         });
+        let capacity = config.max_sessions.saturating_add(config.max_handshakes);
         Ok(Self {
             endpoint,
             shared,
             connections: Arc::new(()),
+            tunnel: listener.map(|listener| (listener, capacity)),
         })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.endpoint.local_addr()
+    }
+
+    /// Where the tunnel listener accepts connections, if the server has one.
+    pub fn tunnel_addr(&self) -> Option<SocketAddr> {
+        self.tunnel
+            .as_ref()
+            .and_then(|(listener, _)| listener.local_addr().ok())
     }
 
     /// A handle for observing the server while it runs.
@@ -252,7 +313,17 @@ impl Server {
 
     /// Serves connections until `shutdown` completes, then closes every
     /// connection with `SHUTTING_DOWN` and waits for the endpoint to drain.
-    pub async fn run(self, shutdown: impl Future<Output = ()>) {
+    pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
+        let tunnels = self.tunnel.take().and_then(|(listener, capacity)| {
+            let env = TunnelEnv {
+                tunnels: Arc::clone(self.shared.tunnels.as_ref()?),
+                admission: Arc::clone(&self.shared.admission),
+                metrics: Arc::clone(&self.shared.metrics),
+                capacity,
+                handshake_timeout: self.shared.handshake_timeout,
+            };
+            Some(tokio::spawn(listener.run(env)))
+        });
         let collector = self.shared.snapshots.clone().map(|snapshots| {
             tokio::spawn(async move {
                 let mut every = tokio::time::interval(snapshots::COLLECT_EVERY);
@@ -280,6 +351,10 @@ impl Server {
             collector.abort();
         }
         self.endpoint.wait_idle().await;
+        // Only now: the connections' closes have gone out through them.
+        if let Some(tunnels) = tunnels {
+            tunnels.abort();
+        }
         self.shared.directory.shut_down().await;
         // Once every connection's task has ended, and the server with them,
         // nothing holds the snapshot store for the next process.
@@ -294,12 +369,14 @@ impl Server {
     }
 
     fn admit(&self, incoming: quinn::Incoming) {
-        let origin = Origin::of(incoming.remote_address().ip());
-        let decision = self.shared.admission.on_attempt(
-            origin,
-            incoming.remote_address_validated(),
-            incoming.may_retry(),
-        );
+        let origin = self.shared.origin(incoming.remote_address());
+        // A tunnel's client proved its address with TCP's handshake.
+        let validated =
+            incoming.remote_address_validated() || Tunnels::is_tunnel(incoming.remote_address());
+        let decision = self
+            .shared
+            .admission
+            .on_attempt(origin, validated, incoming.may_retry());
         match decision {
             Decision::Accept(handshake) => {
                 let shared = Arc::clone(&self.shared);
@@ -342,6 +419,15 @@ impl ServerStats {
         self.shared.metrics.render(&Gauges {
             sessions: self.sessions(),
             rooms: self.rooms(),
+            tunnels: self.tunnels(),
         })
+    }
+
+    /// Tunnels open now.
+    pub fn tunnels(&self) -> usize {
+        self.shared
+            .tunnels
+            .as_ref()
+            .map_or(0, |tunnels| tunnels.len())
     }
 }

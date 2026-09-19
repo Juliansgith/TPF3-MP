@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tpf3mp_net::ServerIdentity;
-use tpf3mp_server::{Server, ServerConfig, SnapshotConfig, serve_admin};
+use tpf3mp_server::{Server, ServerConfig, SnapshotConfig, TunnelConfig, serve_admin};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -105,6 +105,22 @@ struct Args {
     /// from the game's current state.
     #[arg(long, default_value_t = 64)]
     compact_log_mib: u64,
+
+    /// TCP address that also takes players through a WebSocket tunnel, for
+    /// networks that block UDP. Serves TLS with --cert unless
+    /// --tunnel-behind-proxy. Players look for wss://<host>/tpf3mp on 443.
+    #[arg(long)]
+    tunnel_listen: Option<SocketAddr>,
+
+    /// Serve tunnels as plain WebSocket to a TLS-terminating proxy in front,
+    /// such as Caddy or nginx, and take each player's address from the
+    /// X-Forwarded-For it sets. Only the proxy may reach the listener.
+    #[arg(long, requires = "tunnel_listen")]
+    tunnel_behind_proxy: bool,
+
+    /// The URL path tunnels open.
+    #[arg(long, default_value = "/tpf3mp")]
+    tunnel_path: String,
 }
 
 #[tokio::main]
@@ -142,6 +158,18 @@ async fn main() -> Result<()> {
     config.max_rooms_per_address = args.max_rooms_per_address;
     config.data_dir = args.data_dir.clone();
     config.compact_log_at = args.compact_log_mib.max(1).saturating_mul(1 << 20);
+    if !args.tunnel_path.starts_with('/') {
+        bail!("--tunnel-path must start with /");
+    }
+    config.tunnel = args.tunnel_listen.map(|listen| {
+        let mut tunnel = if args.tunnel_behind_proxy {
+            TunnelConfig::behind_proxy(listen)
+        } else {
+            TunnelConfig::new(listen)
+        };
+        tunnel.path = args.tunnel_path.clone();
+        tunnel
+    });
     let snapshot_dir = match (&args.snapshot_dir, &args.data_dir) {
         _ if args.no_snapshots => None,
         (Some(dir), _) => Some(dir.clone()),
@@ -168,6 +196,9 @@ async fn main() -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "listening"
     );
+    if let Some(tunnel) = server.tunnel_addr() {
+        info!(address = %tunnel, path = %args.tunnel_path, "accepting tunnels");
+    }
     if let Some(address) = args.admin_listen {
         if !address.ip().is_loopback() {
             warn!(%address, "the admin endpoint is not on loopback; keep it off the internet");

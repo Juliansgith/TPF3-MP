@@ -27,7 +27,9 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
 **Milestone M1: the core netcode, tested without the game.**
 
 - **Protocol.** QUIC with TLS 1.3, per-install Ed25519 identities proven
-  against the TLS session, and a version preamble frozen for good.
+  against the TLS session, and a version preamble frozen for good. Where a
+  network blocks UDP, the same QUIC connection runs through a WebSocket on
+  port 443; clients fall back to it on their own.
 - **Rooms.** HMAC-tagged invites and optional passwords, a lobby with
   readiness and content fingerprints, owner hand-over.
 - **Sequencer.** Hard lockstep turns. A server-owned clock holds for players
@@ -78,8 +80,7 @@ reasoning behind it in [docs/DECISIONS.md](docs/DECISIONS.md).
 
 **Waiting for the game:** the TPF3-specific hook (build profile, detours,
 the real `Game`), and the release-day measurements in
-[docs/DAY_ONE.md](docs/DAY_ONE.md). **Still to build:** a WebSocket fallback
-for networks that block UDP.
+[docs/DAY_ONE.md](docs/DAY_ONE.md).
 
 ## Layout
 

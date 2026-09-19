@@ -7,7 +7,9 @@ hardened container profile.
 ## What the server needs
 
 - **UDP port 29470** open to the internet: players connect with QUIC.
-  Nothing else needs to be public.
+- **HTTPS on port 443** through the host's reverse proxy, for players whose
+  networks block UDP (see [Tunnels](#tunnels)). Optional, but some school,
+  office and hotel networks leave no other way.
 - **A TLS certificate** for a hostname that points at the server, such as
   `tpf3mp.<ip>.sslip.io`. Agents verify it against public certificate
   authorities, exactly as a browser would.
@@ -64,10 +66,11 @@ certificate that agents pin with `--pin-cert <file>`.
 ## Monitoring
 
 - **Metrics.** `http://127.0.0.1:9470/metrics` serves Prometheus text on the
-  host: sessions and rooms now, plus counters for handshakes refused,
-  protocol violations, turns sealed, events ordered, intents refused,
-  divergences and slow consumers, and for snapshots: saves, snapshots
-  agreed, failed uploads, late joins, rebases and bytes served.
+  host: sessions, rooms and tunnels now, plus counters for handshakes
+  refused, protocol violations, turns sealed, events ordered, intents
+  refused, divergences, slow consumers, log compactions and tunnels opened
+  and refused, and for snapshots: saves, snapshots agreed, failed uploads,
+  late joins, rebases and bytes served.
 - **Health.** `/healthz` returns `ok`.
 - **Logs.** Logs go to stdout (`docker compose logs -f`) and never contain
   IP addresses or invite tokens. `RUST_LOG=debug` adds per-connection
@@ -132,6 +135,66 @@ Persistence details:
   they hold invite and password tags and every command.
 - **Invite key.** Restored games are rejoined with their original invites,
   which only verify with the same `invite.key`.
+
+## Tunnels
+
+Some networks let nothing but HTTPS out. Players there reach the server
+through a WebSocket tunnel that carries the same QUIC connection, end-to-end
+encrypted as always (see "Tunnels" in PROTOCOL.md). Agents try UDP first and,
+after 3 s without an answer, also `wss://<server host>/tpf3mp`; whichever
+connects first is kept.
+
+The image listens for tunnels on TCP 29471 as plain WebSocket and takes each
+player's address from `X-Forwarded-For` (`--tunnel-listen 0.0.0.0:29471
+--tunnel-behind-proxy`). The compose file publishes that port on the host's
+loopback only, for the reverse proxy that already runs `tf2mp-relay`'s
+hostname. Add the TPF3-MP hostname to it:
+
+```caddyfile
+tpf3mp.example.org {
+    handle /tpf3mp {
+        # Overwrite, never trust, the client's own forwarding chain.
+        reverse_proxy 127.0.0.1:29471 {
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+    handle {
+        respond 404
+    }
+}
+```
+
+or with nginx:
+
+```nginx
+location = /tpf3mp {
+    proxy_pass http://127.0.0.1:29471;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_read_timeout 120s;
+}
+```
+
+Without a reverse proxy, the server can serve the tunnel's TLS itself with
+its own certificate: `--tunnel-listen 0.0.0.0:443` without
+`--tunnel-behind-proxy`. Another path is `--tunnel-path`; players then pass
+the whole URL with `--tunnel`.
+
+- **Limits.** Tunnels count against the same per-address limits as UDP
+  sessions, by the player's address. At most a session's and a
+  handshake's worth of tunnels per address, and as many in total as
+  sessions and handshakes together, are open; a TLS and WebSocket
+  handshake must finish within 10 s.
+- **Trust.** `--tunnel-behind-proxy` believes the last `X-Forwarded-For`
+  entry, so nothing but the proxy may reach the listener. Requests without
+  the header are refused.
+- **Metrics.** `tunnels` (open now), `tunnels_opened_total` and
+  `tunnels_refused_total`.
+- **Players.** `--tunnel <url>` names another tunnel, `--tunnel-only` skips
+  UDP, `--no-tunnel` never falls back. The launcher takes the same flags and
+  shows "connected via tunnel" when the fallback was needed.
 
 ## Snapshots
 

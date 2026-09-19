@@ -31,7 +31,7 @@ use tracing::{info, warn};
 pub use self::api::Action;
 use self::api::View;
 use crate::{
-    Client, ClientEvent, ConnectOptions, Events, Worlds,
+    Client, ClientEvent, ConnectOptions, Events, TunnelChoice, Worlds,
     bridge::{self, Bridge, BridgeEnd, BridgeOptions, Control, Rejoin, SharedStatus, Status},
     connect,
 };
@@ -47,6 +47,8 @@ const ACTION_QUEUE: usize = 32;
 pub struct LauncherConfig {
     /// Where the page is served: a loopback address.
     pub listen: SocketAddr,
+    /// Which tunnel connections take when UDP does not get through.
+    pub tunnel: TunnelChoice,
     /// The server the page offers first, as `host:port`.
     pub server: Option<String>,
     /// How to trust servers.
@@ -240,6 +242,7 @@ async fn act(
             view.connecting = false;
             let (client, events) = result.map_err(|error| error.to_string())?;
             view.connected = true;
+            view.tunneled = client.tunneled();
             view.error = None;
             view.name = options.name.as_str().to_owned();
             view.server_version = Some(client.welcome().server_version.as_str().to_owned());
@@ -413,7 +416,10 @@ async fn forward(session: &Option<Session>, control: Control) -> Result<(), Stri
 async fn reconnect(shared: &Arc<Shared>, options: ConnectOptions) -> Option<Connected> {
     match connect(options.clone()).await {
         Ok((client, events)) => {
-            shared.view().connected = true;
+            let mut view = shared.view();
+            view.connected = true;
+            view.tunneled = client.tunneled();
+            drop(view);
             Some(Connected {
                 client,
                 events,
@@ -440,18 +446,21 @@ async fn connect_options(
         .rsplit_once(':')
         .ok_or("the server address must be host:port")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let address = tokio::net::lookup_host(server)
+    let address = crate::resolve(server)
         .await
-        .map_err(|error| format!("cannot find {server}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("{server} has no address"))?;
-    Ok(ConnectOptions::new(
+        .map_err(|error| format!("cannot find {server}: {error}"))?;
+    let mut options = ConnectOptions::new(
         address,
         host,
         config.trust.clone(),
         Arc::clone(&config.identity),
         name,
-    ))
+    );
+    options.route = config
+        .tunnel
+        .route(host)
+        .map_err(|error| error.to_string())?;
+    Ok(options)
 }
 
 fn password_text(password: Option<String>) -> Result<Option<Text<64>>, String> {

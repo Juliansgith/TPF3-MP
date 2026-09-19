@@ -175,7 +175,7 @@ function cell(row, value) {
 function render(s) {
   state = s;
   const badge = $("connection");
-  text(badge, s.connection);
+  text(badge, s.tunneled ? s.connection + " via tunnel" : s.connection);
   badge.className = "badge " + s.connection;
   text($("identity"), s.player ? s.name + " (" + s.player + ")" : s.name);
   text($("server-version"), s.server_version ? "server " + s.server_version : "");

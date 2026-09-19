@@ -41,10 +41,13 @@ jobs:
           docker run -d --name tpf3mp --read-only --cap-drop ALL \
             -p 127.0.0.1:9470:9470 -v /tmp/tpf3mp:/data tpf3mp-server:ci \
             --listen 0.0.0.0:29470 --dev-self-signed /data/dev.der \
-            --secret-file /data/invite.key --admin-listen 0.0.0.0:9470
+            --secret-file /data/invite.key --admin-listen 0.0.0.0:9470 \
+            --tunnel-listen 0.0.0.0:29471 --tunnel-behind-proxy
           for attempt in $(seq 1 20); do
             curl -sf http://127.0.0.1:9470/healthz && break
             sleep 1
           done
           curl -sf http://127.0.0.1:9470/metrics | grep tpf3mp_sessions
+          curl -sf http://127.0.0.1:9470/metrics | grep tpf3mp_tunnels
           docker logs tpf3mp
+          docker logs tpf3mp 2>&1 | grep "accepting tunnels"

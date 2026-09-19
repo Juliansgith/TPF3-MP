@@ -73,10 +73,9 @@ async fn main() -> Result<()> {
             let (host, _) = server
                 .rsplit_once(':')
                 .context("the server address must be host:port")?;
-            let address: SocketAddr = tokio::net::lookup_host(server)
-                .await?
-                .next()
-                .with_context(|| format!("{server} has no address"))?;
+            let address = tpf3mp_agent::resolve(server)
+                .await
+                .with_context(|| format!("resolving {server}"))?;
             let trust = match &args.pin_cert {
                 Some(path) => ServerTrust::Pinned(CertificateDer::from(std::fs::read(path)?)),
                 None => ServerTrust::WebPki,

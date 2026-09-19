@@ -18,10 +18,11 @@ COPY --from=build /tpf3mp-server /usr/local/bin/tpf3mp-server
 # create its invite key without root.
 COPY --from=build --chown=65532:65532 /data /data
 USER 65532:65532
-EXPOSE 29470/udp 9470/tcp
+EXPOSE 29470/udp 29471/tcp 9470/tcp
 ENTRYPOINT ["/usr/local/bin/tpf3mp-server"]
 CMD ["--listen", "0.0.0.0:29470", \
      "--cert", "/certs/fullchain.pem", "--key", "/certs/privkey.pem", \
      "--secret-file", "/data/invite.key", \
      "--data-dir", "/data/rooms", \
-     "--admin-listen", "0.0.0.0:9470"]
+     "--admin-listen", "0.0.0.0:9470", \
+     "--tunnel-listen", "0.0.0.0:29471", "--tunnel-behind-proxy"]

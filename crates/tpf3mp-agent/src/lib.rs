@@ -24,7 +24,9 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tpf3mp_net::{
     Identity, IdentityError, NetError, ServerTrust, TlsError, client_config, close, read_message,
-    read_preamble, write_message, write_preamble,
+    read_preamble,
+    tunnel::{self, TunnelError, TunnelUrl},
+    write_message, write_preamble,
 };
 use tpf3mp_proto::{
     CONTROL_MAX_FRAME, ChatText, ClientMessage, ContentFingerprint, CreateRoom, GameMessage, Hello,
@@ -52,6 +54,53 @@ const EVENT_QUEUE: usize = 1024;
 /// a hostile server could make the client hold gigabytes.
 const EVENT_BYTES: usize = 64 << 20;
 
+/// How long UDP gets on its own before a tunnel joins the race. A QUIC
+/// handshake takes a round trip or two; three seconds cover a lost packet
+/// and its first resend.
+pub const FALLBACK_AFTER: Duration = Duration::from_secs(3);
+
+/// How a client reaches the server.
+#[derive(Debug, Clone, Default)]
+pub enum Route {
+    /// QUIC over UDP.
+    #[default]
+    Udp,
+    /// QUIC over UDP, and through this tunnel too if UDP has not connected
+    /// after [`ConnectOptions::fallback_after`]; whichever connects first
+    /// is kept.
+    UdpOrTunnel(TunnelUrl),
+    /// QUIC through this tunnel only, for networks known to block UDP.
+    Tunnel(TunnelUrl),
+}
+
+/// Which tunnel, if any, a player takes when UDP does not get through.
+#[derive(Debug, Clone, Default)]
+pub enum TunnelChoice {
+    /// Fall back to the one servers serve by default, `wss://<host>/tpf3mp`.
+    #[default]
+    Default,
+    /// Fall back to this one.
+    Url(TunnelUrl),
+    /// A tunnel only, never UDP: this one, or the default one.
+    Only(Option<TunnelUrl>),
+    /// None: UDP only.
+    Off,
+}
+
+impl TunnelChoice {
+    /// The route to a server at `host`.
+    pub fn route(&self, host: &str) -> Result<Route, TunnelError> {
+        Ok(match self {
+            // A host no URL can name gets no fallback, rather than no route.
+            Self::Default => TunnelUrl::default_for(host).map_or(Route::Udp, Route::UdpOrTunnel),
+            Self::Url(url) => Route::UdpOrTunnel(url.clone()),
+            Self::Only(Some(url)) => Route::Tunnel(url.clone()),
+            Self::Only(None) => Route::Tunnel(TunnelUrl::default_for(host)?),
+            Self::Off => Route::Udp,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub server: SocketAddr,
@@ -63,6 +112,11 @@ pub struct ConnectOptions {
     pub client_version: Text<64>,
     /// The protocol version announced in the preamble. Only tests change it.
     pub protocol_version: u32,
+    /// UDP, a tunnel, or both. Through a tunnel, `server` only names the
+    /// peer for QUIC; everything goes to the tunnel's host.
+    pub route: Route,
+    /// How long UDP has alone before a fallback tunnel joins the race.
+    pub fallback_after: Duration,
 }
 
 impl ConnectOptions {
@@ -82,6 +136,8 @@ impl ConnectOptions {
             client_version: Text::new(env!("CARGO_PKG_VERSION"))
                 .expect("the crate version is short printable text"),
             protocol_version: PROTOCOL_VERSION,
+            route: Route::Udp,
+            fallback_after: FALLBACK_AFTER,
         }
     }
 }
@@ -94,6 +150,14 @@ pub enum ConnectError {
     Identity(#[from] IdentityError),
     #[error("cannot open a UDP socket: {0}")]
     Socket(#[from] io::Error),
+    #[error("cannot open the tunnel: {0}")]
+    Tunnel(#[from] TunnelError),
+    #[error("the server is out of reach over UDP ({udp}) and through {url} ({tunnel})")]
+    NoRoute {
+        url: String,
+        udp: Box<ConnectError>,
+        tunnel: Box<ConnectError>,
+    },
     #[error("cannot start the connection: {0}")]
     Start(#[from] quinn::ConnectError),
     #[error("connection failed: {0}")]
@@ -205,6 +269,7 @@ pub struct Client {
     welcome: Welcome,
     player: PlayerId,
     requests: Requests,
+    tunneled: bool,
 }
 
 /// Sends requests on a client's control stream and matches the responses.
@@ -233,15 +298,99 @@ impl fmt::Debug for Client {
     }
 }
 
+/// Finds the address of a server given as `host:port`: an IPv4 one when
+/// there is one, as servers listen on IPv4 by default while `localhost` and
+/// names with both kinds of record may list IPv6 first.
+pub async fn resolve(server: &str) -> io::Result<SocketAddr> {
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host(server).await?.collect();
+    addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or(addresses.first())
+        .copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the name has no address"))
+}
+
 /// Connects to a server and completes the handshake. Server messages arrive
 /// on the returned receiver.
 pub async fn connect(options: ConnectOptions) -> Result<(Client, Events), ConnectError> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_within(options))
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    tokio::time::timeout_at(deadline, connect_within(options, deadline))
         .await
         .map_err(|_| ConnectError::Timeout)?
 }
 
-async fn connect_within(options: ConnectOptions) -> Result<(Client, Events), ConnectError> {
+/// A QUIC connection and the endpoint it runs on.
+type Opened = (quinn::Endpoint, quinn::Connection);
+
+/// Opens the QUIC connection by the options' route, by `deadline`. Says
+/// whether it runs through a tunnel. When neither UDP nor the tunnel
+/// connects, the error names what went wrong with both.
+async fn open_connection(
+    options: &ConnectOptions,
+    deadline: tokio::time::Instant,
+) -> Result<(Opened, bool), ConnectError> {
+    let url = match &options.route {
+        Route::Udp => return Ok((Box::pin(over_udp(options)).await?, false)),
+        Route::Tunnel(url) => return Ok((Box::pin(through_tunnel(options, url)).await?, true)),
+        Route::UdpOrTunnel(url) => url,
+    };
+    // Boxed: the handshakes' state would make every future that awaits a
+    // connection too large for a thread's stack.
+    let mut udp = Box::pin(over_udp(options));
+    let failed_early = tokio::select! {
+        result = &mut udp => match result {
+            Ok(opened) => return Ok((opened, false)),
+            Err(error) => Some(error),
+        },
+        () = tokio::time::sleep(options.fallback_after) => None,
+    };
+    if let Some(udp_error) = failed_early {
+        return match by_deadline(deadline, Box::pin(through_tunnel(options, url))).await {
+            Ok(opened) => Ok((opened, true)),
+            Err(tunnel_error) => Err(no_route(url, udp_error, tunnel_error)),
+        };
+    }
+    // UDP is slow to answer: race it against the tunnel.
+    let mut tunnel = Box::pin(through_tunnel(options, url));
+    tokio::select! {
+        result = &mut udp => match result {
+            Ok(opened) => Ok((opened, false)),
+            Err(udp_error) => match by_deadline(deadline, tunnel).await {
+                Ok(opened) => Ok((opened, true)),
+                Err(tunnel_error) => Err(no_route(url, udp_error, tunnel_error)),
+            },
+        },
+        result = &mut tunnel => match result {
+            Ok(opened) => Ok((opened, true)),
+            Err(tunnel_error) => match by_deadline(deadline, udp).await {
+                Ok(opened) => Ok((opened, false)),
+                Err(udp_error) => Err(no_route(url, udp_error, tunnel_error)),
+            },
+        },
+    }
+}
+
+/// Runs a connection attempt until `deadline`. One that never answers fails
+/// with `Timeout`, to be reported next to the other route's failure.
+async fn by_deadline(
+    deadline: tokio::time::Instant,
+    attempt: impl Future<Output = Result<Opened, ConnectError>>,
+) -> Result<Opened, ConnectError> {
+    tokio::time::timeout_at(deadline, attempt)
+        .await
+        .unwrap_or(Err(ConnectError::Timeout))
+}
+
+fn no_route(url: &TunnelUrl, udp: ConnectError, tunnel: ConnectError) -> ConnectError {
+    ConnectError::NoRoute {
+        url: url.to_string(),
+        udp: Box::new(udp),
+        tunnel: Box::new(tunnel),
+    }
+}
+
+async fn over_udp(options: &ConnectOptions) -> Result<Opened, ConnectError> {
     let local: SocketAddr = if options.server.is_ipv6() {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
@@ -252,6 +401,29 @@ async fn connect_within(options: ConnectOptions) -> Result<(Client, Events), Con
     let connection = endpoint
         .connect(options.server, &options.server_name)?
         .await?;
+    Ok((endpoint, connection))
+}
+
+async fn through_tunnel(options: &ConnectOptions, url: &TunnelUrl) -> Result<Opened, ConnectError> {
+    let socket = tunnel::connect(url, &options.trust, options.server).await?;
+    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    endpoint.set_default_client_config(client_config(options.trust.clone())?);
+    let connection = endpoint
+        .connect(options.server, &options.server_name)?
+        .await?;
+    Ok((endpoint, connection))
+}
+
+async fn connect_within(
+    options: ConnectOptions,
+    deadline: tokio::time::Instant,
+) -> Result<(Client, Events), ConnectError> {
+    let ((endpoint, connection), tunneled) = open_connection(&options, deadline).await?;
     let (welcome, send, recv) = match handshake(&connection, &options).await {
         Ok(opened) => opened,
         Err(error) => {
@@ -303,6 +475,7 @@ async fn connect_within(options: ConnectOptions) -> Result<(Client, Events), Con
                 reader_done,
                 next_request: Arc::new(AtomicU32::new(1)),
             },
+            tunneled,
         },
         Events {
             receiver: events_rx,
@@ -366,6 +539,11 @@ impl Client {
 
     pub fn rtt(&self) -> Duration {
         self.connection.rtt()
+    }
+
+    /// Whether the session runs through a tunnel rather than over UDP.
+    pub fn tunneled(&self) -> bool {
+        self.tunneled
     }
 
     /// Sends a request and waits for its response.

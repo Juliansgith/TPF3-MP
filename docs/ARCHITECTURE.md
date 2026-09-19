@@ -178,8 +178,11 @@ connection carries:
 | bulk streams | snapshots, so a 100 MB+ transfer never delays turns |
 | datagrams | advisory traffic: cursors, build previews, pings |
 
-**Fallback:** WebSocket over TLS on TCP 443 behind the reverse proxy, for
-networks that block UDP. Same messages, one multiplexed connection.
+**Fallback:** for networks that block UDP, the same QUIC connection runs
+through a WebSocket over TLS on TCP 443, one datagram per message, usually
+behind the reverse proxy. The server merges tunnels into its QUIC endpoint,
+so nothing above the transport knows the difference (see "Tunnels" in
+PROTOCOL.md).
 
 **Frames:** a little-endian `u32` length plus a postcard-encoded message.
 Each channel has a hard frame cap, and every message is validated after

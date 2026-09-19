@@ -7,9 +7,10 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::{sync::oneshot, task::JoinHandle};
+use tpf3mp_net::tunnel::TunnelUrl;
 use tpf3mp_net::{ServerIdentity, ServerTrust};
 use tpf3mp_proto::{RoomSettings, Speed};
-use tpf3mp_server::{Server, ServerConfig, ServerStats, SnapshotConfig};
+use tpf3mp_server::{Server, ServerConfig, ServerStats, SnapshotConfig, TunnelConfig};
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -23,6 +24,8 @@ struct TestServer {
     address: SocketAddr,
     trust: ServerTrust,
     stats: ServerStats,
+    /// The server's tunnel, for players behind networks that block UDP.
+    tunnel: TunnelUrl,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -77,6 +80,8 @@ impl TestServer {
         // Compact logs every second or two of play, so restarts restore the
         // canonical ledger from a compacted log's base.
         config.compact_log_at = 1 << 10;
+        // Every scenario's UDP players share the endpoint with tunnels.
+        config.tunnel = Some(TunnelConfig::new("127.0.0.1:0".parse().unwrap()));
         config.tick = Duration::from_millis(25);
         // Every bot connects from loopback, one address.
         config.max_sessions_per_address = 1000;
@@ -85,6 +90,12 @@ impl TestServer {
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();
         let stats = server.stats();
+        let tunnel = format!(
+            "wss://localhost:{}/tpf3mp",
+            server.tunnel_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(server.run(async {
             let _ = stopped.await;
@@ -93,6 +104,7 @@ impl TestServer {
             address,
             trust,
             stats,
+            tunnel,
             stop: Some(stop),
             task,
         }
@@ -243,6 +255,7 @@ async fn games_behind_the_bridge_and_gate_agree() {
             target_step: 300,
             drift_at: None,
             join_after: None,
+            tunnel: None,
         })
         .collect();
     let reports = play_bridged_room(BridgedPlan {
@@ -299,6 +312,7 @@ async fn games_ride_out_a_server_restart() {
             target_step: 400,
             drift_at: None,
             join_after: None,
+            tunnel: None,
         })
         .collect();
     let game = tokio::spawn(play_bridged_room(BridgedPlan {
@@ -420,6 +434,7 @@ fn saving_players(count: u64, target_step: u64) -> Vec<BridgedPlayer> {
             target_step,
             drift_at: None,
             join_after: None,
+            tunnel: None,
         })
         .collect()
 }
@@ -479,6 +494,56 @@ async fn a_player_joins_a_running_game_from_the_rooms_world() {
     for report in &reports {
         assert!(report.diverged.is_empty(), "{:?}", report.diverged);
     }
+    server.stop().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_player_behind_a_udp_block_joins_late_through_the_tunnel() {
+    let root = temp_dir("tunnel-join");
+    let identity = ServerIdentity::self_signed(&["localhost"]).unwrap();
+    let server = TestServer::start_saving(
+        "127.0.0.1:0".parse().unwrap(),
+        identity,
+        None,
+        root.join("server"),
+    )
+    .await;
+    let settings = RoomSettings {
+        steps_per_second: 100,
+        input_delay_ms: 60,
+        checkpoint_interval: 20,
+    };
+    let mut players = saving_players(3, 600);
+    // The newcomer's network lets nothing but HTTPS out: it joins, downloads
+    // the world and plays, all through the tunnel.
+    players[2].join_after = Some(Duration::from_secs(2));
+    players[2].tunnel = Some(server.tunnel.clone());
+    let reports = play_bridged_room(BridgedPlan {
+        server: server.address,
+        server_name: "localhost".into(),
+        trust: server.trust.clone(),
+        settings,
+        players,
+        deadline: Duration::from_secs(60),
+        worlds: Some(root.join("players")),
+    })
+    .await
+    .unwrap();
+
+    assert_worlds_agree(&reports);
+    assert_eq!(
+        reports[2].received, 1,
+        "the newcomer loaded the room's world"
+    );
+    for report in &reports {
+        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
+    }
+    let metrics = server.stats.render_metrics();
+    assert!(
+        !metrics.contains("tpf3mp_tunnels_opened_total 0\n"),
+        "the newcomer came through the tunnel:\n{metrics}"
+    );
     server.stop().await;
     let _ = std::fs::remove_dir_all(&root);
 }

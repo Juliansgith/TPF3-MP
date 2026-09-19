@@ -13,12 +13,12 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use tpf3mp_agent::{
-    Client, ConnectOptions, Events, Worlds,
+    Client, ConnectOptions, Events, Route, Worlds,
     bridge::{self, Bridge, BridgeEnd, BridgeFault, BridgeOptions, Rejoin},
     connect,
 };
 use tpf3mp_ipc::{Config as LinkConfig, Link, Role};
-use tpf3mp_net::{Identity, ServerTrust};
+use tpf3mp_net::{Identity, ServerTrust, tunnel::TunnelUrl};
 use tpf3mp_proto::{
     ContentFingerprint, CreateRoom, FixedBytes, Invite, JoinRoom, RoomSettings, Speed, Text,
 };
@@ -172,6 +172,20 @@ pub struct BridgedPlayer {
     pub drift_at: Option<u64>,
     /// Join the game this long after it started, instead of from the lobby.
     pub join_after: Option<Duration>,
+    /// Reach the server only through this tunnel, as behind a network that
+    /// blocks UDP.
+    pub tunnel: Option<TunnelUrl>,
+}
+
+impl BridgedPlayer {
+    /// How this player connects.
+    fn options(&self, plan: &BridgedPlan) -> Result<ConnectOptions> {
+        let mut options = player_options(plan.server, &plan.server_name, &plan.trust, &self.name)?;
+        if let Some(url) = &self.tunnel {
+            options.route = Route::Tunnel(url.clone());
+        }
+        Ok(options)
+    }
 }
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
@@ -184,7 +198,7 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(0);
 pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
     let mut starting = Vec::new();
     for player in plan.players.iter().filter(|p| p.join_after.is_none()) {
-        let options = player_options(plan.server, &plan.server_name, &plan.trust, &player.name)?;
+        let options = player.options(&plan)?;
         let (client, events) = connect(options.clone())
             .await
             .context("connecting a player")?;
@@ -214,7 +228,7 @@ pub async fn play_bridged_room(plan: BridgedPlan) -> Result<Vec<HookReport>> {
     late.sort_by_key(|(_, _, after)| *after);
     for (index, player, after) in late {
         tokio::time::sleep_until(started + after).await;
-        let options = player_options(plan.server, &plan.server_name, &plan.trust, &player.name)?;
+        let options = player.options(&plan)?;
         let (client, events) = connect(options.clone())
             .await
             .context("connecting a late player")?;

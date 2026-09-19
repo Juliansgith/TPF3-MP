@@ -63,6 +63,14 @@ Rejected: TCP-only, which has head-of-line blocking between snapshots and
 turns, and raw UDP with custom reliability and cryptography, which is what
 `tpf2-multiplayer` had to build by hand.
 
+Update (2026-09-19): the fallback carries QUIC itself, not the messages. A
+tunnel is a WebSocket whose binary messages are QUIC datagrams, and the
+server merges tunnels into its one QUIC endpoint. A second transport for the
+same messages would have needed its own framing, multiplexing, flow control
+and authentication, and every feature would have had to work on both. QUIC
+inside TCP pays twice for congestion control and suffers TCP's head-of-line
+blocking, which is acceptable for networks that leave no other way.
+
 ## D4 (2026-09-18): operated servers, trusted by clients
 
 Servers are run by the project: first on the existing German server, then on

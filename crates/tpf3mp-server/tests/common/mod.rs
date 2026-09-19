@@ -27,6 +27,8 @@ pub const FAST: RoomSettings = RoomSettings {
 
 pub struct RunningServer {
     pub address: SocketAddr,
+    /// Where the server accepts tunnels, if it was configured to.
+    pub tunnel: Option<SocketAddr>,
     pub trust: ServerTrust,
     pub stats: ServerStats,
     stop: Option<oneshot::Sender<()>>,
@@ -46,6 +48,7 @@ impl RunningServer {
         configure(&mut config);
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();
+        let tunnel = server.tunnel_addr();
         let stats = server.stats();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(server.run(async {
@@ -53,6 +56,7 @@ impl RunningServer {
         }));
         Self {
             address,
+            tunnel,
             trust,
             stats,
             stop: Some(stop),

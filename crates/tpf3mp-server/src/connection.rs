@@ -281,7 +281,7 @@ impl Client {
             connection: connection.clone(),
         };
         Self {
-            origin: Origin::of(connection.remote_address().ip()),
+            origin: shared.origin(connection.remote_address()),
             connection,
             shared,
             player: hello.identity,

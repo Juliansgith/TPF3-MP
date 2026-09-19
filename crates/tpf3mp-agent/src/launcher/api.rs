@@ -13,6 +13,8 @@ pub(crate) struct View {
     pub(crate) player: Option<PlayerId>,
     pub(crate) connecting: bool,
     pub(crate) connected: bool,
+    /// The connection runs through a tunnel, not over UDP.
+    pub(crate) tunneled: bool,
     pub(crate) server_version: Option<String>,
     pub(crate) in_room: bool,
     pub(crate) invite: Option<String>,
@@ -60,6 +62,7 @@ struct State<'a> {
     server: Option<&'a str>,
     server_version: Option<&'a str>,
     connection: &'static str,
+    tunneled: bool,
     error: Option<&'a str>,
     room: Option<Room>,
     game: Game,
@@ -166,6 +169,7 @@ pub(crate) fn render(view: &View, status: &Status) -> String {
         server: view.server.as_deref(),
         server_version: view.server_version.as_deref(),
         connection,
+        tunneled: view.connected && view.tunneled,
         error: view.error.as_deref(),
         room,
         game: Game {
@@ -269,6 +273,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&render(&view, &Status::default())).unwrap();
         assert_eq!(json["connection"], "connected");
+        assert_eq!(json["tunneled"], false);
         assert_eq!(json["name"], "Ann");
         assert!(json["room"].is_null());
         assert_eq!(json["game"]["world"], "none");

@@ -3,12 +3,12 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use tpf3mp_agent::{
-    Client, ClientEvent, ConnectOptions, Events, Worlds,
+    Client, ClientEvent, ConnectOptions, Events, TunnelChoice, Worlds,
     bridge::{self, Bridge, BridgeOptions, Rejoin},
     connect,
     launcher::{Launcher, LauncherConfig},
 };
-use tpf3mp_net::{CertificateDer, Identity, ServerTrust};
+use tpf3mp_net::{CertificateDer, Identity, ServerTrust, tunnel::TunnelUrl};
 use tpf3mp_proto::{
     ContentFingerprint, CreateRoom, FixedBytes, Invite, JoinRoom, RoomPhase, RoomSettings,
     RoomView, Text,
@@ -132,6 +132,9 @@ struct LauncherArgs {
     #[arg(long)]
     identity: Option<PathBuf>,
 
+    #[command(flatten)]
+    tunnel: TunnelArgs,
+
     /// The shared-memory link the game's hook opens.
     #[arg(long, default_value = tpf3mp_bridge::DEFAULT_LINK)]
     game_link: String,
@@ -171,6 +174,47 @@ struct Server {
     /// makes you the same player next time.
     #[arg(long)]
     identity: Option<PathBuf>,
+
+    #[command(flatten)]
+    tunnel: TunnelArgs,
+}
+
+/// For networks that block UDP: QUIC through a WebSocket tunnel.
+#[derive(Debug, ClapArgs)]
+struct TunnelArgs {
+    /// The tunnel to take when UDP gets no answer, as a wss:// URL.
+    /// Defaults to wss://<server host>/tpf3mp.
+    #[arg(long)]
+    tunnel: Option<String>,
+
+    /// Connect through the tunnel only, never over UDP.
+    #[arg(long, conflicts_with = "no_tunnel")]
+    tunnel_only: bool,
+
+    /// Never take a tunnel.
+    #[arg(long, conflicts_with = "tunnel")]
+    no_tunnel: bool,
+}
+
+impl TunnelArgs {
+    fn choice(&self) -> Result<TunnelChoice> {
+        if self.no_tunnel {
+            return Ok(TunnelChoice::Off);
+        }
+        let url = self
+            .tunnel
+            .as_deref()
+            .map(|url| {
+                url.parse::<TunnelUrl>()
+                    .with_context(|| format!("the tunnel URL {url}"))
+            })
+            .transpose()?;
+        Ok(match (url, self.tunnel_only) {
+            (url, true) => TunnelChoice::Only(url),
+            (Some(url), false) => TunnelChoice::Url(url),
+            (None, false) => TunnelChoice::Default,
+        })
+    }
 }
 
 #[tokio::main]
@@ -178,7 +222,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
-    match Args::parse().command {
+    // On the heap: the commands' futures hold whole connection handshakes,
+    // more than the main thread's stack has room for in a debug build.
+    Box::pin(run(Args::parse().command)).await
+}
+
+async fn run(command: Command) -> Result<()> {
+    match command {
         Command::Connect(server) => {
             let (client, _events) = open(&server).await?;
             let welcome = client.welcome();
@@ -283,6 +333,7 @@ async fn launch(args: LauncherArgs) -> Result<()> {
     let launcher = Launcher::start(LauncherConfig {
         listen: args.listen,
         server: args.server,
+        tunnel: args.tunnel.choice()?,
         trust,
         identity,
         name: args.name,
@@ -387,11 +438,9 @@ async fn options(server: &Server) -> Result<ConnectOptions> {
         .rsplit_once(':')
         .context("the server address must be host:port")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let address: SocketAddr = tokio::net::lookup_host(&server.server)
+    let address = tpf3mp_agent::resolve(&server.server)
         .await
-        .with_context(|| format!("resolving {}", server.server))?
-        .next()
-        .with_context(|| format!("{} has no address", server.server))?;
+        .with_context(|| format!("resolving {}", server.server))?;
     let trust = match &server.pin_cert {
         Some(path) => ServerTrust::Pinned(CertificateDer::from(
             std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
@@ -402,7 +451,9 @@ async fn options(server: &Server) -> Result<ConnectOptions> {
         server.identity.as_ref(),
     )?)?);
     let name = Text::new(server.name.clone()).context("player name")?;
-    Ok(ConnectOptions::new(address, host, trust, identity, name))
+    let mut options = ConnectOptions::new(address, host, trust, identity, name);
+    options.route = server.tunnel.choice()?.route(host)?;
+    Ok(options)
 }
 
 /// The identity key file: the one given, or the per-user default.

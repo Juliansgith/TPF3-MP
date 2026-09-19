@@ -8,6 +8,9 @@ services:
     ports:
       # Players: QUIC over UDP.
       - "29470:29470/udp"
+      # Players whose networks block UDP: WebSocket tunnels, for the host's
+      # reverse proxy only (see docs/OPERATIONS.md, "Tunnels").
+      - "127.0.0.1:29471:29471/tcp"
       # Metrics and health, for the host only. Never publish this publicly.
       - "127.0.0.1:9470:9470/tcp"
     volumes:

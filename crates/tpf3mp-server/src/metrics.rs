@@ -29,12 +29,15 @@ pub(crate) struct Metrics {
     pub(crate) rebases: AtomicU64,
     pub(crate) snapshot_bytes_served: AtomicU64,
     pub(crate) logs_compacted: AtomicU64,
+    pub(crate) tunnels_opened: AtomicU64,
+    pub(crate) tunnels_refused: AtomicU64,
 }
 
 /// Values measured at scrape time rather than counted.
 pub(crate) struct Gauges {
     pub(crate) sessions: usize,
     pub(crate) rooms: usize,
+    pub(crate) tunnels: usize,
 }
 
 pub(crate) fn increment(counter: &AtomicU64) {
@@ -47,7 +50,7 @@ pub(crate) fn add(counter: &AtomicU64, amount: u64) {
 
 impl Metrics {
     pub(crate) fn render(&self, gauges: &Gauges) -> String {
-        let counters: [(&str, &str, &AtomicU64); 22] = [
+        let counters: [(&str, &str, &AtomicU64); 24] = [
             (
                 "sessions_opened",
                 "Sessions that completed the handshake.",
@@ -146,6 +149,16 @@ impl Metrics {
                 "Room logs rewritten to start from their game's current state.",
                 &self.logs_compacted,
             ),
+            (
+                "tunnels_opened",
+                "Tunnels opened: QUIC over WebSocket, for networks that block UDP.",
+                &self.tunnels_opened,
+            ),
+            (
+                "tunnels_refused",
+                "Tunnel connections refused by the server-wide or per-address limit.",
+                &self.tunnels_refused,
+            ),
         ];
         let mut out = String::new();
         for (name, help, counter) in counters {
@@ -160,6 +173,7 @@ impl Metrics {
         for (name, help, value) in [
             ("sessions", "Sessions open now.", gauges.sessions),
             ("rooms", "Rooms hosted now.", gauges.rooms),
+            ("tunnels", "Tunnels open now.", gauges.tunnels),
         ] {
             let _ = writeln!(out, "# HELP tpf3mp_{name} {help}");
             let _ = writeln!(out, "# TYPE tpf3mp_{name} gauge");
@@ -181,6 +195,7 @@ mod tests {
         let text = metrics.render(&Gauges {
             sessions: 3,
             rooms: 1,
+            tunnels: 0,
         });
         assert!(
             text.contains(

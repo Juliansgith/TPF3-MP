@@ -22,6 +22,34 @@ three kinds of stream:
 Every stream starts with the version preamble. Frames and limits are described
 in the `tpf3mp-proto` crate docs.
 
+### Tunnels
+
+A client whose network blocks UDP runs the same QUIC connection through a
+WebSocket tunnel instead:
+
+- The client opens a WebSocket to a `wss://` URL, by default
+  `wss://<server host>/tpf3mp` on port 443, offering the subprotocol
+  `tpf3mp-quic-1`. The server answers with that subprotocol or refuses.
+- Each binary message carries exactly one QUIC datagram of at most 2048
+  bytes. Text messages and larger messages end the tunnel. Pings and pongs
+  are allowed and carry nothing.
+- Everything else is unchanged: the QUIC handshake, TLS 1.3 with the
+  server's certificate, the streams and all limits. A proxy in front of the
+  server sees only QUIC ciphertext. The tunnel's own TLS only gets the
+  traffic through the network; the client accepts the tunnel's certificate
+  if public authorities vouch for it or if it is the server's pinned one.
+- The server merges tunnels into its one QUIC endpoint, where each tunnel
+  appears at an address of its own. Per-address limits count the tunnel's
+  client: its TCP address, or behind a proxy the last `X-Forwarded-For`
+  entry. A tunnel's client counts as having proved its address, so it is
+  never asked for a QUIC retry.
+- A tunnel that carries nothing for 60 s is closed. QUIC keep-alives cross
+  an open connection's tunnel every 5 s.
+
+Clients try UDP first. If UDP has not connected after 3 s, the tunnel joins
+the race, and whichever connects first is kept. Over a tunnel, one lost TCP
+segment holds up everything behind it, so it is only a fallback.
+
 ## Handshake and identity
 
 1. Both sides exchange the preamble. If the versions differ, both close with

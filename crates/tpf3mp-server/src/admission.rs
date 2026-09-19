@@ -22,6 +22,8 @@ pub(crate) struct Limits {
     /// Open rooms created from one address. A room counts until it closes,
     /// even after its creator disconnects.
     pub(crate) rooms_per_address: usize,
+    /// Tunnels one address may hold open, handshakes included.
+    pub(crate) tunnels_per_address: usize,
 }
 
 /// Where a connection comes from, as far as limits go. An IPv6 host usually
@@ -49,11 +51,12 @@ struct Held {
     handshakes: usize,
     sessions: usize,
     rooms: usize,
+    tunnels: usize,
 }
 
 impl Held {
     fn is_empty(&self) -> bool {
-        self.handshakes == 0 && self.sessions == 0 && self.rooms == 0
+        self.handshakes == 0 && self.sessions == 0 && self.rooms == 0 && self.tunnels == 0
     }
 }
 
@@ -130,6 +133,24 @@ impl Admission {
         })
     }
 
+    /// Counts a new tunnel against `origin`, or `None` when the address
+    /// already holds its share.
+    pub(crate) fn tunnel(self: &Arc<Self>, origin: Origin) -> Option<TunnelSlot> {
+        let mut held = self.lock();
+        let entry = held.entry(origin).or_default();
+        if entry.tunnels >= self.limits.tunnels_per_address {
+            if entry.is_empty() {
+                held.remove(&origin);
+            }
+            return None;
+        }
+        entry.tunnels += 1;
+        Some(TunnelSlot {
+            admission: Arc::clone(self),
+            origin,
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Origin, Held>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -156,6 +177,21 @@ impl Drop for RoomShare {
     fn drop(&mut self) {
         self.admission.release(self.origin, |held| {
             held.rooms = held.rooms.saturating_sub(1);
+        });
+    }
+}
+
+/// An open tunnel counted against its client's address; it stops counting
+/// when dropped.
+pub(crate) struct TunnelSlot {
+    admission: Arc<Admission>,
+    origin: Origin,
+}
+
+impl Drop for TunnelSlot {
+    fn drop(&mut self) {
+        self.admission.release(self.origin, |held| {
+            held.tunnels = held.tunnels.saturating_sub(1);
         });
     }
 }
@@ -219,7 +255,22 @@ mod tests {
             handshakes_per_address: 2,
             sessions_per_address: 1,
             rooms_per_address: 2,
+            tunnels_per_address: 2,
         }
+    }
+
+    #[test]
+    fn an_address_has_only_so_many_tunnels() {
+        let admission = Admission::new(limits());
+        let first = admission.tunnel(HOME).unwrap();
+        let _second = admission.tunnel(HOME).unwrap();
+        assert!(admission.tunnel(HOME).is_none());
+        assert!(admission.tunnel(AWAY).is_some());
+        drop(first);
+        assert!(
+            admission.tunnel(HOME).is_some(),
+            "a closed tunnel frees its slot"
+        );
     }
 
     #[test]
@@ -305,6 +356,7 @@ mod tests {
             handshakes_per_address: 8,
             sessions_per_address: 8,
             rooms_per_address: 8,
+            tunnels_per_address: 8,
         });
         let _a = accept(admission.on_attempt(HOME, true, true));
         let _b = accept(admission.on_attempt(AWAY, true, true));

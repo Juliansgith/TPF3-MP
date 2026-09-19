@@ -12,7 +12,7 @@ use tokio::{
     net::TcpStream,
 };
 use tpf3mp_agent::{
-    Worlds,
+    TunnelChoice, Worlds,
     launcher::{Launcher, LauncherConfig},
 };
 use tpf3mp_net::{Identity, ServerIdentity, ServerTrust};
@@ -123,6 +123,7 @@ fn launcher_config(
     LauncherConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         server: None,
+        tunnel: TunnelChoice::Off,
         trust: trust.clone(),
         identity,
         name: name.into(),

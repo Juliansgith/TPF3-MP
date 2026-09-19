@@ -1,9 +1,17 @@
 use std::{fmt, path::Path, sync::Arc, time::Duration};
 
 use quinn::crypto::rustls::{NoInitialCipherSuite, QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
-    pem::{self, PemObject},
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::{
+        VerifierBuilderError, WebPkiServerVerifier,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
+    crypto::CryptoProvider,
+    pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+        pem::{self, PemObject},
+    },
 };
 use thiserror::Error;
 use tpf3mp_proto::ALPN;
@@ -38,6 +46,8 @@ pub enum TlsError {
     Generate(#[from] rcgen::Error),
     #[error("the TLS configuration offers no cipher suite QUIC can use")]
     NoInitialCipherSuite(#[from] NoInitialCipherSuite),
+    #[error("cannot build the certificate verifier: {0}")]
+    Verifier(#[from] VerifierBuilderError),
 }
 
 /// The server's certificate chain and private key.
@@ -132,6 +142,113 @@ pub fn client_config(trust: ServerTrust) -> Result<quinn::ClientConfig, TlsError
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
     config.transport_config(Arc::new(client_transport()));
     Ok(config)
+}
+
+/// The TLS a server's tunnel listener serves: its own identity, over
+/// HTTP/1.1 for the WebSocket upgrade.
+pub fn tunnel_server_tls(identity: ServerIdentity) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let mut tls = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(identity.chain, identity.key)?;
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(tls))
+}
+
+/// The TLS a tunnel's client speaks. See [`TunnelVerifier`] for what it
+/// trusts.
+pub(crate) fn tunnel_client_tls(
+    trust: &ServerTrust,
+) -> Result<Arc<rustls::ClientConfig>, TlsError> {
+    let provider = crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let webpki =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+            .build()?;
+    let pinned = match trust {
+        ServerTrust::Pinned(certificate) => Some(certificate.clone()),
+        ServerTrust::WebPki => None,
+    };
+    let verifier = Arc::new(TunnelVerifier {
+        webpki,
+        pinned,
+        provider: Arc::clone(&provider),
+    });
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(tls))
+}
+
+/// Trusts a tunnel's certificate if public authorities vouch for it for the
+/// tunnel's host, or if it is exactly the server's pinned certificate. A
+/// proxy in front of a server with a pinned identity shows a public
+/// certificate of its own. Either way the QUIC connection inside checks the
+/// server's identity again, end to end.
+#[derive(Debug)]
+struct TunnelVerifier {
+    webpki: Arc<WebPkiServerVerifier>,
+    pinned: Option<CertificateDer<'static>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for TunnelVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if self
+            .pinned
+            .as_ref()
+            .is_some_and(|pinned| pinned.as_ref() == end_entity.as_ref())
+        {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.webpki
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
