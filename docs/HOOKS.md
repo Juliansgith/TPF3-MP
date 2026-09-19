@@ -115,6 +115,15 @@ A resolved target's address is `region_base + match_index + offset`.
 
 ## The detour engine
 
+Trampolines are allocated within 1 GiB of their target, so a relocated
+RIP-relative operand keeps a 32-bit displacement to the data it addresses.
+On Windows the free regions around the target are walked; on Unix, mmap
+hints step away from it. A trampoline is written while read-write, then
+turned read-execute; it is never writable and executable at once. On
+Windows, the prologue read stops at the end of the target's memory region.
+A relocation that still cannot reach fails the install cleanly
+(`DetourError::Encode`); it never produces wrong code.
+
 `tpf3mp_hookcore::detour::InlineDetour` is an x86-64 inline hook. Installing it
 overwrites a function's first instructions with a jump to a replacement, after
 copying those instructions into a **trampoline** that ends by jumping back into
@@ -169,6 +178,19 @@ The logical link name is mapped to a per-user OS object:
 - **Linux/macOS**: `shm_open`/`mmap` with mode `0600` (owner only). The name is
   `/tpf3mp.<hash>`, where `<hash>` includes the uid; it is kept within macOS's
   31-character `shm_open` limit.
+- **Other users** cannot reach the link. **The same user's processes can.**
+  Creation is not exclusive, because the agent re-creates the mapping after
+  a restart while the game still holds it (see "Restart"). A process of the
+  same user could therefore create the object first, or write into it. That
+  process can already debug or inject into the game, so this opens no new
+  boundary. Each side still treats the other's bytes as hostile:
+  - `open` refuses sizes `create` would refuse;
+  - no frame is read beyond its ring;
+  - a producer refuses a consumer index claiming more than the ring holds;
+  - `next_len` never exceeds `max_message`.
+
+  A hostile peer can garble or stall the link, but cannot make this side
+  read or write out of bounds (`tpf3mp-ipc/tests/poc_hostile_peer.rs`).
 
 ### Header layout (little-endian)
 

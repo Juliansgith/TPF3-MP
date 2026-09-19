@@ -47,14 +47,18 @@ impl InlineDetour {
         let rel_ok = fits_i32((detour_addr as i128) - ((target_addr + REL_JMP_LEN) as i128));
         let min_patch = if rel_ok { REL_JMP_LEN } else { ABS_JMP_LEN };
 
-        // SAFETY: a function has at least `PROLOGUE_SCAN` readable code bytes.
-        let code = unsafe { std::slice::from_raw_parts(target, PROLOGUE_SCAN) };
+        // Only as many bytes as the target's memory region holds: a function
+        // near the region's end is read no further.
+        let scan = sys::readable(target_addr, PROLOGUE_SCAN);
+        // SAFETY: `scan` bytes at `target` are readable code.
+        let code = unsafe { std::slice::from_raw_parts(target, scan) };
         let (instrs, steal_len) = decode_prologue(code, target_addr as u64, min_patch)?;
         let original = code[..steal_len].to_vec();
 
         // Trampoline: the relocated prologue, then an absolute jump back to the
-        // first instruction after it.
-        let trampoline = sys::alloc(steal_len + ABS_JMP_LEN + 64)?;
+        // first instruction after it. Near the target, so relocated
+        // RIP-relative operands still reach what they address.
+        let trampoline = sys::alloc_near(target_addr, steal_len + ABS_JMP_LEN + 64)?;
         let tramp_addr = trampoline.as_mut_ptr() as u64;
         let mut body = encode_block(&instrs, tramp_addr)?;
         body.extend_from_slice(&abs_jmp((target_addr + steal_len) as u64));
@@ -63,9 +67,14 @@ impl InlineDetour {
                 "relocated prologue does not fit the trampoline".to_owned(),
             ));
         }
-        // SAFETY: `trampoline` is a fresh RWX buffer of at least `body.len()`.
+        // SAFETY: `trampoline` is a fresh writable buffer of at least
+        // `body.len()` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(body.as_ptr(), trampoline.as_mut_ptr(), body.len());
+        }
+        sys::make_executable(&trampoline)?;
+        // SAFETY: the trampoline is now executable code of `body.len()` bytes.
+        unsafe {
             sys::flush_icache(trampoline.as_mut_ptr(), body.len());
         }
 
@@ -238,9 +247,14 @@ mod tests {
         code[0x0E] = 0xC3;
         code[0x40..0x44].copy_from_slice(&value.to_le_bytes());
         let buffer = sys::alloc(code.len()).unwrap();
-        // SAFETY: `buffer` is a fresh RWX region of exactly `code.len()` bytes.
+        // SAFETY: `buffer` is a fresh writable region of exactly `code.len()`
+        // bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(code.as_ptr(), buffer.as_mut_ptr(), code.len());
+        }
+        sys::make_executable(&buffer).unwrap();
+        // SAFETY: the buffer now holds executable code.
+        unsafe {
             sys::flush_icache(buffer.as_mut_ptr(), code.len());
         }
         buffer
@@ -280,9 +294,13 @@ mod tests {
     fn refuses_a_prologue_that_branches_immediately() {
         // A buffer that starts with `ret`: it cannot be stolen.
         let buffer = sys::alloc(PROLOGUE_SCAN).unwrap();
-        // SAFETY: fresh RWX buffer; fill it with `ret` bytes.
+        // SAFETY: fresh writable buffer; fill it with `ret` bytes.
         unsafe {
             std::ptr::write_bytes(buffer.as_mut_ptr(), 0xC3, PROLOGUE_SCAN);
+        }
+        sys::make_executable(&buffer).unwrap();
+        // SAFETY: the buffer now holds executable code.
+        unsafe {
             sys::flush_icache(buffer.as_mut_ptr(), PROLOGUE_SCAN);
         }
         // SAFETY: the target is never executed; install refuses before patching.
