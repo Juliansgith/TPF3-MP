@@ -110,6 +110,19 @@ cargo run -p tpf3mp-agent -- host 127.0.0.1:29470 --pin-cert runtime/dev-cert.de
 cargo run -p tpf3mp-agent -- join 127.0.0.1:29470 <invite> --pin-cert runtime/dev-cert.der --name bob
 ```
 
+Play a room through the whole stack, with a fake game in place of TPF3.
+Each game process attaches to its agent over shared memory and runs the toy
+game behind the step gate, as the real hook will:
+
+```sh
+cargo run -p tpf3mp-agent -- host 127.0.0.1:29470 --pin-cert runtime/dev-cert.der --name ann --game-link ann --start-with 2
+cargo run -p tpf3mp-testkit --bin tpf3mp-fakegame -- ann --steps 100
+cargo run -p tpf3mp-agent -- join 127.0.0.1:29470 <invite> --pin-cert runtime/dev-cert.der --name bob --game-link bob
+cargo run -p tpf3mp-testkit --bin tpf3mp-fakegame -- bob --steps 100
+```
+
+Both games print the same lane digests at the end.
+
 Load-test a server with bots:
 
 ```sh

@@ -1464,6 +1464,7 @@ dependencies = [
  "clap",
  "dirs",
  "quinn",
+ "ring",
  "thiserror",
  "tokio",
  "tpf3mp-bridge",

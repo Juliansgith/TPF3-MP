@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
 quinn.workspace = true
+ring.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tpf3mp-bridge.workspace = true
