@@ -191,6 +191,11 @@ The logical link name is mapped to a per-user OS object:
 
   A hostile peer can garble or stall the link, but cannot make this side
   read or write out of bounds (`tpf3mp-ipc/tests/poc_hostile_peer.rs`).
+  Nor can it make the agent take in, and so delete, a file other than a
+  save in the directory the agent named (`tests/hook_save_path.rs` in
+  `tpf3mp-agent`). A game that stops reading makes the agent stop taking
+  the room's turns once about 16 MiB wait for it, rather than hold them
+  all.
 
 ### Header layout (little-endian)
 
@@ -280,7 +285,8 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
   - `Ran { step }`: the game ran this step.
   - `Checkpoint { step, lanes }`: digests at a checkpoint.
   - `Saved { event, lanes, file }`: the world as saved at a save event, and
-    its digests there; no file if saving failed.
+    its digests there; no file if saving failed. The file must be in the
+    directory `Begin` named; the agent takes in no other.
   - `Chat { text }`: the player says something to the room
     (`Session::chat`).
   - `Log`: a line for the agent's log.

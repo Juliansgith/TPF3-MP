@@ -148,7 +148,9 @@ simulation time, whatever its latency. Clients enforce them strictly
 (`TurnFollower`): an event whose step is not the previous turn's frontier
 plus one, a counter at the end of its range, or more than 256 MiB of events
 waiting is a protocol violation. A client also holds at most 64 MiB of
-turns the game has not taken yet, then stops reading until it does. Invariant 1 also makes building work
+turns the game has not taken yet, and its link to the game about 16 MiB of
+events the game has not read, then stops reading until the game catches up.
+Invariant 1 also makes building work
 while paused: a paused client has executed `sealed_through` and can apply the
 events for `sealed_through + 1` at once, without running a step.
 

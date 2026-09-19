@@ -24,8 +24,8 @@ use tpf3mp_bridge::{
 };
 use tpf3mp_net::close;
 use tpf3mp_proto::{
-    ChatText, ContentFingerprint, Invite, JoinRoom, LaneDigest, PlayerId, Request, RequestError,
-    Resume, RoomView, SavedWorld, SnapshotId, Speed, Text, WorldOffer,
+    ChatText, ContentFingerprint, Event, EventBody, Invite, JoinRoom, LaneDigest, PlayerId,
+    Request, RequestError, Resume, RoomView, SavedWorld, SnapshotId, Speed, Text, WorldOffer,
 };
 use tpf3mp_snapshot::ManifestId;
 use tracing::{debug, info, warn};
@@ -277,7 +277,7 @@ pub struct Bridge<L> {
     follower: Option<TurnFollower>,
     playout: Option<Playout>,
     /// Messages for the hook, in order, sent as the hook takes them.
-    outbox: VecDeque<ToHook>,
+    outbox: Outbox,
     hook_ready: bool,
     begun: bool,
     world: World,
@@ -319,7 +319,7 @@ impl<L: HookLink> Bridge<L> {
             options,
             follower: None,
             playout: None,
-            outbox: VecDeque::new(),
+            outbox: Outbox::default(),
             hook_ready: false,
             begun: false,
             world: World::Ready,
@@ -380,8 +380,11 @@ impl<L: HookLink> Bridge<L> {
             self.flush()?;
             let poll_at = now + self.options.poll;
             let wake = self.wait_until.map_or(poll_at, |at| at.min(poll_at));
+            // While the hook falls behind, the room's turns wait in the
+            // client, and past its bound on the server's stream.
+            let taking = !self.outbox.is_full();
             tokio::select! {
-                event = events.recv() => {
+                event = events.recv(), if taking => {
                     let Some(event) = event else {
                         return Ok(BridgeEnd::EventsEnded);
                     };
@@ -532,10 +535,19 @@ impl<L: HookLink> Bridge<L> {
         };
         let done = self.done_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let result = worlds
-                .ingest(&file)
-                .map(|(manifest, world)| (manifest.id(), world))
-                .map_err(|error| format!("cannot keep the save {}: {error}", file.display()));
+            // The hook saves where it was told. Any other file it names is
+            // the player's, not the agent's to take in and delete.
+            let result = if within(&file, worlds.saves()) {
+                worlds
+                    .ingest(&file)
+                    .map(|(manifest, world)| (manifest.id(), world))
+                    .map_err(|error| format!("cannot keep the save {}: {error}", file.display()))
+            } else {
+                Err(format!(
+                    "the game reported a save outside {}: not taken",
+                    worlds.saves().display()
+                ))
+            };
             let _ = done.send(Done::Ingested {
                 event,
                 lanes,
@@ -910,6 +922,78 @@ impl<L: HookLink> Bridge<L> {
     }
 }
 
+/// Whether `file` is a file inside `dir`, links followed.
+fn within(file: &Path, dir: &Path) -> bool {
+    match (file.canonicalize(), dir.canonicalize()) {
+        (Ok(file), Ok(dir)) => file != dir && file.starts_with(dir),
+        _ => false,
+    }
+}
+
+/// Messages waiting for the hook, and about how many bytes they hold.
+///
+/// A hook that does not read, as before it attaches or while the game loads
+/// a world, must not make the agent hold whatever the server sends. Past
+/// [`OUTBOX_BYTES`] the bridge takes nothing more from the room until the
+/// hook catches up: the turns wait in the client, whose own bound then holds
+/// back the server's stream.
+#[derive(Debug, Default)]
+pub(crate) struct Outbox {
+    messages: VecDeque<ToHook>,
+    bytes: usize,
+}
+
+/// About how much the outbox holds before the bridge stops taking turns.
+const OUTBOX_BYTES: usize = 16 << 20;
+
+impl Outbox {
+    /// About how many bytes `message` takes.
+    fn weight(message: &ToHook) -> usize {
+        let carried = match message {
+            ToHook::Apply(Event {
+                body: EventBody::Command { payload, .. },
+                ..
+            }) => payload.len(),
+            ToHook::Load { file, .. } => file.as_ref().map_or(0, |file| file.as_str().len()),
+            ToHook::Begin { saves, .. } => saves.as_str().len(),
+            ToHook::Diverged { lanes, .. } => lanes.len() * 2,
+            ToHook::Chat { from, text } => from.as_str().len() + text.as_str().len(),
+            ToHook::End { reason } => reason.as_str().len(),
+            _ => 0,
+        };
+        carried + 64
+    }
+
+    fn push_back(&mut self, message: ToHook) {
+        self.bytes += Self::weight(&message);
+        self.messages.push_back(message);
+    }
+
+    fn push_front(&mut self, message: ToHook) {
+        self.bytes += Self::weight(&message);
+        self.messages.push_front(message);
+    }
+
+    fn front(&self) -> Option<&ToHook> {
+        self.messages.front()
+    }
+
+    fn pop_front(&mut self) -> Option<ToHook> {
+        let message = self.messages.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(Self::weight(&message));
+        Some(message)
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&ToHook) -> bool) {
+        self.messages.retain(keep);
+        self.bytes = self.messages.iter().map(Self::weight).sum();
+    }
+
+    fn is_full(&self) -> bool {
+        self.bytes >= OUTBOX_BYTES
+    }
+}
+
 fn path_text(path: &Path) -> Result<Text<MAX_PATH>, BridgeFault> {
     Text::new(path.to_string_lossy().into_owned())
         .map_err(|_| BridgeFault::PathTooLong(path.to_owned()))
@@ -1085,10 +1169,14 @@ pub(crate) fn pump(
     follower: &mut TurnFollower,
     playout: &mut Playout,
     now: Instant,
-    out: &mut VecDeque<ToHook>,
+    out: &mut Outbox,
 ) -> Option<Instant> {
     let mut released = None;
     let wait = loop {
+        if out.is_full() {
+            // The hook is behind; the follower keeps the rest.
+            break None;
+        }
         if let Some(step) = follower.next_step() {
             let due = playout.due(step, now).unwrap_or(now);
             if due > now {
@@ -1118,7 +1206,7 @@ pub(crate) fn pump(
 
 #[cfg(test)]
 mod tests {
-    use tpf3mp_proto::{Event, EventBody, FixedBytes, PlayerId, RoomId, Turn, TurnStart};
+    use tpf3mp_proto::{FixedBytes, MAX_PAYLOAD, Payload, RoomId, Turn, TurnStart};
 
     use super::*;
 
@@ -1170,10 +1258,10 @@ mod tests {
     fn steps_without_events_between_them_go_out_as_one_release() {
         let now = Instant::now();
         let (mut follower, mut playout) = fed(vec![turn(1, 5, vec![])], now);
-        let mut out = VecDeque::new();
+        let mut out = Outbox::default();
         // Steps 1 to 5 were sealed at once; reckoned at pace, all are due.
         let wait = pump(&mut follower, &mut playout, now, &mut out);
-        assert_eq!(out, [ToHook::Release { through: 5 }]);
+        assert_eq!(out.messages, [ToHook::Release { through: 5 }]);
         assert_eq!(wait, None, "nothing further is sealed");
     }
 
@@ -1184,7 +1272,7 @@ mod tests {
             vec![turn(1, 2, vec![event(1, 1)]), turn(2, 4, vec![event(2, 3)])],
             now,
         );
-        let mut out = VecDeque::new();
+        let mut out = Outbox::default();
         // Both turns arrived together, so steps 3 and 4 play at pace after
         // step 2: a second later, all are due.
         pump(
@@ -1194,7 +1282,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(
-            out,
+            out.messages,
             [
                 ToHook::Apply(event(1, 1)),
                 ToHook::Release { through: 2 },
@@ -1208,16 +1296,16 @@ mod tests {
     fn a_step_not_yet_due_waits_and_says_when() {
         let now = Instant::now();
         let (mut follower, mut playout) = fed(vec![turn(1, 1, vec![])], now);
-        let mut out = VecDeque::new();
+        let mut out = Outbox::default();
         pump(&mut follower, &mut playout, now, &mut out);
-        assert_eq!(out, [ToHook::Release { through: 1 }]);
+        assert_eq!(out.messages, [ToHook::Release { through: 1 }]);
         // Step 2 arrives now; with steps 100 ms apart, it plays 100 ms after
         // step 1.
         follower.accept(turn(2, 2, vec![])).unwrap();
         playout.on_turn(2, Speed::NORMAL, now);
-        out.clear();
+        out = Outbox::default();
         let wait = pump(&mut follower, &mut playout, now, &mut out);
-        assert!(out.is_empty());
+        assert!(out.messages.is_empty());
         assert!(wait.is_some_and(|at| at > now), "{wait:?}");
         let wait = pump(
             &mut follower,
@@ -1225,7 +1313,52 @@ mod tests {
             now + Duration::from_millis(100),
             &mut out,
         );
-        assert_eq!(out, [ToHook::Release { through: 2 }]);
+        assert_eq!(out.messages, [ToHook::Release { through: 2 }]);
         assert_eq!(wait, None);
+    }
+
+    #[test]
+    fn a_full_outbox_takes_nothing_more_from_the_room() {
+        let now = Instant::now();
+        let big = |seq| Event {
+            seq,
+            step: 1,
+            body: EventBody::Command {
+                player: PlayerId(FixedBytes([7; 32])),
+                client_seq: seq,
+                payload: Payload::new(vec![0; MAX_PAYLOAD]).unwrap(),
+            },
+        };
+        // Far more than the outbox takes, all for the next step.
+        let events: Vec<Event> = (1..=1000).map(big).collect();
+        let (mut follower, mut playout) = fed(vec![turn(1, 0, events)], now);
+        let mut out = Outbox::default();
+        pump(&mut follower, &mut playout, now, &mut out);
+        assert!(out.is_full());
+        let taken = out.messages.len();
+        assert!(taken < 1000 && out.bytes < OUTBOX_BYTES + MAX_PAYLOAD + 64);
+        // Nothing more while it is full; the rest once the hook read some.
+        pump(&mut follower, &mut playout, now, &mut out);
+        assert_eq!(out.messages.len(), taken);
+        while out.pop_front().is_some() && out.messages.len() > taken / 2 {}
+        pump(&mut follower, &mut playout, now, &mut out);
+        assert!(out.messages.len() > taken / 2);
+    }
+
+    #[test]
+    fn only_files_inside_the_saves_directory_are_within_it() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-within-{}", std::process::id()));
+        let saves = dir.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let inside = saves.join("12.sav");
+        let outside = dir.join("notes.txt");
+        std::fs::write(&inside, b"save").unwrap();
+        std::fs::write(&outside, b"notes").unwrap();
+        assert!(within(&inside, &saves));
+        assert!(!within(&outside, &saves));
+        assert!(!within(&saves.join("..").join("notes.txt"), &saves));
+        assert!(!within(&saves, &saves));
+        assert!(!within(&saves.join("missing.sav"), &saves));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
