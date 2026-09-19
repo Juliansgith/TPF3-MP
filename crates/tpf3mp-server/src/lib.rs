@@ -52,6 +52,13 @@ pub struct ServerConfig {
     pub roomless_timeout: Duration,
     /// Rooms hosted at once.
     pub max_rooms: usize,
+    /// Open rooms created from one address. A room counts until it closes,
+    /// so throwaway identities cannot fill `max_rooms`.
+    pub max_rooms_per_address: usize,
+    /// A running game nobody has been connected to for this long closes,
+    /// and its log is deleted. Restored games get this long for their
+    /// players to return after a restart.
+    pub abandoned_timeout: Duration,
     /// Key for the HMAC tags of invites and room passwords. An invite stays
     /// valid only while the server keeps this key.
     pub secret: [u8; 32],
@@ -88,6 +95,9 @@ impl ServerConfig {
             // Time to browse invites and set up a game, not to hold a slot.
             roomless_timeout: Duration::from_secs(600),
             max_rooms: 10_000,
+            max_rooms_per_address: 8,
+            // Long enough to ride out a server restart or a player's crash.
+            abandoned_timeout: Duration::from_secs(600),
             secret,
             ruleset: Arc::new(|| Box::new(AcceptAll)),
             tick: Duration::from_millis(100),
@@ -116,6 +126,8 @@ impl fmt::Debug for ServerConfig {
             .field("handshake_timeout", &self.handshake_timeout)
             .field("roomless_timeout", &self.roomless_timeout)
             .field("max_rooms", &self.max_rooms)
+            .field("max_rooms_per_address", &self.max_rooms_per_address)
+            .field("abandoned_timeout", &self.abandoned_timeout)
             .field("tick", &self.tick)
             .field("data_dir", &self.data_dir)
             .finish_non_exhaustive()
@@ -163,6 +175,7 @@ impl Server {
                 timeouts: Timeouts {
                     stall: config.stall_timeout,
                     load: config.load_timeout,
+                    abandoned: config.abandoned_timeout,
                 },
             },
         }));
@@ -177,6 +190,7 @@ impl Server {
                 handshakes: config.max_handshakes.max(1),
                 handshakes_per_address: config.max_handshakes_per_address.max(1),
                 sessions_per_address: config.max_sessions_per_address.max(1),
+                rooms_per_address: config.max_rooms_per_address.max(1),
             }),
             handshake_timeout: config.handshake_timeout,
             roomless_timeout: config.roomless_timeout,

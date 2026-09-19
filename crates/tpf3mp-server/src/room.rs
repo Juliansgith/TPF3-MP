@@ -26,6 +26,7 @@ use tpf3mp_proto::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    admission::RoomShare,
     directory::Directory,
     metrics::{self, Metrics},
     pacing::Pacer,
@@ -241,6 +242,8 @@ pub(crate) struct Timeouts {
     pub(crate) stall: Duration,
     /// A member still loading the world this long after the start.
     pub(crate) load: Duration,
+    /// A running game with nobody connected for this long closes.
+    pub(crate) abandoned: Duration,
 }
 
 /// How a member relates to the room clock.
@@ -308,6 +311,11 @@ pub(crate) struct Room {
     data_dir: Option<PathBuf>,
     timeouts: Timeouts,
     log: Option<RoomLog>,
+    /// Since when no member has been connected, while the game runs.
+    unattended_since: Option<Instant>,
+    /// Counts this room against the address that created it until it
+    /// closes. Restored rooms have none.
+    _share: Option<RoomShare>,
     closed: bool,
 }
 
@@ -345,6 +353,7 @@ pub(crate) struct RoomSpec {
     pub(crate) secrets: RoomSecrets,
     pub(crate) ruleset: Box<dyn Ruleset>,
     pub(crate) env: RoomEnv,
+    pub(crate) share: RoomShare,
 }
 
 impl Room {
@@ -364,6 +373,8 @@ impl Room {
             data_dir: spec.env.data_dir,
             timeouts: spec.env.timeouts,
             log: None,
+            unattended_since: None,
+            _share: Some(spec.share),
             closed: false,
         };
         room.members.push(Member::new(owner));
@@ -475,6 +486,10 @@ impl Room {
             data_dir: env.data_dir,
             timeouts: env.timeouts,
             log: Some(log),
+            // Nobody is connected after a restart; the abandon timeout runs
+            // from here.
+            unattended_since: None,
+            _share: None,
             closed: false,
         }))
     }
@@ -1037,7 +1052,37 @@ impl Room {
         }
     }
 
+    /// Closes a running game nobody has been connected to for the abandon
+    /// timeout, and deletes its log. Without this, games whose players all
+    /// disconnected would hold server resources forever, even across
+    /// restarts.
+    fn expire_if_abandoned(&mut self, now: Instant) {
+        if !matches!(self.phase, Phase::Running(_)) {
+            return;
+        }
+        if self.members.iter().any(|member| member.link.is_some()) {
+            self.unattended_since = None;
+            return;
+        }
+        let since = *self.unattended_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < self.timeouts.abandoned {
+            return;
+        }
+        info!(room = %self.id, "closing a game nobody returned to");
+        metrics::increment(&self.metrics.rooms_abandoned);
+        if let Some(log) = self.log.take()
+            && let Err(error) = log.delete()
+        {
+            warn!(room = %self.id, %error, "cannot delete the log of an abandoned room");
+        }
+        self.closed = true;
+    }
+
     fn on_tick(&mut self, now: Instant) {
+        self.expire_if_abandoned(now);
+        if self.closed {
+            return;
+        }
         self.decide_waiting_rounds(now);
         self.demote_stalled(now);
         let Phase::Running(game) = &mut self.phase else {

@@ -19,6 +19,9 @@ pub(crate) struct Limits {
     pub(crate) handshakes_per_address: usize,
     /// Sessions held by one address.
     pub(crate) sessions_per_address: usize,
+    /// Open rooms created from one address. A room counts until it closes,
+    /// even after its creator disconnects.
+    pub(crate) rooms_per_address: usize,
 }
 
 /// Where a connection comes from, as far as limits go. An IPv6 host usually
@@ -45,6 +48,13 @@ impl Origin {
 struct Held {
     handshakes: usize,
     sessions: usize,
+    rooms: usize,
+}
+
+impl Held {
+    fn is_empty(&self) -> bool {
+        self.handshakes == 0 && self.sessions == 0 && self.rooms == 0
+    }
 }
 
 /// What to do with a connection attempt.
@@ -89,7 +99,7 @@ impl Admission {
         let mut held = self.lock();
         let entry = held.entry(origin).or_default();
         if entry.handshakes >= self.limits.handshakes_per_address {
-            if entry.handshakes == 0 && entry.sessions == 0 {
+            if entry.is_empty() {
                 held.remove(&origin);
             }
             return Decision::Refuse;
@@ -102,6 +112,24 @@ impl Admission {
         })
     }
 
+    /// Counts a new room against `origin`, or `None` when the address
+    /// already has its share of open rooms.
+    pub(crate) fn room(self: &Arc<Self>, origin: Origin) -> Option<RoomShare> {
+        let mut held = self.lock();
+        let entry = held.entry(origin).or_default();
+        if entry.rooms >= self.limits.rooms_per_address {
+            if entry.is_empty() {
+                held.remove(&origin);
+            }
+            return None;
+        }
+        entry.rooms += 1;
+        Some(RoomShare {
+            admission: Arc::clone(self),
+            origin,
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Origin, Held>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -110,10 +138,25 @@ impl Admission {
         let mut held = self.lock();
         if let Some(entry) = held.get_mut(&origin) {
             update(entry);
-            if entry.handshakes == 0 && entry.sessions == 0 {
+            if entry.is_empty() {
                 held.remove(&origin);
             }
         }
+    }
+}
+
+/// An open room counted against the address it was created from; it stops
+/// counting when the room drops it.
+pub(crate) struct RoomShare {
+    admission: Arc<Admission>,
+    origin: Origin,
+}
+
+impl Drop for RoomShare {
+    fn drop(&mut self) {
+        self.admission.release(self.origin, |held| {
+            held.rooms = held.rooms.saturating_sub(1);
+        });
     }
 }
 
@@ -175,7 +218,22 @@ mod tests {
             handshakes: 8,
             handshakes_per_address: 2,
             sessions_per_address: 1,
+            rooms_per_address: 2,
         }
+    }
+
+    #[test]
+    fn an_address_has_only_so_many_open_rooms() {
+        let admission = Admission::new(limits());
+        let first = admission.room(HOME).unwrap();
+        let _second = admission.room(HOME).unwrap();
+        assert!(admission.room(HOME).is_none());
+        assert!(admission.room(AWAY).is_some());
+        drop(first);
+        assert!(
+            admission.room(HOME).is_some(),
+            "a closed room frees its share"
+        );
     }
 
     fn accept(decision: Decision) -> Handshake {
@@ -246,6 +304,7 @@ mod tests {
             handshakes: 2,
             handshakes_per_address: 8,
             sessions_per_address: 8,
+            rooms_per_address: 8,
         });
         let _a = accept(admission.on_attempt(HOME, true, true));
         let _b = accept(admission.on_attempt(AWAY, true, true));

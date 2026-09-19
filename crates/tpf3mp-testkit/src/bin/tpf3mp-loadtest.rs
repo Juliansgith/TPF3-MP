@@ -171,6 +171,7 @@ async fn start_local(args: &Args) -> Result<(SocketAddr, ServerTrust, LocalServe
     config.max_sessions_per_address = 100_000;
     config.max_handshakes = 100_000;
     config.max_handshakes_per_address = 100_000;
+    config.max_rooms_per_address = 100_000;
     let server = Server::bind(config)?;
     let mut address = server.local_addr()?;
     let task = tokio::spawn(server.run(std::future::pending()));

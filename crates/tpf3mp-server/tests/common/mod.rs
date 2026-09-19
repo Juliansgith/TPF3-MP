@@ -45,6 +45,7 @@ impl RunningServer {
         // Every test client connects from loopback, one address.
         config.max_sessions_per_address = 1000;
         config.max_handshakes_per_address = 1000;
+        config.max_rooms_per_address = 1000;
         configure(&mut config);
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();

@@ -28,7 +28,7 @@ use tracing::{debug, info};
 
 use crate::{
     Shared,
-    admission::{self, Handshake},
+    admission::{self, Handshake, Origin},
     metrics,
     room::{MemberLink, NewMember, Reply, RoomCommand, RoomHandle, TurnFeed},
 };
@@ -229,6 +229,7 @@ enum Violation {
 struct Client {
     connection: quinn::Connection,
     shared: Arc<Shared>,
+    origin: Origin,
     player: PlayerId,
     hello: Hello,
     link: MemberLink,
@@ -248,6 +249,7 @@ impl Client {
             connection: connection.clone(),
         };
         Self {
+            origin: Origin::of(connection.remote_address().ip()),
             connection,
             shared,
             player: hello.identity,
@@ -336,8 +338,15 @@ impl Client {
                 if self.room.is_some() {
                     return Err(RequestError::AlreadyInRoom);
                 }
+                let share = self
+                    .shared
+                    .admission
+                    .room(self.origin)
+                    .ok_or(RequestError::TooManyRooms)?;
                 let (handle, invite, room) =
-                    self.shared.directory.create(self.new_member(), create)?;
+                    self.shared
+                        .directory
+                        .create(self.new_member(), create, share)?;
                 self.room = Some(handle);
                 Ok(Response::RoomCreated { invite, room })
             }

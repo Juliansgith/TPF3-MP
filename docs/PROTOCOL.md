@@ -43,7 +43,11 @@ player who reconnects with the same key is the same player.
 A room has a name, an owner, a player limit, settings, members, and a phase:
 **lobby** or **running**.
 
-- **Creating.** Any player can create a room and becomes its owner.
+- **Creating.** Any player can create a room and becomes its owner. One
+  network address can have at most 8 rooms open (`TooManyRooms`).
+- **Closing.** A room closes when its last member leaves. A running game
+  also closes when nobody has been connected to it for 10 minutes; until
+  then, disconnected players keep their seats and can resume.
 - **Invites.** The server answers with an **invite**,
   `TPF3MP1.<base64url(room id ‖ 256-bit token)>`. The server stores only an
   HMAC of the token under a server-side pepper and checks it in constant time.

@@ -15,6 +15,7 @@ use tpf3mp_proto::{
 use tracing::{info, warn};
 
 use crate::{
+    admission::RoomShare,
     metrics,
     room::{NewMember, ROOM_QUEUE, Room, RoomEnv, RoomHandle, RoomSecrets, RoomSpec},
     ruleset::RulesetFactory,
@@ -83,10 +84,12 @@ impl Directory {
     }
 
     /// Creates a room with `owner` as its first member and starts its task.
+    /// The room holds `share` until it closes.
     pub(crate) fn create(
         self: &Arc<Self>,
         owner: NewMember,
         request: CreateRoom,
+        share: RoomShare,
     ) -> Result<(RoomHandle, Invite, RoomView), RequestError> {
         if !request.settings.is_valid() || !(1..=MAX_ROOM_MEMBERS).contains(&request.max_players) {
             return Err(RequestError::InvalidSettings);
@@ -122,6 +125,7 @@ impl Directory {
                 secrets,
                 ruleset: (self.ruleset)(),
                 env: self.env.clone(),
+                share,
             },
             owner,
         );

@@ -36,6 +36,7 @@ impl TestServer {
         // Every bot connects from loopback, one address.
         config.max_sessions_per_address = 1000;
         config.max_handshakes_per_address = 1000;
+        config.max_rooms_per_address = 1000;
         let server = Server::bind(config).unwrap();
         let address = server.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();

@@ -139,8 +139,10 @@ async fn raw_request(
 /// is no expiry, so anyone can fill `max_rooms` with one-player games: a
 /// fresh key, CreateRoom, DeclareContent, SetReady, StartGame, disconnect.
 /// With `--data-dir` (the image default) the lock-out survives restarts.
+///
+/// Fixed: a running game nobody is connected to closes after the abandon
+/// timeout (shortened here), and its log goes with it.
 #[tokio::test]
-#[ignore = "security PoC: fails until abandoned running rooms are reclaimed"]
 async fn abandoned_games_do_not_lock_everyone_out_of_the_server() {
     let dir = data_dir("zombies");
     let secret = [3; 32];
@@ -149,6 +151,7 @@ async fn abandoned_games_do_not_lock_everyone_out_of_the_server() {
             config.max_rooms = 3;
             config.data_dir = Some(dir);
             config.secret = secret;
+            config.abandoned_timeout = Duration::from_millis(200);
         }
     };
     let server = RunningServer::start(config(dir.clone())).await;

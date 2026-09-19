@@ -90,6 +90,8 @@ What happens during the restart:
 3. Players reconnect with the same identity and resume after the last turn
    they applied. The event log continues without a gap. Lobbies that had not
    started are not kept.
+4. A restored game that nobody reconnects to within 10 minutes closes and
+   its log is deleted, like any running game whose players all disconnected.
 
 Persistence details:
 
@@ -143,5 +145,9 @@ games do, so the latencies it reports are the ones players would feel.
   `retries_sent` and `connections_refused` counters show when this happens.
 - A session that stays outside any room for 10 minutes is closed
   (`idle_sessions_closed`).
+- One address has at most 8 open rooms (`--max-rooms-per-address`). A room
+  counts until it closes, and a running game with nobody connected closes
+  after 10 minutes (`rooms_abandoned`). Throwaway identities therefore
+  cannot fill the server's rooms.
 - Rotate the invite key only deliberately: every existing invite stops
   working.

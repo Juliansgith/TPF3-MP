@@ -197,6 +197,23 @@ async fn the_server_caps_its_rooms() {
 }
 
 #[tokio::test]
+async fn an_address_has_only_so_many_open_rooms() {
+    let server = RunningServer::start(|config| config.max_rooms_per_address = 1).await;
+    let ann = server.client("ann").await;
+    let bob = server.client("bob").await;
+    ann.client.create_room(room("one", FAST)).await.unwrap();
+    // Bob connects from the same address as Ann.
+    assert_eq!(
+        bob.client.create_room(room("two", FAST)).await.unwrap_err(),
+        ClientError::Refused(RequestError::TooManyRooms)
+    );
+    ann.client.leave_room().await.unwrap();
+    server.wait_for_rooms(0).await;
+    bob.client.create_room(room("two", FAST)).await.unwrap();
+    server.shut_down().await;
+}
+
+#[tokio::test]
 async fn starting_requires_the_owner_readiness_and_matching_content() {
     let server = RunningServer::start(|_| {}).await;
     let ann = server.client("ann").await;

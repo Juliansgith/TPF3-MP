@@ -151,6 +151,32 @@ async fn a_finished_game_leaves_no_log_behind() {
 }
 
 #[tokio::test]
+async fn a_restored_game_nobody_returns_to_closes_with_its_log() {
+    let dir = data_dir("abandoned");
+    let secret = [5; 32];
+    let server = RunningServer::start(persistent(&dir, secret)).await;
+    let mut clients = vec![server.client("ann").await];
+    let mut seats: Vec<&mut TestClient> = clients.iter_mut().collect();
+    seat(&mut seats, FAST).await;
+    clients[0].client.start_game().await.unwrap();
+    let mut player = Player::new(clients.pop().unwrap());
+    player.play_until(|p| p.executed >= 3).await;
+    drop(player);
+    server.shut_down().await;
+
+    let abandoned = |config: &mut ServerConfig| {
+        persistent(&dir, secret)(config);
+        config.abandoned_timeout = Duration::from_millis(300);
+    };
+    let server = RunningServer::start(abandoned).await;
+    assert_eq!(server.stats.rooms(), 1, "restored");
+    server.wait_for_rooms(0).await;
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "log deleted");
+    server.shut_down().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn restored_rooms_need_the_same_secret() {
     let dir = data_dir("secret");
     let server = RunningServer::start(persistent(&dir, [1; 32])).await;

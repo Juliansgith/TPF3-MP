@@ -71,6 +71,10 @@ struct Args {
     /// Rooms hosted at once.
     #[arg(long, default_value_t = 10_000)]
     max_rooms: usize,
+
+    /// Open rooms created from one network address.
+    #[arg(long, default_value_t = 8)]
+    max_rooms_per_address: usize,
 }
 
 #[tokio::main]
@@ -105,6 +109,7 @@ async fn main() -> Result<()> {
     config.max_sessions_per_address = args.max_sessions_per_address;
     config.max_handshakes_per_address = args.max_handshakes_per_address;
     config.max_rooms = args.max_rooms;
+    config.max_rooms_per_address = args.max_rooms_per_address;
     config.data_dir = args.data_dir.clone();
     match &args.secret_file {
         Some(path) => config.secret = load_or_create_secret(path)?,
