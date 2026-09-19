@@ -11,6 +11,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -21,13 +22,16 @@ use quinn::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async_with_config,
     tungstenite::{
         handshake::server::{ErrorResponse, Request, Response},
-        http::{HeaderMap, HeaderValue, StatusCode, header::SEC_WEBSOCKET_PROTOCOL},
+        http::{
+            HeaderMap, HeaderValue, StatusCode,
+            header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL},
+        },
     },
 };
 
@@ -48,22 +52,40 @@ pub struct Tunnels {
     queue: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
     peers: Mutex<HashMap<SocketAddr, Peer>>,
     next: AtomicU64,
+    /// How long a tunnel may go without a QUIC connection attached, or
+    /// `None` to keep tunnels without one.
+    grace: Option<Duration>,
 }
 
 struct Peer {
     outbound: mpsc::Sender<Bytes>,
     origin: IpAddr,
+    /// QUIC connections through the tunnel.
+    attached: Arc<watch::Sender<usize>>,
 }
 
 impl Tunnels {
-    pub fn new() -> Arc<Self> {
+    /// Tunnels that close once no QUIC connection has been
+    /// [attached](Tunnels::attach) for `grace`, so a tunnel cannot be held
+    /// without playing. With `None`, only silence closes them.
+    pub fn new(grace: Option<Duration>) -> Arc<Self> {
         let (inbound, queue) = mpsc::channel(INBOUND);
         Arc::new(Self {
             inbound,
             queue: Mutex::new(queue),
             peers: Mutex::default(),
             next: AtomicU64::new(1),
+            grace,
         })
+    }
+
+    /// Notes a QUIC connection through the tunnel QUIC sees at `addr`, for
+    /// as long as the returned guard lives. `None` if `addr` is no open
+    /// tunnel.
+    pub fn attach(&self, addr: SocketAddr) -> Option<Attached> {
+        let attached = Arc::clone(&self.peers().get(&addr)?.attached);
+        attached.send_modify(|count| *count += 1);
+        Some(Attached { attached })
     }
 
     /// Whether QUIC sees `addr` as a tunnel rather than a UDP peer.
@@ -93,19 +115,31 @@ impl Tunnels {
         self.peers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Gives a new tunnel its address; it keeps it until the returned
-    /// guard drops.
-    fn open(self: &Arc<Self>, origin: IpAddr) -> (SocketAddr, mpsc::Receiver<Bytes>, Opened) {
+    /// Gives a new tunnel its address, which it keeps until the returned
+    /// guard drops, with the queue of datagrams for it and a count of the
+    /// connections it carries.
+    fn open(
+        self: &Arc<Self>,
+        origin: IpAddr,
+    ) -> (Opened, mpsc::Receiver<Bytes>, watch::Receiver<usize>) {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         let ip = Ipv6Addr::from_bits((u128::from(PREFIX) << 64) | u128::from(index));
         let addr = SocketAddr::new(ip.into(), 443);
         let (outbound, queue) = mpsc::channel(QUEUE);
-        self.peers().insert(addr, Peer { outbound, origin });
+        let (attached, watching) = watch::channel(0);
+        self.peers().insert(
+            addr,
+            Peer {
+                outbound,
+                origin,
+                attached: Arc::new(attached),
+            },
+        );
         let opened = Opened {
             tunnels: Arc::clone(self),
             addr,
         };
-        (addr, queue, opened)
+        (opened, queue, watching)
     }
 
     fn send(&self, transmit: &Transmit) {
@@ -139,6 +173,19 @@ impl fmt::Debug for Tunnels {
     }
 }
 
+/// A QUIC connection through a tunnel; see [`Tunnels::attach`].
+#[derive(Debug)]
+pub struct Attached {
+    attached: Arc<watch::Sender<usize>>,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.attached
+            .send_modify(|count| *count = count.saturating_sub(1));
+    }
+}
+
 /// Takes a tunnel out of the table when it ends.
 struct Opened {
     tunnels: Arc<Tunnels>,
@@ -154,20 +201,29 @@ impl Drop for Opened {
 /// Completes a client's WebSocket handshake for a tunnel at `path`. With
 /// `forwarded`, the client's address is the last `X-Forwarded-For` entry,
 /// which the trusted proxy in front sets, and a request without one is
-/// refused. Returns the tunnel, and that address if it was asked for.
+/// refused. `admit` then decides on that address, or on `None` without
+/// `forwarded`, and a refusal is answered `429 Too Many Requests`.
+///
+/// Browsers are refused: a page may open WebSockets to any server, and
+/// every visitor would be an address of its own for the server's limits.
+/// Agents send no `Origin`; browsers always do.
+///
+/// Returns the tunnel, the forwarded address, and what `admit` gave.
 #[allow(
     clippy::result_large_err,
     reason = "tungstenite's handshake callback returns its error response by value"
 )]
-pub async fn accept<S>(
+pub async fn accept<S, T>(
     stream: S,
     path: &str,
     forwarded: bool,
-) -> Result<(WebSocketStream<S>, Option<IpAddr>), TunnelError>
+    admit: impl FnOnce(Option<IpAddr>) -> Option<T> + Unpin,
+) -> Result<(WebSocketStream<S>, Option<IpAddr>, T), TunnelError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut client = None;
+    let mut admitted = None;
     let mut refusal = None;
     let callback = |request: &Request, mut response: Response| {
         let mut refuse = |status: StatusCode, why: &'static str| {
@@ -179,6 +235,9 @@ where
         if request.uri().path() != path {
             return refuse(StatusCode::NOT_FOUND, "another path");
         }
+        if request.headers().contains_key(ORIGIN) {
+            return refuse(StatusCode::FORBIDDEN, "a browser page");
+        }
         if !offers_protocol(request.headers()) {
             return refuse(StatusCode::BAD_REQUEST, "no tunnel protocol offered");
         }
@@ -188,15 +247,25 @@ where
                 None => return refuse(StatusCode::BAD_REQUEST, "no X-Forwarded-For"),
             }
         }
+        match admit(client) {
+            Some(value) => admitted = Some(value),
+            None => {
+                return refuse(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "the address holds its share of tunnels",
+                );
+            }
+        }
         response
             .headers_mut()
             .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(PROTOCOL));
         Ok(response)
     };
     let accepted = accept_hdr_async_with_config(stream, callback, Some(ws_config())).await;
-    match accepted {
-        Ok(ws) => Ok((ws, client)),
-        Err(error) => Err(refusal.map_or_else(|| error.into(), TunnelError::Refused)),
+    match (accepted, admitted) {
+        (Ok(ws), Some(admitted)) => Ok((ws, client, admitted)),
+        (Ok(_), None) => Err(TunnelError::Refused("not admitted")),
+        (Err(error), _) => Err(refusal.map_or_else(|| error.into(), TunnelError::Refused)),
     }
 }
 
@@ -226,18 +295,38 @@ fn forwarded_client(headers: &HeaderMap) -> Option<IpAddr> {
         .or_else(|| last.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
 }
 
-/// Carries one accepted tunnel of a client at `origin` until it closes, or
-/// nothing crosses it for [`IDLE`](super::IDLE).
+/// Carries one accepted tunnel of a client at `origin` until it closes, no
+/// datagram crosses it for [`IDLE`](super::IDLE), or it carries no QUIC
+/// connection for the tunnels' grace.
 pub async fn serve<S>(ws: WebSocketStream<S>, tunnels: &Arc<Tunnels>, origin: IpAddr)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (addr, outbound, _opened) = tunnels.open(origin);
+    let (opened, queue, mut attached) = tunnels.open(origin);
+    let addr = opened.addr;
     let (sink, stream) = ws.split();
     let inbound = tunnels.inbound.clone();
     tokio::select! {
         () = read_datagrams(stream, inbound, move |datagram| (addr, datagram)) => {}
-        () = write_datagrams(sink, outbound) => {}
+        () = write_datagrams(sink, queue) => {}
+        () = unused(&mut attached, tunnels.grace) => {}
+    }
+}
+
+/// Ends once no connection has been attached for `grace`, or never without
+/// one.
+async fn unused(attached: &mut watch::Receiver<usize>, grace: Option<Duration>) {
+    let Some(grace) = grace else {
+        return std::future::pending().await;
+    };
+    loop {
+        if attached.wait_for(|count| *count == 0).await.is_err() {
+            return;
+        }
+        match tokio::time::timeout(grace, attached.wait_for(|count| *count > 0)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => return,
+        }
     }
 }
 
@@ -257,6 +346,18 @@ impl MuxSocket {
             tunnels_first: AtomicBool::new(false),
         }
     }
+}
+
+/// Empties UDP datagrams claiming a tunnel's address: only a tunnel may
+/// speak for one, and such a source can only be spoofed. QUIC skips empty
+/// datagrams.
+fn drop_spoofed(meta: &mut [RecvMeta], count: usize) -> usize {
+    for received in meta.iter_mut().take(count) {
+        if Tunnels::is_tunnel(received.addr) {
+            received.len = 0;
+        }
+    }
+    count
 }
 
 impl fmt::Debug for MuxSocket {
@@ -295,11 +396,13 @@ impl AsyncUdpSocket for MuxSocket {
             if let Poll::Ready(count) = self.tunnels.poll_recv(cx, bufs, meta) {
                 return Poll::Ready(Ok(count));
             }
-            self.udp.poll_recv(cx, bufs, meta)
+            self.udp
+                .poll_recv(cx, bufs, meta)
+                .map_ok(|count| drop_spoofed(meta, count))
         } else {
             match self.udp.poll_recv(cx, bufs, meta) {
                 Poll::Pending => self.tunnels.poll_recv(cx, bufs, meta).map(Ok),
-                ready => ready,
+                ready => ready.map_ok(|count| drop_spoofed(meta, count)),
             }
         }
     }
@@ -327,8 +430,9 @@ mod tests {
 
     #[test]
     fn tunnel_addresses_never_look_like_udp_peers() {
-        let tunnels = Tunnels::new();
-        let (addr, _queue, opened) = tunnels.open("192.0.2.7".parse().unwrap());
+        let tunnels = Tunnels::new(None);
+        let (opened, _queue, _attached) = tunnels.open("192.0.2.7".parse().unwrap());
+        let addr = opened.addr;
         assert!(Tunnels::is_tunnel(addr));
         assert_eq!(tunnels.origin(addr), Some("192.0.2.7".parse().unwrap()));
         for udp in [
@@ -338,8 +442,8 @@ mod tests {
         ] {
             assert!(!Tunnels::is_tunnel(udp.parse().unwrap()), "{udp}");
         }
-        let (other, _queue, _opened) = tunnels.open("192.0.2.8".parse().unwrap());
-        assert_ne!(addr, other, "every tunnel has its own address");
+        let (other, _queue, _attached) = tunnels.open("192.0.2.8".parse().unwrap());
+        assert_ne!(addr, other.addr, "every tunnel has its own address");
         drop(opened);
         assert_eq!(tunnels.origin(addr), None, "closed tunnels are forgotten");
         assert_eq!(tunnels.len(), 1);

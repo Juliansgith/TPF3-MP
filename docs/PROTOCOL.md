@@ -29,10 +29,14 @@ WebSocket tunnel instead:
 
 - The client opens a WebSocket to a `wss://` URL, by default
   `wss://<server host>/tpf3mp` on port 443, offering the subprotocol
-  `tpf3mp-quic-1`. The server answers with that subprotocol or refuses.
+  `tpf3mp-quic-1` and sending no `Origin` header. The server answers with
+  that subprotocol, or refuses: `403` for a request with an `Origin`, as
+  browsers send (a web page must not be able to open tunnels from its
+  visitors' machines), and `429` for an address over its share of
+  tunnels.
 - Each binary message carries exactly one QUIC datagram of at most 2048
   bytes. Text messages and larger messages end the tunnel. Pings and pongs
-  are allowed and carry nothing.
+  are allowed, carry nothing, and keep nothing open.
 - Everything else is unchanged: the QUIC handshake, TLS 1.3 with the
   server's certificate, the streams and all limits. A proxy in front of the
   server sees only QUIC ciphertext. The tunnel's own TLS only gets the
@@ -43,8 +47,10 @@ WebSocket tunnel instead:
   client: its TCP address, or behind a proxy the last `X-Forwarded-For`
   entry. A tunnel's client counts as having proved its address, so it is
   never asked for a QUIC retry.
-- A tunnel that carries nothing for 60 s is closed. QUIC keep-alives cross
-  an open connection's tunnel every 5 s.
+- A tunnel is for one QUIC connection. It closes when no connection has
+  been admitted through it for 10 s, so within 10 s of opening and 10 s
+  after its connection ends, and when no datagram crosses it for 60 s.
+  QUIC keep-alives cross an open connection's tunnel every 5 s.
 
 Clients try UDP first. If UDP has not connected after 3 s, the tunnel joins
 the race, and whichever connects first is kept. Over a tunnel, one lost TCP

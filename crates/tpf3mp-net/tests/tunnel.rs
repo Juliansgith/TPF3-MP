@@ -34,7 +34,7 @@ async fn start(tls: bool) -> Server {
     let runtime = Arc::new(TokioRuntime);
     let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let udp = socket.local_addr().unwrap();
-    let tunnels = Tunnels::new();
+    let tunnels = Tunnels::new(None);
     let mux = MuxSocket::new(
         runtime.wrap_udp_socket(socket).unwrap(),
         Arc::clone(&tunnels),
@@ -60,11 +60,15 @@ async fn start(tls: bool) -> Server {
                 match acceptor {
                     Some(acceptor) => {
                         let tls = acceptor.accept(tcp).await.unwrap();
-                        let (ws, _) = tunnel::accept(tls, "/tpf3mp", false).await.unwrap();
+                        let (ws, _, ()) = tunnel::accept(tls, "/tpf3mp", false, |_| Some(()))
+                            .await
+                            .unwrap();
                         tunnel::serve(ws, &tunnels, peer.ip()).await;
                     }
                     None => {
-                        let (ws, _) = tunnel::accept(tcp, "/tpf3mp", false).await.unwrap();
+                        let (ws, _, ()) = tunnel::accept(tcp, "/tpf3mp", false, |_| Some(()))
+                            .await
+                            .unwrap();
                         tunnel::serve(ws, &tunnels, peer.ip()).await;
                     }
                 }

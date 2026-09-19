@@ -193,6 +193,9 @@ impl Ledger {
 }
 
 /// The ledger as a room's canonical ruleset on the server.
+/// The format of [`ToyRules`]' saved state.
+const TOY_STATE_FORMAT: u8 = 1;
+
 #[derive(Debug, Default)]
 pub struct ToyRules {
     ledger: Ledger,
@@ -209,12 +212,19 @@ impl Ruleset for ToyRules {
     }
 
     fn save(&self) -> Option<Vec<u8>> {
-        postcard::to_stdvec(&self.ledger).ok()
+        let mut state = vec![TOY_STATE_FORMAT];
+        state.extend(postcard::to_stdvec(&self.ledger).ok()?);
+        Some(state)
     }
 
     fn restore(&mut self, state: &[u8]) -> Result<(), String> {
-        self.ledger = postcard::from_bytes(state).map_err(|error| error.to_string())?;
-        Ok(())
+        match state.split_first() {
+            Some((&TOY_STATE_FORMAT, ledger)) => {
+                self.ledger = postcard::from_bytes(ledger).map_err(|error| error.to_string())?;
+                Ok(())
+            }
+            _ => Err("not a state of these rules".into()),
+        }
     }
 }
 

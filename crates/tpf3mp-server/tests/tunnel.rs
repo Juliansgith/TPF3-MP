@@ -212,6 +212,22 @@ async fn behind_a_proxy_the_forwarded_address_is_the_clients() {
         "{error}"
     );
 
+    // A listener that knows its proxy connects from elsewhere takes no
+    // forwarded word from this one.
+    let elsewhere = RunningServer::start(|config| {
+        let mut tunnel = TunnelConfig::behind_proxy("127.0.0.1:0".parse().unwrap());
+        tunnel.proxies = vec!["192.0.2.0/24".parse().unwrap()];
+        config.tunnel = Some(tunnel);
+    })
+    .await;
+    let unknown = proxy(elsewhere.tunnel.unwrap(), "203.0.113.3").await;
+    let refused = connect_via(&elsewhere, "zoe", via(unknown))
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(refused, ConnectError::Tunnel(_)), "{refused}");
+    elsewhere.shut_down().await;
+
     // Straight to the listener, without the proxy's word, nobody gets in.
     let direct = connect_via(&server, "mallory", via(listener))
         .await

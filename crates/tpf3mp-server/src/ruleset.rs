@@ -22,6 +22,11 @@ pub trait Ruleset: Send + 'static {
     /// events after must end exactly where this one does. `None`, the
     /// default, means the ruleset cannot say, and its rooms keep their whole
     /// log.
+    ///
+    /// The state outlives the process: a server upgraded meanwhile restores
+    /// it with newer rules. So the bytes should name their own format, and
+    /// `restore` refuse a format it does not know; the room is then set
+    /// aside, not restored wrong.
     fn save(&self) -> Option<Vec<u8>> {
         None
     }

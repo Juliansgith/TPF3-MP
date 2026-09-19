@@ -41,7 +41,7 @@ use tokio_tungstenite::{
 };
 
 pub use client::{TunnelSocket, connect};
-pub use server::{MuxSocket, Tunnels, accept, serve};
+pub use server::{Attached, MuxSocket, Tunnels, accept, serve};
 
 use crate::TlsError;
 
@@ -52,8 +52,9 @@ pub const PROTOCOL: &str = "tpf3mp-quic-1";
 pub const DEFAULT_PATH: &str = "/tpf3mp";
 /// Largest datagram a tunnel carries, well above any QUIC packet.
 pub const MAX_DATAGRAM: usize = 2048;
-/// A tunnel that carries nothing for this long is closed. QUIC keep-alives
-/// cross an open connection's tunnel every few seconds.
+/// A tunnel that carries no datagram for this long is closed. Pings and
+/// pongs do not count. QUIC keep-alives cross an open connection's tunnel
+/// every few seconds.
 pub const IDLE: Duration = Duration::from_secs(60);
 /// Datagrams queued in each direction of one tunnel. When a queue is full,
 /// new datagrams are dropped, as a full UDP socket drops them, and QUIC's
@@ -173,11 +174,14 @@ impl From<tungstenite::Error> for TunnelError {
 }
 
 /// What a tunnel's WebSocket accepts: messages the size of a datagram, and
-/// nothing larger.
+/// nothing larger. Its buffers are sized for datagrams too, where the
+/// defaults would hold 128 KiB each per tunnel.
 fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_DATAGRAM))
         .max_frame_size(Some(MAX_DATAGRAM))
+        .read_buffer_size(4 * 1024)
+        .write_buffer_size(16 * 1024)
 }
 
 /// The datagrams of a transmit: several of `segment_size` bytes when the
@@ -234,7 +238,7 @@ fn fill<T>(
 }
 
 /// Reads a tunnel's datagrams into `queue` until the tunnel ends, the queue
-/// closes, or nothing arrives for [`IDLE`].
+/// closes, or no datagram arrives for [`IDLE`].
 async fn read_datagrams<S, T>(
     mut stream: SplitStream<WebSocketStream<S>>,
     queue: mpsc::Sender<T>,
@@ -242,20 +246,23 @@ async fn read_datagrams<S, T>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut deadline = tokio::time::Instant::now() + IDLE;
     loop {
-        let message = match tokio::time::timeout(IDLE, stream.next()).await {
+        let message = match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(message))) => message,
             // Silence, the end, or a broken stream: the tunnel is over.
             _ => return,
         };
         match message {
             Message::Binary(datagram) => {
+                deadline = tokio::time::Instant::now() + IDLE;
                 // Waiting here holds the TCP connection back, which is
                 // better than dropping what already crossed it.
                 if queue.send(wrap(datagram)).await.is_err() {
                     return;
                 }
             }
+            // They carry nothing, so they keep nothing open.
             Message::Ping(_) | Message::Pong(_) => {}
             // Text, a close, or a raw frame: not a tunnel's traffic.
             Message::Text(_) | Message::Close(_) | Message::Frame(_) => return,

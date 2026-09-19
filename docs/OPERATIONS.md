@@ -185,11 +185,26 @@ the whole URL with `--tunnel`.
 - **Limits.** Tunnels count against the same per-address limits as UDP
   sessions, by the player's address. At most a session's and a
   handshake's worth of tunnels per address, and as many in total as
-  sessions and handshakes together, are open; a TLS and WebSocket
-  handshake must finish within 10 s.
+  sessions and handshakes together, are open; a player over the share is
+  answered `429`. A TLS and WebSocket handshake must finish within 10 s,
+  and a tunnel must carry a QUIC connection within 10 s of opening, and
+  closes 10 s after its connection ends, so holding one without playing
+  gets nowhere. Browsers are refused, so a web page cannot open tunnels
+  from its visitors' machines.
+- **File descriptors.** Each tunnel is an open connection. The compose
+  file raises the container's open-file limit to 65,536; outside Docker,
+  raise it for the server's service the same way (`LimitNOFILE=` in a
+  systemd unit), or rooms may fail to write their logs under load.
 - **Trust.** `--tunnel-behind-proxy` believes the last `X-Forwarded-For`
-  entry, so nothing but the proxy may reach the listener. Requests without
-  the header are refused.
+  entry, and only from a proxy connecting from loopback or a private
+  network, where a reverse proxy on the same host or in a container sits.
+  `--tunnel-proxy <address or range>`, repeated as needed, narrows that to
+  your proxy's own address. Requests without the header are refused.
+- **Behind a CDN** the proxy's `{remote_host}` is the CDN's edge, and every
+  player would share a few edges' limits. Have the proxy forward the
+  CDN's client-address header instead, such as Cloudflare's
+  `CF-Connecting-IP`: `header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}`,
+  and accept connections only from the CDN's ranges.
 - **Metrics.** `tunnels` (open now), `tunnels_opened_total` and
   `tunnels_refused_total`.
 - **Players.** `--tunnel <url>` names another tunnel, `--tunnel-only` skips

@@ -30,7 +30,7 @@ pub use crate::{
     admin::serve_admin,
     ruleset::{AcceptAll, Ruleset, RulesetFactory},
     snapshots::SnapshotConfig,
-    tunnel::TunnelConfig,
+    tunnel::{AddressRange, TunnelConfig},
 };
 use crate::{
     admission::{Admission, Decision, Origin},
@@ -224,7 +224,10 @@ impl Server {
             Some(tunnel) => Some(Listener::bind(tunnel, config.identity.clone())?),
             None => None,
         };
-        let tunnels = listener.as_ref().map(|_| Tunnels::new());
+        // A tunnel carries a player's QUIC connection, or closes.
+        let tunnels = listener
+            .as_ref()
+            .map(|_| Tunnels::new(Some(config.handshake_timeout)));
         let quic = tpf3mp_net::server_config(config.identity)?;
         let endpoint = match &tunnels {
             None => quinn::Endpoint::server(quic, config.listen)?,
@@ -382,8 +385,14 @@ impl Server {
             Decision::Accept(handshake) => {
                 let shared = Arc::clone(&self.shared);
                 let running = Arc::clone(&self.connections);
+                // Holds its tunnel open, if it came through one.
+                let attached = shared
+                    .tunnels
+                    .as_ref()
+                    .and_then(|tunnels| tunnels.attach(incoming.remote_address()));
                 tokio::spawn(async move {
                     connection::serve(incoming, handshake, shared).await;
+                    drop(attached);
                     drop(running);
                 });
             }

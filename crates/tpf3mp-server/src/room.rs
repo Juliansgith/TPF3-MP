@@ -79,6 +79,9 @@ const RESUME_WINDOW_BYTES: usize = 64 << 20;
 /// settings. Recovery refuses logs that do, so arithmetic on steps never
 /// overflows.
 const MAX_FRONTIER: u64 = 1 << 48;
+/// No honest game gets this many turns or events; a compacted log's base
+/// claiming more is refused, so counting on never overflows.
+const MAX_COUNT: u64 = 1 << 56;
 /// The least time between two rebases of one member. A replica that keeps
 /// diverging is told so every time, but reloading it more often would only
 /// keep its player out of the game.
@@ -525,6 +528,8 @@ pub(crate) struct Room {
     data_dir: Option<PathBuf>,
     timeouts: Timeouts,
     log: Option<RoomLog>,
+    /// A compaction of the log in progress.
+    compaction: Option<Compaction>,
     /// The log's size at which it is compacted next.
     compact_at: u64,
     /// See [`RoomEnv::compact_log_at`].
@@ -615,6 +620,7 @@ impl Room {
             data_dir: spec.env.data_dir,
             timeouts: spec.env.timeouts,
             log: None,
+            compaction: None,
             compact_at: spec.env.compact_log_at,
             compact_log_at: spec.env.compact_log_at,
             unattended_since: None,
@@ -658,7 +664,14 @@ impl Room {
         let mut banned = BTreeSet::new();
         let base = start.base.as_ref();
         if let Some(base) = base {
-            if !game.rebase(base) || base.banned.len() > MAX_BANNED {
+            let mut seats: Vec<PlayerId> = base.seated.iter().map(|(player, ..)| *player).collect();
+            seats.sort_unstable();
+            seats.dedup();
+            if !game.rebase(base)
+                || base.banned.len() > MAX_BANNED
+                || seats.len() != base.seated.len()
+                || seats.len() > usize::from(start.max_players)
+            {
                 return Err(RecoverError::Base);
             }
             ruleset.restore(&base.rules).map_err(RecoverError::Rules)?;
@@ -668,6 +681,9 @@ impl Room {
         // who resume: the base holds what they did.
         let base_turn = base.map_or(0, |base| base.after_turn);
         let mut based = base.is_none();
+        // Ownership passes as the live room passed it: to the earliest
+        // remaining player whenever the owner leaves.
+        let mut owner = start.owner;
         let mut index = 0;
         loop {
             if !based && game.next_turn > base_turn {
@@ -720,13 +736,15 @@ impl Room {
                 }
                 ruleset.apply(event);
                 seat(&mut game.seated, event);
-                if let EventBody::PlayerLeft {
-                    player,
-                    kicked: true,
-                } = &event.body
-                    && banned.len() < MAX_BANNED
-                {
-                    banned.insert(*player);
+                if let EventBody::PlayerLeft { player, kicked } = &event.body {
+                    if *player == owner
+                        && let Some((first, ..)) = game.seated.first()
+                    {
+                        owner = *first;
+                    }
+                    if *kicked && banned.len() < MAX_BANNED {
+                        banned.insert(*player);
+                    }
                 }
             }
             game.remember(LoggedTurn {
@@ -800,13 +818,14 @@ impl Room {
         };
         let marker = TurnMessage::Start(game.turn_start(start.id, start.settings, &head, None));
         log.append(&encode_frame(&marker, TURN_MAX_FRAME).map_err(io::Error::other)?)?;
-        // The live room hands ownership to the earliest remaining member at
-        // each departure, which leaves the same owner as this.
-        let owner = if members.iter().any(|member| member.player == start.owner) {
-            start.owner
+        let owner = if members.iter().any(|member| member.player == owner) {
+            owner
         } else {
             members[0].player
         };
+        // A log compacted just before the restart is not compacted again at
+        // once.
+        let compact_at = next_compaction(log.written(), env.compact_log_at);
         Ok(Some(Self {
             id: start.id,
             name: start.name,
@@ -826,7 +845,8 @@ impl Room {
             data_dir: env.data_dir,
             timeouts: env.timeouts,
             log: Some(log),
-            compact_at: env.compact_log_at,
+            compaction: None,
+            compact_at,
             compact_log_at: env.compact_log_at,
             // Nobody is connected after a restart; the abandon timeout runs
             // from here.
@@ -894,6 +914,7 @@ impl Room {
                     None => break,
                 },
                 _ = ticker.tick() => self.on_tick(Instant::now()),
+                done = compaction_done(&mut self.compaction) => self.finish_compaction(done),
             }
         }
         directory.remove(&self.id);
@@ -1385,13 +1406,17 @@ impl Room {
         }
     }
 
-    /// Rewrites a long game's log to start from where the game stands now,
-    /// keeping only the turns players may still resume on. Recovery then
-    /// replays only what comes after, and the log never reaches its size
-    /// limit. Runs right after sealing, when the rules have applied exactly
-    /// the logged events. Rules that cannot save their state keep the whole
-    /// log.
-    fn compact_log(&mut self) {
+    /// Starts rewriting a long game's log to begin from where the game
+    /// stands now, keeping only the turns players may still resume on.
+    /// Recovery then replays only what comes after, and the log never
+    /// reaches its size limit. Runs right after sealing, when the rules have
+    /// applied exactly the logged events. The rewrite runs on a blocking
+    /// thread while the game goes on; see [`Room::finish_compaction`]. Rules
+    /// that cannot save their state keep the whole log.
+    fn start_compaction(&mut self) {
+        if self.compaction.is_some() {
+            return;
+        }
         let (Some(dir), Some(written)) = (&self.data_dir, self.log.as_ref().map(RoomLog::written))
         else {
             return;
@@ -1409,27 +1434,72 @@ impl Room {
         let base = game.base(rules, self.content, &self.banned);
         let first_history = game.histories.first().map_or(0, |history| history.id);
         let start = self.start_record(first_history, Some(base));
-        let frames: Vec<&[u8]> = game.log.iter().map(|turn| &*turn.frame).collect();
-        let path = RoomLog::path_for(dir, &self.id);
-        // The rewrite replaces the file, which must not be open meanwhile.
-        drop(self.log.take());
-        match RoomLog::rewrite(dir, &start, &frames) {
+        let frames: Vec<Arc<[u8]>> = game
+            .log
+            .iter()
+            .map(|turn| Arc::clone(&turn.frame))
+            .collect();
+        let dir = dir.clone();
+        let task = tokio::task::spawn_blocking(move || RoomLog::compacted(&dir, &start, &frames));
+        self.compaction = Some(Compaction {
+            task,
+            tail: Vec::new(),
+        });
+    }
+
+    /// Puts a finished compaction's log in place of the room's, with the
+    /// turns sealed since it began. Until then the old log stays the room's,
+    /// and stays so if anything fails.
+    fn finish_compaction(&mut self, done: Result<io::Result<RoomLog>, tokio::task::JoinError>) {
+        let Some(compaction) = self.compaction.take() else {
+            return;
+        };
+        let before = self.log.as_ref().map_or(0, RoomLog::written);
+        let installed = match done {
+            Ok(Ok(mut log)) => {
+                let result = compaction
+                    .tail
+                    .iter()
+                    .try_for_each(|frame| log.append(frame))
+                    .and_then(|()| log.install());
+                match result {
+                    Ok(()) => Ok(log),
+                    Err(error) => {
+                        log.discard();
+                        Err(error)
+                    }
+                }
+            }
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(io::Error::other(error)),
+        };
+        match installed {
             Ok(log) => {
-                info!(room = %self.id, before = written, after = log.written(), "compacted the room log");
+                info!(room = %self.id, before, after = log.written(), "compacted the room log");
                 metrics::increment(&self.metrics.logs_compacted);
                 self.compact_at = next_compaction(log.written(), self.compact_log_at);
+                // The old log closes here, already replaced.
                 self.log = Some(log);
             }
             Err(error) => {
                 warn!(room = %self.id, %error, "cannot compact the room log; it keeps growing");
-                self.compact_at = next_compaction(written, self.compact_log_at);
-                match RoomLog::reopen(&path) {
-                    Ok(log) => self.log = Some(log),
-                    Err(error) => {
-                        error!(room = %self.id, %error, "cannot reopen the room log; it stops here");
-                    }
-                }
+                self.compact_at = next_compaction(before, self.compact_log_at);
             }
+        }
+    }
+
+    /// Drops a running compaction, for a game that is over: its log, once
+    /// written, is deleted rather than put in place.
+    fn cancel_compaction(&mut self) {
+        let Some(compaction) = self.compaction.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Ok(Ok(log)) = compaction.task.await {
+                    tokio::task::spawn_blocking(move || log.discard());
+                }
+            });
         }
     }
 
@@ -2129,6 +2199,7 @@ impl Room {
     /// Deletes what a finished game kept: its log, its snapshot pointer and
     /// its snapshots.
     fn discard_game(&mut self) {
+        self.cancel_compaction();
         if let Some(log) = self.log.take()
             && let Err(error) = log.delete()
         {
@@ -2211,6 +2282,11 @@ impl Room {
             error!(room = %self.id, %error, "cannot append to the room log; it stops here");
             self.log = None;
         }
+        // A compaction under way gets them too, logged or not: its log may
+        // yet be put in place.
+        if let Some(compaction) = &mut self.compaction {
+            compaction.tail.extend(frames.iter().cloned());
+        }
         for frame in frames {
             for index in 0..self.members.len() {
                 if self.members[index].streaming {
@@ -2218,7 +2294,7 @@ impl Room {
                 }
             }
         }
-        self.compact_log();
+        self.start_compaction();
     }
 
     /// Sends a control message to a member, disconnecting members whose
@@ -2410,6 +2486,23 @@ fn seat(seated: &mut Vec<Seat>, event: &Event) {
     }
 }
 
+/// A room's log being compacted on a blocking thread.
+struct Compaction {
+    task: tokio::task::JoinHandle<io::Result<RoomLog>>,
+    /// Turns sealed since it began, which the new log needs too.
+    tail: Vec<Arc<[u8]>>,
+}
+
+/// The result of the running compaction, or never without one.
+async fn compaction_done(
+    compaction: &mut Option<Compaction>,
+) -> Result<io::Result<RoomLog>, tokio::task::JoinError> {
+    match compaction {
+        Some(compaction) => (&mut compaction.task).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Where a log compacted to `size` bytes is compacted next: once it has
 /// grown by `every`, or by its own size if that is more, so a rewrite never
 /// writes more than was appended since the last.
@@ -2460,7 +2553,11 @@ impl Game {
     /// Stands the game where a compacted log's kept turns begin, with the
     /// base's histories and table. `false` if the base contradicts itself.
     fn rebase(&mut self, base: &Base) -> bool {
-        let consistent = base.first_turn >= 1
+        // Counters that could not have grown this far in a game's life: a
+        // crafted base must not bring them near overflowing.
+        let plausible = base.after_turn < MAX_COUNT && base.next_event < MAX_COUNT;
+        let consistent = plausible
+            && base.first_turn >= 1
             && base.first_turn <= base.after_turn.saturating_add(1)
             && base.first_event >= 1
             && base.first_event <= base.next_event
@@ -2955,8 +3052,8 @@ mod tests {
         game
     }
 
-    #[test]
-    fn a_compacted_log_restores_the_same_game() {
+    #[tokio::test]
+    async fn a_compacted_log_restores_the_same_game() {
         let dir = std::env::temp_dir().join(format!("tpf3mp-compact-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let id = RoomId(FixedBytes([5; 16]));
@@ -3005,7 +3102,18 @@ mod tests {
         game.resume_window = 3;
         game.trim();
         first.compact_at = 0;
-        first.compact_log();
+        first.start_compaction();
+        // A turn sealed while the rewrite runs joins the new log.
+        let during = {
+            let Phase::Running(game) = &mut first.phase else {
+                panic!("the room runs a game");
+            };
+            game.append(command(1, 77), first.ruleset.as_mut());
+            game.seal(235).unwrap()
+        };
+        first.publish(during.clone());
+        let done = compaction_done(&mut first.compaction).await;
+        first.finish_compaction(done);
         assert_eq!(
             first
                 .metrics
@@ -3076,9 +3184,11 @@ mod tests {
                 history,
             }))
             .unwrap();
-        assert_eq!(stream.backlog.len(), 2);
+        // Turn 23, kept; the turn sealed during the rewrite; the one after.
+        assert_eq!(stream.backlog.len(), 3);
         assert_eq!(stream.backlog[0], frames[22]);
-        assert_eq!(stream.backlog[1], frames_after[0]);
+        assert_eq!(stream.backlog[1], during[0]);
+        assert_eq!(stream.backlog[2], frames_after[0]);
         assert!(
             game.stream_after(Some(Resume {
                 after_turn: 19,
@@ -3137,6 +3247,128 @@ mod tests {
         for base in &broken {
             assert!(!fresh().rebase(base), "{base:?}");
         }
+    }
+
+    /// A base's counters stand where the game stood. One standing near the
+    /// end of their range is refused, rather than overflowing on the next
+    /// turn read.
+    #[test]
+    fn an_implausible_base_is_refused() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-poc-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = RoomId(FixedBytes([6; 16]));
+        let base = Base {
+            first_turn: u64::MAX,
+            first_event: 1,
+            sealed_before: 0,
+            after_turn: u64::MAX - 1,
+            next_event: 1,
+            sealed_through: 0,
+            speed: Speed::NORMAL,
+            histories: vec![(1, 0)],
+            content: None,
+            seated: vec![(player(1), Text::new("p1").unwrap(), Platform::current())],
+            banned: Vec::new(),
+            rules: Vec::new(),
+        };
+        let start = StartRecord {
+            version: persist::FORMAT_VERSION,
+            history: 1,
+            id,
+            name: Text::new("crafted").unwrap(),
+            owner: player(1),
+            max_players: 8,
+            settings: RoomSettings::DEFAULT,
+            invite_tag: vec![0; 32],
+            password_tag: None,
+            members: Vec::new(),
+            base: Some(base),
+        };
+        let mut log = RoomLog::create(&dir, &start).unwrap();
+        let turn = TurnMessage::Turn(Turn {
+            number: u64::MAX,
+            sealed_through: 0,
+            speed: Speed::NORMAL,
+            events: Vec::new(),
+        });
+        log.append(&encode_frame(&turn, TURN_MAX_FRAME).unwrap())
+            .unwrap();
+        drop(log);
+        let path = RoomLog::path_for(&dir, &id);
+        let env = RoomEnv {
+            tick: Duration::from_millis(100),
+            metrics: Arc::new(Metrics::default()),
+            data_dir: Some(dir.clone()),
+            timeouts: Timeouts {
+                stall: Duration::from_secs(20),
+                load: Duration::from_secs(300),
+                abandoned: Duration::from_secs(600),
+            },
+            snapshots: None,
+            compact_log_at: u64::MAX,
+        };
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &[0; 32]);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matches!(
+                Room::recover(&path, key, Box::new(Recorder::default()), env),
+                Err(RecoverError::Base | RecoverError::Continuity(_))
+            )
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(outcome, Ok(true)),
+            "an implausible base must be refused; recovery panicked: {}",
+            outcome.is_err()
+        );
+    }
+
+    /// The live room hands ownership to the earliest remaining player when
+    /// the owner leaves; an owner who comes back is a player like any other.
+    #[test]
+    fn a_restored_room_has_the_owner_the_live_room_had() {
+        let dir = std::env::temp_dir().join(format!("tpf3mp-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = RoomId(FixedBytes([7; 16]));
+        let mut game = Game::new(RoomSettings::DEFAULT, 1);
+        let mut rules = Recorder::default();
+        let mut frames = Vec::new();
+        for n in 1..=3 {
+            game.append(joined(n), &mut rules);
+        }
+        frames.extend(game.seal(10).unwrap());
+        // The owner leaves, and comes back later.
+        let left = EventBody::PlayerLeft {
+            player: player(1),
+            kicked: false,
+        };
+        game.append(left, &mut rules);
+        frames.extend(game.seal(20).unwrap());
+        game.append(joined(1), &mut rules);
+        frames.extend(game.seal(30).unwrap());
+        let start = StartRecord {
+            version: persist::FORMAT_VERSION,
+            history: 1,
+            id,
+            name: Text::new("owners").unwrap(),
+            owner: player(1),
+            max_players: 8,
+            settings: RoomSettings::DEFAULT,
+            invite_tag: vec![0; 32],
+            password_tag: None,
+            members: Vec::new(),
+            base: None,
+        };
+        let mut log = RoomLog::create(&dir, &start).unwrap();
+        for frame in &frames {
+            log.append(frame).unwrap();
+        }
+        drop(log);
+        let room = recover_room(&RoomLog::path_for(&dir, &id), &dir);
+        assert_eq!(room.owner, player(2), "the second player took over");
+        let seats: Vec<PlayerId> = room.members.iter().map(|m| m.player).collect();
+        assert_eq!(seats, [player(2), player(3), player(1)]);
+        drop(room);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn test_member() -> Member {

@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tpf3mp_net::ServerIdentity;
-use tpf3mp_server::{Server, ServerConfig, SnapshotConfig, TunnelConfig, serve_admin};
+use tpf3mp_server::{
+    AddressRange, Server, ServerConfig, SnapshotConfig, TunnelConfig, serve_admin,
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -121,6 +123,12 @@ struct Args {
     /// The URL path tunnels open.
     #[arg(long, default_value = "/tpf3mp")]
     tunnel_path: String,
+
+    /// With --tunnel-behind-proxy: where the proxy connects from, as an
+    /// address or a range like 172.18.0.0/16. Repeat for several. Defaults
+    /// to loopback and the private networks.
+    #[arg(long, requires = "tunnel_behind_proxy")]
+    tunnel_proxy: Vec<AddressRange>,
 }
 
 #[tokio::main]
@@ -168,6 +176,9 @@ async fn main() -> Result<()> {
             TunnelConfig::new(listen)
         };
         tunnel.path = args.tunnel_path.clone();
+        if !args.tunnel_proxy.is_empty() {
+            tunnel.proxies.clone_from(&args.tunnel_proxy);
+        }
         tunnel
     });
     let snapshot_dir = match (&args.snapshot_dir, &args.data_dir) {

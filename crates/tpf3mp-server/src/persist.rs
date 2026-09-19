@@ -7,10 +7,12 @@
 //! byte for byte as clients received it, so a recovered room serves resumes
 //! from exactly the same bytes.
 //!
-//! A long game's log is compacted: once the room agreed on a snapshot, the
-//! log is rewritten to start from that snapshot's point. Its start record
-//! then carries a [`Base`], the game's state there, and only the turns
-//! after it follow.
+//! A long game's log is compacted: once it outgrows a threshold, it is
+//! rewritten to start from where the game stands. Its start record then
+//! carries a [`Base`], the game's state, followed by the turns of the resume
+//! window, kept for players who resume, and the turns after. The new log is
+//! written and flushed under another name and renamed over the old one, so
+//! a crash leaves one or the other whole.
 //!
 //! Recovery reads a log one record at a time and changes nothing on disk
 //! until the room has been rebuilt. A crash can tear only the last record,
@@ -37,10 +39,12 @@ use tpf3mp_proto::{
 /// saves appear in the log. Version 4 lets the start record carry a
 /// [`Base`], for compacted logs.
 pub(crate) const FORMAT_VERSION: u16 = 4;
-/// Largest record a log may hold: a turn frame at its cap, or a start
-/// record whose base holds the rules' state.
-const MAX_RECORD: usize = 16 << 20;
-const _: () = assert!(MAX_RECORD >= TURN_MAX_FRAME + 64);
+/// Largest start record: one whose base holds the rules' state.
+const MAX_START_RECORD: usize = 16 << 20;
+/// Largest record after the start record: a turn frame at its cap. Kept
+/// tight, so damage to a record's length before the end of a log is seen
+/// as damage, not as a torn final record.
+const MAX_RECORD: usize = TURN_MAX_FRAME + 64;
 const HEADER: usize = 8;
 /// Bytes one room's log may reach. Past this the game keeps running but is
 /// no longer logged, so one room cannot fill the disk. An honest game takes
@@ -120,6 +124,9 @@ pub(crate) struct RoomLog {
     path: PathBuf,
     /// Bytes in the file, for the size limit.
     written: u64,
+    /// For a compacted log not yet [installed](RoomLog::install): the
+    /// room's log it is to replace.
+    replaces: Option<PathBuf>,
 }
 
 impl RoomLog {
@@ -136,6 +143,7 @@ impl RoomLog {
             file,
             path,
             written: 0,
+            replaces: None,
         };
         let payload = postcard::to_stdvec(start).map_err(io::Error::other)?;
         log.append(&payload)?;
@@ -143,55 +151,72 @@ impl RoomLog {
         Ok(log)
     }
 
-    /// Replaces a room's log with `start` and `frames`, all at once: the new
-    /// log is written and flushed under another name, then renamed over the
-    /// old one, so a crash leaves one or the other whole. The old log must
-    /// not be open. Returns the new log, ready for appending.
-    pub(crate) fn rewrite(dir: &Path, start: &StartRecord, frames: &[&[u8]]) -> io::Result<Self> {
-        let path = Self::path_for(dir, &start.id);
-        let partial = path.with_extension("log.compacting");
+    /// Writes a compacted log of `start`'s room under another name and
+    /// flushes it to disk: `start`, then `frames`. It becomes the room's log
+    /// once [installed](RoomLog::install). Blocking.
+    pub(crate) fn compacted(
+        dir: &Path,
+        start: &StartRecord,
+        frames: &[impl AsRef<[u8]>],
+    ) -> io::Result<Self> {
+        let replaces = Self::path_for(dir, &start.id);
+        let partial = replaces.with_extension("log.compacting");
         let _ = fs::remove_file(&partial);
         let file = private_options().create_new(true).open(&partial)?;
         let mut log = Self {
             file,
-            path: partial.clone(),
+            path: partial,
             written: 0,
+            replaces: Some(replaces),
         };
         let written = (|| {
             let payload = postcard::to_stdvec(start).map_err(io::Error::other)?;
             log.append(&payload)?;
             for frame in frames {
-                log.append(frame)?;
+                log.append(frame.as_ref())?;
             }
             log.file.sync_all()
         })();
-        if let Err(error) = written {
-            drop(log);
-            let _ = fs::remove_file(&partial);
-            return Err(error);
+        match written {
+            Ok(()) => Ok(log),
+            Err(error) => {
+                log.discard();
+                Err(error)
+            }
         }
-        let Self { file, written, .. } = log;
-        drop(file);
-        if let Err(error) = fs::rename(&partial, &path) {
-            let _ = fs::remove_file(&partial);
-            return Err(error);
-        }
-        sync_dir(dir);
-        Self::reopen(&path).map(|mut log| {
-            log.written = written;
-            log
-        })
     }
 
-    /// Opens a log for appending where it ends.
-    pub(crate) fn reopen(path: &Path) -> io::Result<Self> {
-        let mut file = OpenOptions::new().write(true).open(path)?;
-        let written = file.seek(SeekFrom::End(0))?;
-        Ok(Self {
+    /// Puts a compacted log in place of the room's log, in one rename, and
+    /// keeps it open for appending. The log it replaces may stay open until
+    /// then, and on failure it is still the room's log.
+    pub(crate) fn install(&mut self) -> io::Result<()> {
+        let Some(replaces) = self.replaces.take() else {
+            return Ok(());
+        };
+        if let Err(error) = fs::rename(&self.path, &replaces) {
+            self.replaces = Some(replaces);
+            return Err(error);
+        }
+        if let Some(dir) = replaces.parent() {
+            sync_dir(dir);
+        }
+        self.path = replaces;
+        Ok(())
+    }
+
+    /// Deletes a compacted log that will not be installed. An installed log
+    /// is only closed.
+    pub(crate) fn discard(self) {
+        let Self {
             file,
-            path: path.to_owned(),
-            written,
-        })
+            path,
+            replaces,
+            ..
+        } = self;
+        drop(file);
+        if replaces.is_some() {
+            let _ = fs::remove_file(path);
+        }
     }
 
     /// Bytes in the log.
@@ -206,7 +231,7 @@ impl RoomLog {
         if !metadata.file_type().is_file() {
             return Err(LogError::NotAFile);
         }
-        if metadata.len() > LOG_LIMIT + (HEADER + MAX_RECORD) as u64 {
+        if metadata.len() > LOG_LIMIT + (HEADER + MAX_START_RECORD) as u64 {
             return Err(LogError::TooLarge(metadata.len()));
         }
         let file = File::open(path)?;
@@ -224,7 +249,12 @@ impl RoomLog {
     /// so it survives the process crashing; surviving a machine crash would
     /// need an fsync per turn, which this deliberately leaves out.
     pub(crate) fn append(&mut self, payload: &[u8]) -> io::Result<()> {
-        if payload.len() > MAX_RECORD {
+        let limit = if self.written == 0 {
+            MAX_START_RECORD
+        } else {
+            MAX_RECORD
+        };
+        if payload.len() > limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "record exceeds the log's limit",
@@ -279,7 +309,12 @@ impl LogReader {
         self.reader.read_exact(&mut header)?;
         let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        if len > MAX_RECORD {
+        let limit = if self.offset == 0 {
+            MAX_START_RECORD
+        } else {
+            MAX_RECORD
+        };
+        if len > limit {
             // The server never writes such a record, torn or not.
             return Err(LogError::Damaged(self.offset));
         }
@@ -333,6 +368,7 @@ impl LogReader {
             file,
             path,
             written: offset,
+            replaces: None,
         })
     }
 
@@ -539,10 +575,17 @@ mod tests {
             banned: Vec::new(),
             rules: vec![9; 100],
         });
-        let mut log = RoomLog::rewrite(&dir, &compacted, &[b"turn 41", b"turn 42"]).unwrap();
+        let mut log = RoomLog::compacted(&dir, &compacted, &[b"turn 41", b"turn 42"]).unwrap();
+        let path = RoomLog::path_for(&dir, &start().id);
+        let (_, before) = read_all(&path).unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "the room's log is untouched until installed"
+        );
+        log.install().unwrap();
         log.append(b"turn 43").unwrap();
         drop(log);
-        let path = RoomLog::path_for(&dir, &start().id);
         let (_, records) = read_all(&path).unwrap();
         assert_eq!(records.len(), 4);
         let first: StartRecord = postcard::from_bytes(&records[0]).unwrap();
@@ -556,6 +599,80 @@ mod tests {
             ]
         );
         assert!(!path.with_extension("log.compacting").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Damage before the final record is damage: a turn record's length
+    /// that runs past the end is no torn tail when it is over any turn's,
+    /// even if a start record may be that long.
+    #[test]
+    fn a_damaged_length_before_the_end_is_not_a_torn_tail() {
+        let dir = temp_dir("poc-length");
+        let mut log = RoomLog::create(&dir, &start()).unwrap();
+        log.append(b"first").unwrap();
+        // 2 MiB of intact turns after it.
+        let turn = vec![7u8; 512 << 10];
+        for _ in 0..4 {
+            log.append(&turn).unwrap();
+        }
+        let path = RoomLog::path_for(&dir, &start().id);
+        drop(log);
+        let mut bytes = fs::read(&path).unwrap();
+        let start_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let at = HEADER + start_len;
+        // The length of "first" becomes 8 MiB: past the end of the file,
+        // over any turn frame, but under the new MAX_RECORD.
+        bytes[at..at + 4].copy_from_slice(&(8u32 << 20).to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let outcome = read_all(&path).map(|(_, records)| records.len());
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(outcome, Err(LogError::Damaged(_))),
+            "damage before the end was read as a torn tail: {outcome:?} records kept of 6"
+        );
+    }
+
+    /// Compaction keeps the room's log open until the new one is in place,
+    /// and the new one open from writing it to appending to it.
+    #[test]
+    fn a_compacted_log_replaces_one_still_open() {
+        let dir = temp_dir("replace-open");
+        let mut old = RoomLog::create(&dir, &start()).unwrap();
+        old.append(b"old turn").unwrap();
+        let mut new = RoomLog::compacted(&dir, &start(), &[b"new turn"]).unwrap();
+        old.append(b"turn while compacting").unwrap();
+        new.append(b"turn while compacting").unwrap();
+        new.install().unwrap();
+        drop(old);
+        new.append(b"turn after").unwrap();
+        drop(new);
+        let path = RoomLog::path_for(&dir, &start().id);
+        let (_, records) = read_all(&path).unwrap();
+        assert_eq!(
+            records[1..],
+            [
+                b"new turn".to_vec(),
+                b"turn while compacting".to_vec(),
+                b"turn after".to_vec()
+            ]
+        );
+        assert!(!path.with_extension("log.compacting").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_discarded_compaction_leaves_the_log_alone() {
+        let dir = temp_dir("discard");
+        let mut log = RoomLog::create(&dir, &start()).unwrap();
+        log.append(b"turn").unwrap();
+        RoomLog::compacted(&dir, &start(), &[b"other"])
+            .unwrap()
+            .discard();
+        let path = RoomLog::path_for(&dir, &start().id);
+        assert!(!path.with_extension("log.compacting").exists());
+        drop(log);
+        let (_, records) = read_all(&path).unwrap();
+        assert_eq!(records[1], b"turn");
         fs::remove_dir_all(&dir).unwrap();
     }
 
