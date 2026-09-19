@@ -26,7 +26,7 @@ use tpf3mp_proto::{
     PlayerId, Reject, RejectReason, Request, RequestError, Response, ServerMessage, SessionId,
     TURN_MAX_FRAME, TurnMessage, TurnStart, Welcome,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     Shared,
@@ -748,22 +748,26 @@ async fn bulk_stream(
                 return refuse(&mut send, open).await;
             }
             let _permit = transfer_permit(snapshots).await;
+            // Held from before it arrives, so no room letting go of the same
+            // world can take it; the room takes the hold over.
+            let id = bulk::manifest_id(&snapshot);
+            snapshots.hold(id);
             let fetched = bulk::fetch(
                 &mut send,
                 &mut recv,
                 &snapshots.store,
-                &bulk::manifest_id(&snapshot),
+                &id,
                 Completion::Retain,
                 BULK_IDLE,
                 |_| {},
             )
             .await;
             let violation = fetched.as_ref().err().is_some_and(BulkError::is_violation);
+            let failed = fetched.is_err();
             let result = match fetched {
                 Ok(manifest) => Ok(Arc::new(manifest)),
                 Err(error) => Err(error.to_string()),
             };
-            let kept = result.as_ref().ok().map(|manifest| manifest.id());
             let told = room
                 .tell(RoomCommand::Uploaded {
                     player,
@@ -771,13 +775,11 @@ async fn bulk_stream(
                     result,
                 })
                 .await;
-            if !told
-                && let Some(id) = kept
-                && let Err(error) = snapshots.store.release(&id)
-            {
-                // The room closed meanwhile, and nobody else would release
-                // the save.
-                warn!(%error, "cannot release the save of a closed room");
+            if failed || !told {
+                // Nothing arrived, or the room closed meanwhile: the hold
+                // goes back.
+                let snapshots = Arc::clone(snapshots);
+                let _ = tokio::task::spawn_blocking(move || snapshots.release(&[id])).await;
             }
             if violation {
                 return Err(BulkError::Violation("a broken upload"));

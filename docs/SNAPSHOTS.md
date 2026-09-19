@@ -450,12 +450,30 @@ How the duties this crate leaves to its users are met:
   anything else is `Unavailable` or a protocol violation.
 - **Bounds.** One bulk stream per connection at a time, 32 at once across a
   server, requests of at most 256 chunks and 16 KiB, responses of at most
-  11 MiB, and a minute of silence ends a stream. The server's store has a
-  size bound (64 GiB by default).
+  11 MiB, and a minute of silence ends a stream. Every chunk frame must
+  move at 64 KiB/s for its size (at least 5 s each), so a peer cannot hold
+  a transfer by trickling. An upload may run for 30 s plus its size at
+  128 KiB/s, at most 90 minutes; then its player is cut off and asked last
+  from then on. The server's store has a size bound (64 GiB by default).
+- **Shared worlds.** Rooms whose worlds are bit-identical share one
+  snapshot. Each room holds the snapshots it uses, one hold per slot
+  (current, previous), and the store lets a snapshot go only once no room
+  holds it. An upload holds its snapshot from before it arrives.
+- **Unfinished transfers.** A fetch that fails gives its transfer up, and
+  both sides sweep transfers nobody is running (after a crash, or an
+  aborted fetch) before collecting garbage, so nothing stays pinned.
 - **Untrusted uploads.** The server receives a save through a `ChunkSink`
   with `recompress_received`, and keeps it only after `ChunkSink::retain`
   verified the whole file. Which save to fetch is decided by the room's
-  save round, from lane digests, never by one client's say.
+  save round, from lane digests, never by one client's say. Only a member
+  whose stream carried the save may report on it.
+- **What the server cannot check.** The server does not run the game, so
+  it cannot tell whether the bytes a player uploads are the world its lane
+  digests describe. A player who reports the room's lanes and uploads
+  another world is caught at the receivers' next checkpoint, and rebased
+  onto the next save. Received saves must also be checked as data before
+  the game loads them (ARCHITECTURE.md, "Saves are code"); that needs the
+  save format, and is a release-day item (DAY_ONE.md §7).
 - **Blocking work** runs on Tokio's blocking pool.
 
 Retention:

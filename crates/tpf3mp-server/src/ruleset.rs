@@ -16,6 +16,21 @@ pub trait Ruleset: Send + 'static {
     fn validate(&self, player: &PlayerId, payload: &Payload) -> Result<(), u16>;
 
     fn apply(&mut self, event: &Event);
+
+    /// The ruleset's whole state, for compacting a room's log: a fresh
+    /// ruleset that [restores](Ruleset::restore) it and then applies the
+    /// events after must end exactly where this one does. `None`, the
+    /// default, means the ruleset cannot say, and its rooms keep their whole
+    /// log.
+    fn save(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Takes on a state that [`save`](Ruleset::save) produced.
+    fn restore(&mut self, state: &[u8]) -> Result<(), String> {
+        let _ = state;
+        Err("this ruleset cannot restore a saved state".into())
+    }
 }
 
 /// Creates the ruleset of each new room.
@@ -31,4 +46,16 @@ impl Ruleset for AcceptAll {
     }
 
     fn apply(&mut self, _event: &Event) {}
+
+    fn save(&self) -> Option<Vec<u8>> {
+        Some(Vec::new())
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), String> {
+        if state.is_empty() {
+            Ok(())
+        } else {
+            Err("accepting every intent keeps no state".into())
+        }
+    }
 }

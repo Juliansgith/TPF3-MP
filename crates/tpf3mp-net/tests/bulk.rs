@@ -308,3 +308,112 @@ async fn an_idle_peer_times_out() {
     .await;
     assert!(matches!(fetched, Err(BulkError::Idle(_))), "{fetched:?}");
 }
+
+/// From the snapshot review: a fetch that failed partway used to leave its
+/// transfer pending, and garbage collection keeps pending transfers' chunks,
+/// so they stayed forever.
+#[tokio::test]
+async fn a_failed_fetch_leaves_nothing_pinned() {
+    let (server_dir, client_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (server, client) = (store(&server_dir), store(&client_dir));
+    let manifest = server
+        .ingest(random_bytes(9, 900_000).as_slice(), params())
+        .unwrap();
+    // The server can serve every chunk but the last.
+    let last = manifest.unique_chunks().last().unwrap().id.to_string();
+    std::fs::remove_file(server.root().join("chunks").join(&last[..2]).join(&last)).unwrap();
+    let (fetched, _) = transfer(
+        &server,
+        &client,
+        &manifest,
+        manifest.id(),
+        Completion::Retain,
+    )
+    .await;
+    assert!(fetched.is_err());
+    assert_eq!(client.pending().unwrap(), [], "the transfer was given up");
+    client.gc([]).unwrap();
+    assert_eq!(
+        client.used_bytes(),
+        0,
+        "its chunks went at the next collection"
+    );
+}
+
+/// A transfer cut off without a word (its task aborted, its process killed)
+/// is dropped by the sweep, unless it is running.
+#[tokio::test]
+async fn idle_transfers_can_be_swept_but_running_ones_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let source = tempfile::tempdir().unwrap();
+    let other = self::store(&source);
+    let idle = other
+        .ingest(random_bytes(10, 300_000).as_slice(), params())
+        .unwrap();
+    let running = other
+        .ingest(random_bytes(11, 300_000).as_slice(), params())
+        .unwrap();
+    drop(tpf3mp_snapshot::ChunkSink::open(&store, idle).unwrap());
+    let _open = tpf3mp_snapshot::ChunkSink::open(&store, running.clone()).unwrap();
+    assert_eq!(store.abandon_idle_transfers().unwrap(), 1);
+    assert_eq!(store.pending().unwrap(), [running.id()]);
+}
+
+/// A server that trickles a chunk is given up on rather than holding the
+/// transfer, and what waits on it, indefinitely.
+#[tokio::test]
+async fn a_trickling_server_is_given_up_on() {
+    let (server_dir, client_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (server, client) = (store(&server_dir), store(&client_dir));
+    let manifest = server
+        .ingest(random_bytes(12, 300_000).as_slice(), params())
+        .unwrap();
+    let Pipe {
+        fetcher: (mut send, mut recv),
+        server: (mut server_send, mut server_recv),
+        _alive,
+    } = pipe().await;
+    let trickling = tokio::spawn(async move {
+        let request = read_message::<BulkRequest>(&mut server_recv, BULK_REQUEST_MAX_FRAME)
+            .await
+            .unwrap();
+        assert_eq!(request, BulkRequest::Manifest);
+        let answer = BulkResponse::Manifest {
+            bytes: manifest.to_bytes(),
+        };
+        write_message(&mut server_send, &answer, BULK_RESPONSE_MAX_FRAME)
+            .await
+            .unwrap();
+        // The first chunk's frame header, then a byte now and then.
+        let _ = read_message::<BulkRequest>(&mut server_recv, BULK_REQUEST_MAX_FRAME).await;
+        let _ = server_send.write_all(&60_000u32.to_le_bytes()).await;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if server_send.write_all(&[0]).await.is_err() {
+                break;
+            }
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let fetched = bulk::fetch(
+        &mut send,
+        &mut recv,
+        &client,
+        &manifest_id_of(&server),
+        Completion::Retain,
+        IDLE,
+        |_| {},
+    )
+    .await;
+    assert!(matches!(fetched, Err(BulkError::Idle(_))), "{fetched:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "given up promptly"
+    );
+    trickling.abort();
+}
+
+fn manifest_id_of(store: &ChunkStore) -> ManifestId {
+    store.retained().unwrap()[0]
+}

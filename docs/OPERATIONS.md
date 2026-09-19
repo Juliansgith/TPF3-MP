@@ -142,6 +142,22 @@ PROTOCOL.md describes the flow.
   both share are stored once. Closed games release theirs, and at start the
   server releases snapshots of games that are gone.
 
+## Releases
+
+`.github/workflows/release.yml` builds the player's package for Windows x64,
+Linux x64 and macOS arm64: the agent with its launcher, the in-game hook
+library and the server, plus a script that opens the launcher.
+
+- **Cutting one.** Push a version tag, for example
+  `git tag v0.1.0 && git push origin v0.1.0`. The workflow attaches the
+  packages to a draft release; review it on GitHub, then publish it.
+- **Building without releasing.** Run the workflow by hand. The packages
+  stay workflow artifacts, but the repository is public, so anyone can
+  download them.
+- **Until the game is out** the hook finds no build profile and installs
+  nothing, so the package is for trying the launcher and the netcode with
+  the fake game.
+
 ## Capacity
 
 Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and

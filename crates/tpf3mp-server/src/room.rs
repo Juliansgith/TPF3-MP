@@ -83,6 +83,9 @@ const MAX_FRONTIER: u64 = 1 << 48;
 /// diverging is told so every time, but reloading it more often would only
 /// keep its player out of the game.
 const REBASE_GAP: Duration = Duration::from_secs(300);
+/// Players a room keeps barred. The owner kicking throwaway identities in a
+/// loop cannot grow it further.
+const MAX_BANNED: usize = 1024;
 
 /// The channels to one connection of a member.
 #[derive(Clone)]
@@ -672,7 +675,7 @@ impl Room {
                 match &event.body {
                     EventBody::PlayerLeft { player, kicked } => {
                         seated.retain(|(seat, ..)| seat != player);
-                        if *kicked {
+                        if *kicked && banned.len() < MAX_BANNED {
                             banned.insert(*player);
                         }
                     }
@@ -1166,7 +1169,9 @@ impl Room {
             .ok_or(RequestError::NoSuchPlayer)?;
         info!(room = %self.id, player = %target, "the owner removed a player");
         self.push(index, ServerMessage::Kicked);
-        self.banned.insert(target);
+        if self.banned.len() < MAX_BANNED {
+            self.banned.insert(target);
+        }
         self.leave(target, true)
     }
 
@@ -1599,7 +1604,13 @@ impl Room {
         else {
             return;
         };
-        let platform = self.members[order].platform;
+        // Only a member whose stream carried the save can have made it.
+        let member = &self.members[order];
+        if !member.streaming || member.stream_from > event {
+            debug!(room = %self.id, %player, event, "ignoring a report of a save this member never saw");
+            return;
+        }
+        let platform = member.platform;
         let Phase::Running(game) = &mut self.phase else {
             return;
         };
@@ -1694,10 +1705,8 @@ impl Room {
             .upload
             .take_if(|upload| upload.from == player && upload.world.snapshot == snapshot)
         else {
-            // An upload the room gave up on; the store keeps nothing of it.
-            if let (Ok(manifest), Some(snapshots)) = (&result, &self.snapshots)
-                && game.saves.find(&snapshot).is_none()
-            {
+            // An upload the room gave up on: its hold goes back.
+            if let (Ok(manifest), Some(snapshots)) = (&result, &self.snapshots) {
                 release_in_background(Arc::clone(snapshots), vec![manifest.id()]);
             }
             return;
@@ -1713,6 +1722,7 @@ impl Room {
             Err(error) => {
                 warn!(room = %self.id, %player, %snapshot, %error, "a save's upload failed");
                 metrics::increment(&self.metrics.uploads_failed);
+                game.saves.failed_uploader(player);
                 self.ask_for_upload(upload.point, upload.rest, now);
             }
         }
@@ -1730,6 +1740,9 @@ impl Room {
                 Phase::Lobby => return,
             };
             if let Some(manifest) = held {
+                if let Some(snapshots) = &self.snapshots {
+                    snapshots.hold(manifest.id());
+                }
                 self.promote(Agreed { manifest, point });
                 return;
             }
@@ -1764,7 +1777,8 @@ impl Room {
 
     /// Makes `agreed` the snapshot players who need a world receive. The one
     /// before stays for downloads that may still run; the one before that
-    /// goes.
+    /// goes. The caller took a hold on `agreed` for its slot; the slot that
+    /// goes gives its hold back.
     fn promote(&mut self, agreed: Agreed) {
         let Phase::Running(game) = &mut self.phase else {
             return;
@@ -1781,11 +1795,9 @@ impl Room {
         metrics::increment(&self.metrics.snapshots_agreed);
         let dropped = game.saves.previous.take();
         game.saves.previous = game.saves.current.replace(agreed);
-        let held = game.saves.held();
         let released: Vec<ManifestId> = dropped
             .map(|agreed| agreed.manifest.id())
             .into_iter()
-            .filter(|id| !held.contains(id))
             .collect();
         if let Some(snapshots) = &self.snapshots {
             let snapshots = Arc::clone(snapshots);
@@ -1879,14 +1891,33 @@ impl Room {
             .map(|(event, _)| *event)
             .collect();
         let stalled = game.saves.upload.take_if(|upload| {
-            !upload.receiving && now.saturating_duration_since(upload.asked) >= UPLOAD_START
+            let waited = now.saturating_duration_since(upload.asked);
+            if upload.receiving {
+                waited >= snapshots::upload_deadline(upload.world.size)
+            } else {
+                waited >= UPLOAD_START
+            }
         });
+        if let Some(upload) = &stalled {
+            game.saves.failed_uploader(upload.from);
+        }
         for event in ready {
             self.decide_save(event, now);
         }
         if let Some(upload) = stalled {
-            warn!(room = %self.id, player = %upload.from, "a player asked for its save did not send it");
+            warn!(room = %self.id, player = %upload.from, receiving = upload.receiving, "a player asked for its save did not deliver it in time");
             metrics::increment(&self.metrics.uploads_failed);
+            if upload.receiving
+                && let Some(member) = self.members.iter_mut().find(|m| m.player == upload.from)
+                && let Some(link) = member.link.take()
+            {
+                // Its transfer is still running: end it, which frees the
+                // slot it holds. The player reconnects and resumes.
+                link.connection
+                    .close(close::SLOW_CONSUMER, b"the upload was too slow");
+                member.streaming = false;
+                member.pace = Pace::CatchingUp(None);
+            }
             self.ask_for_upload(upload.point, upload.rest, now);
         }
         self.save_if_due(&snapshots, now);
@@ -1901,7 +1932,11 @@ impl Room {
         let Some(round) = game.saves.rounds.remove(&event) else {
             return;
         };
-        let (candidates, diverged) = snapshots::decide(&round.reports);
+        let (mut candidates, diverged) = snapshots::decide(&round.reports);
+        // Players whose uploads failed go last.
+        candidates
+            .make_contiguous()
+            .sort_by_key(|(player, _)| game.saves.failed.contains(player));
         debug!(
             room = %self.id,
             event,

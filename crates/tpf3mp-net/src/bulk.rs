@@ -42,6 +42,12 @@ pub const FETCH_WINDOW: u64 = 16 << 20;
 /// gives up. One round finds every damaged chunk, so more only helps if the
 /// disk keeps damaging them.
 const REPAIR_ROUNDS: usize = 3;
+/// The least pace a chunk frame must move at, in bytes per second: a peer
+/// that sends or reads slower than this is given up on, so nobody can hold a
+/// transfer, and what waits on it, by trickling. It is 0.5 Mbit/s.
+pub const MIN_RATE: u64 = 64 * 1024;
+/// The time any one frame gets, however small.
+const FRAME_FLOOR: Duration = Duration::from_secs(5);
 
 /// Why a bulk transfer failed.
 #[derive(Debug, Error)]
@@ -189,12 +195,13 @@ pub async fn serve(
                     };
                     served.chunks += 1;
                     served.bytes += frame.len() as u64;
+                    let deadline = frame_time(frame.len() as u64, idle);
                     let response = BulkResponse::Chunk {
                         id: chunk_hash(&id),
                         frame,
                     };
                     within(
-                        idle,
+                        deadline,
                         write_message(send, &response, BULK_RESPONSE_MAX_FRAME),
                     )
                     .await??;
@@ -235,16 +242,50 @@ pub async fn fetch(
     if manifest.id() != *expected {
         return Err(BulkError::WrongManifest);
     }
-    let mut sink = {
+    let sink = {
         let store = store.clone();
         let manifest = manifest.clone();
         blocking(move || open_sink(&store, manifest)).await??
     };
     progress(sink.progress());
+    match fetch_into(send, recv, sink, &completion, idle, &mut progress).await {
+        Ok(()) => {
+            let _ = send.finish();
+            Ok(manifest)
+        }
+        Err(failure) => {
+            let (sink, error) = *failure;
+            // Leave nothing pinned: the chunks already stored stay until the
+            // next garbage collection, and count for another attempt.
+            if let Some(sink) = sink {
+                let _ = blocking(move || sink.abandon()).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// A failed fetch, with the sink if it still has it.
+type Failed = Box<(Option<ChunkSink>, BulkError)>;
+
+fn failed(sink: Option<ChunkSink>, error: BulkError) -> Failed {
+    Box::new((sink, error))
+}
+
+/// Fetches what the sink lacks and completes it, repairing damage found at
+/// the end.
+async fn fetch_into(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    mut sink: ChunkSink,
+    completion: &Completion,
+    idle: Duration,
+    progress: &mut impl FnMut(Progress),
+) -> Result<(), Failed> {
     let mut round = 0;
     loop {
         round += 1;
-        sink = fetch_missing(send, recv, sink, idle, &mut progress).await?;
+        sink = fetch_missing(send, recv, sink, idle, progress).await?;
         let completion = completion.clone();
         let (returned, finished) = blocking(move || {
             let finished = match &completion {
@@ -253,16 +294,14 @@ pub async fn fetch(
             };
             (sink, finished)
         })
-        .await?;
+        .await
+        .map_err(|error| failed(None, error))?;
         sink = returned;
         match finished {
-            Ok(()) => {
-                let _ = send.finish();
-                return Ok(manifest);
-            }
+            Ok(()) => return Ok(()),
             // Damaged chunks were dropped and are missing again.
             Err(SinkError::Store(StoreError::Corrupt { .. })) if round < REPAIR_ROUNDS => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(failed(Some(sink), error.into())),
         }
     }
 }
@@ -282,14 +321,15 @@ fn open_sink(store: &ChunkStore, manifest: Manifest) -> Result<ChunkSink, SinkEr
     ChunkSink::open(store, manifest)
 }
 
-/// Requests every chunk the sink lacks and feeds the answers to it.
+/// Requests every chunk the sink lacks and feeds the answers to it. Each
+/// answer must arrive at [`MIN_RATE`] for its size.
 async fn fetch_missing(
     send: &mut SendStream,
     recv: &mut RecvStream,
     mut sink: ChunkSink,
     idle: Duration,
     progress: &mut impl FnMut(Progress),
-) -> Result<ChunkSink, BulkError> {
+) -> Result<ChunkSink, Failed> {
     let mut wanted = sink.missing().into_iter().peekable();
     // Requested and not yet answered, in the order the answers come.
     let mut outstanding: VecDeque<(ChunkId, u64)> = VecDeque::new();
@@ -306,30 +346,56 @@ async fn fetch_missing(
                 outstanding_bytes += u64::from(entry.len);
             }
             let request = BulkRequest::Chunks { ids };
-            within(idle, write_message(send, &request, BULK_REQUEST_MAX_FRAME)).await??;
+            let sent = within(idle, write_message(send, &request, BULK_REQUEST_MAX_FRAME)).await;
+            match sent {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(failed(Some(sink), error.into())),
+                Err(error) => return Err(failed(Some(sink), error)),
+            }
         }
         let Some((due, len)) = outstanding.pop_front() else {
             return Ok(sink);
         };
         outstanding_bytes -= len;
-        let (id, frame) = match next_response(recv, idle).await? {
-            BulkResponse::Chunk { id, frame } => (chunk_id(&id), frame),
-            BulkResponse::Unavailable => return Err(BulkError::Unavailable),
-            BulkResponse::Manifest { .. } => {
-                return Err(BulkError::Violation("a manifest in place of a chunk"));
+        let (id, frame) = match next_response(recv, frame_time(len, idle)).await {
+            Ok(BulkResponse::Chunk { id, frame }) => (chunk_id(&id), frame),
+            Ok(BulkResponse::Unavailable) => {
+                return Err(failed(Some(sink), BulkError::Unavailable));
             }
+            Ok(BulkResponse::Manifest { .. }) => {
+                return Err(failed(
+                    Some(sink),
+                    BulkError::Violation("a manifest in place of a chunk"),
+                ));
+            }
+            Err(error) => return Err(failed(Some(sink), error)),
         };
         if id != due {
-            return Err(BulkError::Violation("a chunk out of order"));
+            return Err(failed(
+                Some(sink),
+                BulkError::Violation("a chunk out of order"),
+            ));
         }
         let (returned, put) = blocking(move || {
             let put = sink.put(&id, &frame);
             (sink, put)
         })
-        .await?;
+        .await
+        .map_err(|error| failed(None, error))?;
         sink = returned;
-        progress(put?);
+        match put {
+            Ok(done) => progress(done),
+            Err(error) => return Err(failed(Some(sink), error.into())),
+        }
     }
+}
+
+/// The time a frame of `len` bytes gets at [`MIN_RATE`], at least
+/// [`FRAME_FLOOR`] and at most `idle`.
+fn frame_time(len: u64, idle: Duration) -> Duration {
+    Duration::from_millis(len.saturating_mul(1000) / MIN_RATE)
+        .max(FRAME_FLOOR)
+        .min(idle.max(FRAME_FLOOR))
 }
 
 async fn next_response(recv: &mut RecvStream, idle: Duration) -> Result<BulkResponse, BulkError> {

@@ -239,16 +239,19 @@ nothing has changed.
 2. Every client that plays through the event saves its world, with every
    earlier event applied and before the event's step runs. It cuts the save
    into its chunk store and reports `Saved` with the world's lane digests
-   and the snapshot it holds (or none, if saving failed).
+   and the snapshot it holds (or none, if saving failed). Only a member
+   whose stream carried the save may report it.
 3. Once every member pacing the room whose stream carries the save has
    reported, or two minutes have passed, the room judges the lanes as it
    judges a checkpoint's. A lone report stands: that is how a player alone
    in a room hands its world on. Members whose lanes differ are told
    `Diverged`.
 4. The room asks a member whose lanes agreed, earliest in join order first,
-   to `Upload` its snapshot. If it does not start within 30 seconds, or the
-   upload fails, the next one is asked. A snapshot the room already holds
-   needs no upload.
+   to `Upload` its snapshot; members whose uploads failed before are asked
+   last. If it does not start within 30 seconds, fails, or runs longer
+   than its size allows (30 s plus the size at 128 KiB/s, at most 90
+   minutes), the next one is asked, and a transfer still running is cut
+   off. A snapshot the room already holds needs no upload.
 5. The received snapshot becomes the room's current world. The one before
    stays for downloads that may still run; older ones are released.
 
@@ -279,7 +282,9 @@ frame, and is checked against its hash before it is stored; the finished
 file is checked against the manifest's file hash. A server stores received
 chunks compressed by itself, never an uploader's frames. Requests are
 capped at 16 KiB per frame and responses at 11 MiB. A side that sends
-nothing for a minute is given up on.
+nothing for a minute is given up on, and every chunk must move at
+64 KiB/s for its size (at least 5 s each), so nobody holds a transfer by
+trickling.
 
 **Persistence.** Next to each room's log, a pointer file names its current
 snapshot and where it stands. A restored room keeps offering that snapshot

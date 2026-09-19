@@ -11,12 +11,12 @@
 //! snapshot is then what players who need a world receive.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -37,6 +37,14 @@ use crate::verdict::{self, Report};
 pub(crate) const SAVE_DEADLINE: Duration = Duration::from_secs(120);
 /// How long a player asked to upload has to start.
 pub(crate) const UPLOAD_START: Duration = Duration::from_secs(30);
+/// The pace an upload is allowed, in bytes per second of the save's size:
+/// 1 Mbit/s. Any honest uplink manages it; a trickle meant to hold the
+/// room's saves does not.
+const UPLOAD_RATE: u64 = 128 * 1024;
+/// The longest any upload may run.
+const UPLOAD_LIMIT: Duration = Duration::from_secs(90 * 60);
+/// Players whose uploads failed, remembered to ask them last.
+const FAILED_KEPT: usize = 16;
 /// Silence after which a bulk stream is given up.
 pub(crate) const BULK_IDLE: Duration = Duration::from_secs(60);
 /// Bulk streams the server runs at once, so snapshots cannot take all of
@@ -79,12 +87,18 @@ impl SnapshotConfig {
 }
 
 /// The server's snapshots, shared by every room.
+///
+/// The store is content-addressed, so two rooms whose worlds are
+/// bit-identical share one snapshot. Each room therefore holds the snapshots
+/// it uses, and the store lets one go only once no room holds it.
 pub(crate) struct Snapshots {
     pub(crate) store: ChunkStore,
     pub(crate) every: Duration,
     pub(crate) min_gap: Duration,
     /// Bulk streams running at once, across the server.
     pub(crate) transfers: Arc<Semaphore>,
+    /// How many holds each snapshot has.
+    holds: Mutex<HashMap<ManifestId, usize>>,
     /// Whether a snapshot was released since the last collection.
     released: AtomicBool,
 }
@@ -100,35 +114,81 @@ impl Snapshots {
             every: config.every,
             min_gap: config.min_gap.min(config.every),
             transfers: Arc::new(Semaphore::new(TRANSFERS)),
+            holds: Mutex::default(),
             released: AtomicBool::new(false),
         })
     }
 
-    /// Stops keeping these snapshots. Their chunks go at the next
-    /// collection. Blocking.
+    fn holds(&self) -> std::sync::MutexGuard<'_, HashMap<ManifestId, usize>> {
+        self.holds.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes a hold on a snapshot the store retains.
+    pub(crate) fn hold(&self, id: ManifestId) {
+        *self.holds().entry(id).or_default() += 1;
+    }
+
+    /// Gives up one hold on each of these snapshots. A snapshot nobody holds
+    /// any more stops being kept, and its chunks go at the next collection.
+    /// Blocking.
     pub(crate) fn release(&self, ids: &[ManifestId]) {
+        let mut unheld = Vec::new();
+        {
+            let mut holds = self.holds();
+            for id in ids {
+                match holds.get_mut(id) {
+                    Some(count) if *count > 1 => *count -= 1,
+                    _ => {
+                        holds.remove(id);
+                        unheld.push(*id);
+                    }
+                }
+            }
+        }
+        self.drop_unheld(&unheld);
+    }
+
+    /// Stops keeping snapshots nobody holds. The holds stay locked
+    /// meanwhile, so a hold taken at the same moment keeps its snapshot.
+    fn drop_unheld(&self, ids: &[ManifestId]) {
+        let holds = self.holds();
         for id in ids {
+            if holds.contains_key(id) {
+                continue;
+            }
             if let Err(error) = self.store.release(id) {
                 warn!(%error, "cannot release a snapshot");
             }
-        }
-        if !ids.is_empty() {
             self.released.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Collects the chunks of released snapshots, if any were released
-    /// since the last collection. Blocking.
+    /// Drops transfers nobody finished, then collects the chunks of released
+    /// snapshots, if there are any. Blocking.
     pub(crate) fn collect_released(&self) {
-        if self.released.swap(false, Ordering::Relaxed) {
+        let abandoned = match self.store.abandon_idle_transfers() {
+            Ok(abandoned) => abandoned,
+            Err(error) => {
+                warn!(%error, "cannot sweep unfinished snapshot transfers");
+                0
+            }
+        };
+        if self.released.swap(false, Ordering::Relaxed) || abandoned > 0 {
             self.collect();
         }
     }
 
-    /// Stops keeping snapshots no room refers to, for example those of
-    /// rooms that closed while the server was down, and collects their
-    /// chunks.
+    /// Holds the snapshots restored rooms use, stops keeping every other,
+    /// for example those of rooms that closed while the server was down,
+    /// drops unfinished transfers, and collects the chunks. Blocking; for
+    /// the start of the server.
     pub(crate) fn release_all_but(&self, keep: &[ManifestId]) {
+        for id in keep {
+            self.hold(*id);
+        }
+        if let Err(error) = self.store.abandon_idle_transfers() {
+            warn!(%error, "cannot sweep unfinished snapshot transfers");
+        }
         match self.store.retained() {
             Ok(retained) => {
                 for id in retained.iter().filter(|id| !keep.contains(id)) {
@@ -231,6 +291,8 @@ pub(crate) struct Saves {
     pub(crate) last_point: Option<SavePoint>,
     /// Someone needs a world the current snapshot cannot give.
     pub(crate) wanted: bool,
+    /// Players whose last uploads failed, newest last.
+    pub(crate) failed: VecDeque<PlayerId>,
 }
 
 impl Saves {
@@ -266,6 +328,15 @@ impl Saves {
         periodic || needed
     }
 
+    /// Remembers that `player`'s upload failed, so later rounds ask it last.
+    pub(crate) fn failed_uploader(&mut self, player: PlayerId) {
+        self.failed.retain(|failed| *failed != player);
+        if self.failed.len() == FAILED_KEPT {
+            self.failed.pop_front();
+        }
+        self.failed.push_back(player);
+    }
+
     /// The ids of the snapshots this game holds, newest first.
     pub(crate) fn held(&self) -> Vec<ManifestId> {
         [&self.current, &self.previous]
@@ -282,6 +353,11 @@ impl Saves {
             .flatten()
             .find(|agreed| agreed.id() == *snapshot)
     }
+}
+
+/// How long an upload of a save of `size` bytes may run once it started.
+pub(crate) fn upload_deadline(size: u64) -> Duration {
+    (UPLOAD_START + Duration::from_secs(size / UPLOAD_RATE)).min(UPLOAD_LIMIT)
 }
 
 /// Decides a save round: which saves may be uploaded, best first, and who
@@ -479,6 +555,74 @@ mod tests {
             receiving: false,
         });
         assert!(!due(&saves, every, (30, 11)), "one save at a time");
+    }
+
+    /// From the snapshot review: two rooms with the same world share one
+    /// snapshot, and one of them moving on must not take it from the other.
+    #[test]
+    fn a_snapshot_two_rooms_hold_stays_until_both_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = Snapshots::open(&SnapshotConfig::new(dir.path())).unwrap();
+        let world = [7u8; 50_000];
+        let shared = snapshots
+            .store
+            .ingest(&world[..], tpf3mp_snapshot::ChunkParams::DEFAULT)
+            .unwrap();
+        snapshots.hold(shared.id());
+        snapshots.hold(shared.id());
+        snapshots.release(&[shared.id()]);
+        snapshots.collect_released();
+        assert!(
+            snapshots.store.missing(&shared).unwrap().is_empty(),
+            "the other room still has its world"
+        );
+        snapshots.release(&[shared.id()]);
+        snapshots.collect_released();
+        assert_eq!(snapshots.store.retained().unwrap(), []);
+        assert!(!snapshots.store.missing(&shared).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_save_received_for_nobody_is_dropped_but_a_held_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = Snapshots::open(&SnapshotConfig::new(dir.path())).unwrap();
+        let params = tpf3mp_snapshot::ChunkParams::DEFAULT;
+        // An upload holds its snapshot from before it arrives.
+        let unwanted = snapshots.store.ingest(&[1u8; 10_000][..], params).unwrap();
+        snapshots.hold(unwanted.id());
+        let kept = snapshots.store.ingest(&[2u8; 10_000][..], params).unwrap();
+        snapshots.hold(kept.id());
+        snapshots.hold(kept.id());
+        // The room no longer wanted the first; the second a room took over.
+        snapshots.release(&[unwanted.id(), kept.id()]);
+        assert_eq!(snapshots.store.retained().unwrap(), [kept.id()]);
+    }
+
+    #[test]
+    fn uploads_get_time_for_their_size_within_a_limit() {
+        assert_eq!(upload_deadline(0), UPLOAD_START);
+        // 300 MiB at 128 KiB/s: 40 minutes.
+        assert_eq!(
+            upload_deadline(300 << 20),
+            UPLOAD_START + Duration::from_secs(40 * 60)
+        );
+        assert_eq!(upload_deadline(4 << 30), UPLOAD_LIMIT);
+    }
+
+    #[test]
+    fn players_whose_uploads_failed_are_remembered_newest_last() {
+        let mut saves = Saves::default();
+        let player = |n| PlayerId(FixedBytes([n; 32]));
+        for n in 0..20 {
+            saves.failed_uploader(player(n));
+        }
+        saves.failed_uploader(player(5));
+        assert_eq!(saves.failed.len(), FAILED_KEPT);
+        assert_eq!(saves.failed.back(), Some(&player(5)));
+        assert!(
+            !saves.failed.contains(&player(0)),
+            "the oldest are forgotten"
+        );
     }
 
     #[test]

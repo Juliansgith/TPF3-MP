@@ -284,6 +284,40 @@ fn claim(store: &ChunkStore, id: &ManifestId) -> Result<SinkClaim, SinkError> {
     store.claim_sink(id).ok_or(SinkError::AlreadyOpen(*id))
 }
 
+impl ChunkStore {
+    /// Gives up every unfinished transfer no [`ChunkSink`] of this process
+    /// holds, and drops saved transfers that can no longer be read. Their
+    /// chunks stay until the next garbage collection. Returns how many were
+    /// dropped.
+    ///
+    /// Garbage collection keeps the chunks of unfinished transfers so that a
+    /// transfer can continue after a restart. A process that does not mean
+    /// to continue them, or one whose transfers failed or were cut off, calls
+    /// this first, or those chunks stay forever.
+    pub fn abandon_idle_transfers(&self) -> Result<usize, StoreError> {
+        let mut dropped = 0;
+        for id in self.pending()? {
+            match ChunkSink::resume(self, &id) {
+                Ok(sink) => match sink.abandon() {
+                    Ok(()) => dropped += 1,
+                    Err(SinkError::Store(error)) => return Err(error),
+                    Err(_) => {}
+                },
+                // Someone is fetching it right now.
+                Err(SinkError::AlreadyOpen(_)) => {}
+                Err(SinkError::Store(StoreError::DamagedRecord { .. })) => {
+                    self.remove_record(Record::Pending, &id)?;
+                    dropped += 1;
+                }
+                Err(SinkError::Store(StoreError::UnknownSnapshot(_))) => {}
+                Err(SinkError::Store(error)) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(dropped)
+    }
+}
+
 impl fmt::Debug for ChunkSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ChunkSink")

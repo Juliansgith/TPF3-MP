@@ -85,9 +85,13 @@ impl Worlds {
         Ok((manifest, world))
     }
 
-    /// Stops keeping snapshots other than `keep`, deletes received world
-    /// files other than theirs, and collects unused chunks. Blocking.
+    /// Stops keeping snapshots other than `keep`, drops transfers that no
+    /// fetch is running any more, deletes received world files other than
+    /// those of `keep`, and collects unused chunks. Blocking.
     pub fn keep_only(&self, keep: &[ManifestId]) -> io::Result<()> {
+        self.store
+            .abandon_idle_transfers()
+            .map_err(io::Error::other)?;
         for id in self.store.retained().map_err(io::Error::other)? {
             if !keep.contains(&id) {
                 self.store.release(&id).map_err(io::Error::other)?;

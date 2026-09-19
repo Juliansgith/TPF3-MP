@@ -96,6 +96,12 @@ do not change D2.
 - Force a save and load a named save from native code.
 - Load a save made on Windows on Linux and macOS, and the reverse.
 - Measure save sizes for small, medium and large maps.
+- Find what a save can make the game run (script state, mod code), and
+  write the check the agent applies to a received save before the game
+  loads it, as TPF2MP's `save_metadata.py` did. Until then a received save
+  is only as trustworthy as the player who uploaded it.
+- Run `measure --pair` on two saves of one world taken minutes apart, to
+  see how well snapshots deduplicate (SNAPSHOTS.md).
 
 ## Deliverable
 
