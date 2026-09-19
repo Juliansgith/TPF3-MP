@@ -1,19 +1,18 @@
-//! Adversarial-review proof-of-concept for the detour engine's relocation.
+//! From the adversarial review of the detour engine's relocation.
 //!
 //! These probe iced-x86 directly (the same decode/encode the engine drives in
 //! `detour/x86_64.rs`) to establish, on this exact iced-x86 version, what
 //! happens when a stolen RIP-relative instruction's absolute target is farther
-//! than a signed 32-bit displacement can reach from the trampoline. The engine
-//! allocates the trampoline with a plain `VirtualAlloc(null, ..)` /
-//! `mmap(null, ..)` (see `detour/sys.rs`), which places it anywhere in the
-//! 64-bit address space - with no attempt to stay within +/-2 GiB of the target.
+//! than a signed 32-bit displacement can reach from the trampoline.
 //!
-//! Conclusion (documented by the two tests): the relocation is *sound* - it
-//! never miscompiles; it either emits a correct form or returns an error the
-//! engine surfaces as `DetourError::Encode`. But that error path is reachable in
-//! production for a normal, high-loaded module, which is the robustness finding.
+//! The relocation is sound: it never miscompiles, but either emits a correct
+//! form or returns an error the engine surfaces as `DetourError::Encode`. The
+//! review found that error reachable for a high-loaded module, because the
+//! trampoline could land anywhere. The engine now allocates it near the
+//! target (`detour/sys.rs`); these tests pin iced-x86's behaviour either way.
 //!
-//! `#[ignore]`d so the normal suite stays green; both are safe to run.
+//! x86-64 only, like the engine and its iced-x86 dependency.
+#![cfg(target_arch = "x86_64")]
 #![allow(clippy::unwrap_used)]
 
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, InstructionBlock};
@@ -53,15 +52,14 @@ fn near_rip_relative_relocation_stays_correct() {
     );
 }
 
-/// FINDING (Medium, robustness - fails closed, does not miscompile). For a
-/// module loaded high in the address space (the norm on 64-bit Windows with
-/// ASLR, e.g. base ~0x7FF6_xxxx_xxxx) whose stolen prologue contains a
-/// RIP-relative operand, if the trampoline is allocated more than 2 GiB away -
-/// which `sys::alloc`'s unhinted `VirtualAlloc(null)` / `mmap(null)` does not
-/// prevent - the displacement cannot be re-encoded and iced-x86 returns an
-/// error. The engine turns that into `DetourError::Encode` and installs nothing:
-/// sound, but it means installing an otherwise-valid hook can *fail in
-/// production* for exactly the functions the mod wants to hook.
+/// FINDING (Medium, robustness - fails closed, does not miscompile; fixed by
+/// `sys::alloc_near`). For a module loaded high in the address space (the norm
+/// on 64-bit Windows with ASLR, e.g. base ~0x7FF6_xxxx_xxxx) whose stolen
+/// prologue contains a RIP-relative operand, a trampoline more than 2 GiB away
+/// cannot hold the re-encoded displacement and iced-x86 returns an error. The
+/// engine turns that into `DetourError::Encode` and installs nothing: sound,
+/// but installing an otherwise-valid hook would fail for exactly the functions
+/// the mod wants to hook. The engine now keeps trampolines within 1 GiB.
 ///
 /// The test also confirms the encoder never silently miscompiles: when it does
 /// return `Ok` (target reachable via the 32-bit address-size wrap), the emitted
