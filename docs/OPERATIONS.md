@@ -268,6 +268,7 @@ Measured with `tpf3mp-loadtest` on one Windows desktop, with the server and
   the same run time. On loopback nothing is lost, so this measures the
   tunnel's own cost; on a lossy link, TCP holds datagrams back behind each
   lost segment;
+- one full room of 64 players: p99 116 ms, no divergence;
 - with every room logged and compacted past 8 KiB (`--data-dir`,
   `--compact-log-kib 8`), 3,000 steps: 121 compactions during the run,
   p99 114 ms, and memory level at about 150 MB.

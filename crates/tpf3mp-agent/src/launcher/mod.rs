@@ -230,29 +230,23 @@ async fn act(
             if name.as_str().is_empty() {
                 return Err("choose a name".into());
             }
-            let options = connect_options(config, &server, name).await?;
-            *connected = None;
-            {
-                let mut view = shared.view();
-                view.connecting = true;
-                view.server = Some(server.clone());
+            // A whole invite, as "Copy invite" gives it, connects and joins.
+            let passed = passed_invite(&server);
+            let server = match &passed {
+                Some(Passed {
+                    server: Some(server),
+                    ..
+                }) => server.clone(),
+                Some(Passed { server: None, .. }) => {
+                    return Err("that is an invite: put the server's address before it".into());
+                }
+                None => server.trim().to_owned(),
+            };
+            connect_to(shared, config, connected, &server, name).await?;
+            match passed {
+                Some(passed) => join(shared, config, connected, session, passed.invite, None).await,
+                None => Ok(()),
             }
-            let result = connect(options.clone()).await;
-            let mut view = shared.view();
-            view.connecting = false;
-            let (client, events) = result.map_err(|error| error.to_string())?;
-            view.connected = true;
-            view.tunneled = client.tunneled();
-            view.error = None;
-            view.name = options.name.as_str().to_owned();
-            view.server_version = Some(client.welcome().server_version.as_str().to_owned());
-            drop(view);
-            *connected = Some(Connected {
-                options: options.again_after(&client),
-                client,
-                events,
-            });
-            Ok(())
         }
         Action::Disconnect => {
             if let Some(session) = session.take() {
@@ -295,30 +289,17 @@ async fn act(
         }
         Action::Join { invite, password } => {
             let current = connected.as_ref().ok_or("connect to a server first")?;
-            let invite: Invite = invite
-                .trim()
-                .parse()
-                .map_err(|_| "that is not an invite".to_owned())?;
+            let passed = passed_invite(&invite).ok_or("that is not an invite")?;
             let password = password_text(password)?;
-            let room = current
-                .client
-                .join_room(JoinRoom {
-                    invite: invite.clone(),
-                    password: password.clone(),
-                    resume: None,
-                    content: Some(config.content),
-                })
-                .await
-                .map_err(|error| error.to_string())?;
-            if room.phase == RoomPhase::Lobby {
-                current
-                    .client
-                    .declare_content(config.content)
-                    .await
-                    .map_err(|error| error.to_string())?;
+            // An invite to another server takes the player there first.
+            let here = shared.view().server.clone();
+            if let Some(server) = passed.server
+                && !here.is_some_and(|here| here.eq_ignore_ascii_case(&server))
+            {
+                let name = current.options.name.clone();
+                connect_to(shared, config, connected, &server, name).await?;
             }
-            shared.status().room = Some(room);
-            begin_session(shared, config, connected, session, invite, password)
+            join(shared, config, connected, session, passed.invite, password).await
         }
         Action::Ready { ready } => forward(session, Control::Ready(ready)).await,
         Action::Start => forward(session, Control::Start).await,
@@ -391,7 +372,11 @@ fn begin_session(
     });
     {
         let mut view = shared.view();
-        view.invite = Some(invite.to_string());
+        // Friends need the server too: "Copy invite" gives both.
+        view.invite = Some(match &view.server {
+            Some(server) => format!("{server} {invite}"),
+            None => invite.to_string(),
+        });
         view.in_room = true;
         view.error = None;
     }
@@ -434,6 +419,113 @@ async fn reconnect(shared: &Arc<Shared>, options: ConnectOptions) -> Option<Conn
             None
         }
     }
+}
+
+/// Connects to `server` as `name`, replacing any connection.
+async fn connect_to(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    connected: &mut Option<Connected>,
+    server: &str,
+    name: Text<32>,
+) -> Result<(), String> {
+    let options = connect_options(config, server, name).await?;
+    *connected = None;
+    {
+        let mut view = shared.view();
+        view.connecting = true;
+        view.server = Some(server.to_owned());
+    }
+    let result = connect(options.clone()).await;
+    let mut view = shared.view();
+    view.connecting = false;
+    let (client, events) = result.map_err(|error| error.to_string())?;
+    view.connected = true;
+    view.tunneled = client.tunneled();
+    view.error = None;
+    view.name = options.name.as_str().to_owned();
+    view.server_version = Some(client.welcome().server_version.as_str().to_owned());
+    drop(view);
+    *connected = Some(Connected {
+        options: options.again_after(&client),
+        client,
+        events,
+    });
+    Ok(())
+}
+
+/// Joins the room of `invite` on the current connection.
+async fn join(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    connected: &mut Option<Connected>,
+    session: &mut Option<Session>,
+    invite: Invite,
+    password: Option<Text<64>>,
+) -> Result<(), String> {
+    let current = connected.as_ref().ok_or("connect to a server first")?;
+    let room = current
+        .client
+        .join_room(JoinRoom {
+            invite: invite.clone(),
+            password: password.clone(),
+            resume: None,
+            content: Some(config.content),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if room.phase == RoomPhase::Lobby {
+        current
+            .client
+            .declare_content(config.content)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    shared.status().room = Some(room);
+    begin_session(shared, config, connected, session, invite, password)
+}
+
+/// An invite as players pass it on: the room's invite, perhaps with the
+/// server's address before it, as "Copy invite" gives it, inside whatever
+/// message it came in.
+#[derive(Debug, PartialEq, Eq)]
+struct Passed {
+    server: Option<String>,
+    invite: Invite,
+}
+
+fn passed_invite(text: &str) -> Option<Passed> {
+    let tokens: Vec<&str> = text
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | '<' | '>' | '(' | ')' | ',' | ';' | '*'
+                )
+            })
+        })
+        .collect();
+    let (at, invite) = tokens
+        .iter()
+        .enumerate()
+        .find_map(|(at, token)| token.parse::<Invite>().ok().map(|invite| (at, invite)))?;
+    let server = tokens[..at]
+        .iter()
+        .rev()
+        .find(|token| names_a_server(token))
+        .map(|token| (*token).to_owned());
+    Some(Passed { server, invite })
+}
+
+/// Whether `token` reads as `host:port`, the host a name or an address, as
+/// in `tpf3mp.example.org:29470` or `[2001:db8::1]:29470`: not a time of
+/// day like `12:30`.
+fn names_a_server(token: &str) -> bool {
+    token.rsplit_once(':').is_some_and(|(host, port)| {
+        port.parse::<u16>().is_ok_and(|port| port > 0)
+            && host.contains(|c: char| c == '.' || c == '[' || c.is_ascii_alphabetic())
+    })
 }
 
 async fn connect_options(
@@ -503,4 +595,63 @@ fn random_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the operating system's random source is available");
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use tpf3mp_proto::{FixedBytes, RoomId};
+
+    use super::*;
+
+    fn invite() -> Invite {
+        Invite {
+            room: RoomId(FixedBytes([5; 16])),
+            token: FixedBytes([6; 32]),
+        }
+    }
+
+    #[test]
+    fn an_invite_is_found_in_whatever_message_it_came_in() {
+        let code = invite().to_string();
+        let passed = |text: String| passed_invite(&text);
+        let at = |server: &str| {
+            Some(Passed {
+                server: Some(server.to_owned()),
+                invite: invite(),
+            })
+        };
+        // As "Copy invite" gives it.
+        assert_eq!(
+            passed(format!("tpf3mp.example.org:29470 {code}")),
+            at("tpf3mp.example.org:29470")
+        );
+        // Pasted from a chat, formatted.
+        assert_eq!(
+            passed(format!(
+                "join us at `play.example.net:29470` with \"{code}\", at 12:30!"
+            )),
+            at("play.example.net:29470")
+        );
+        assert_eq!(
+            passed(format!("[2001:db8::1]:29470 {code}")),
+            at("[2001:db8::1]:29470")
+        );
+        assert_eq!(
+            passed(format!("localhost:29470\n{code}")),
+            at("localhost:29470")
+        );
+        // A time of day is no server.
+        assert_eq!(
+            passed(format!("at 12:30 {code}")),
+            Some(Passed {
+                server: None,
+                invite: invite(),
+            })
+        );
+        // The bare invite, and no invite at all.
+        assert_eq!(passed(code.clone()).map(|p| p.server), Some(None));
+        assert_eq!(passed("tpf3mp.example.org:29470".into()), None);
+        // A cut-off invite is none.
+        assert_eq!(passed(code[..code.len() - 4].to_owned()), None);
+    }
 }

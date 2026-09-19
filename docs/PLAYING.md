@@ -31,12 +31,16 @@ The page works only on your own machine, and only in the tab the launcher
 opened: other pages and other programs cannot use it.
 
 1. **Server.** Enter the server's address and the name others will see,
-   then **Connect**.
+   then **Connect**. Got an invite? Paste the whole of it here instead,
+   with your name: you are connected and in the room in one step.
 2. **Rooms.** Either create a room, with an optional password, or paste an
    invite someone sent you and **Join room**.
 3. **Invite.** In your room, **Copy invite** and send it to your friends,
-   for example on Discord. Anyone with the invite (and the password, if you
-   set one) can join; keep it within your group.
+   for example on Discord. It holds the server's address, as you typed it,
+   and the room's code; if you typed `localhost` or a home network address,
+   put the address your friends use in its place. Anyone with the invite
+   (and the password, if you set one) can join; keep it within your
+   group.
 4. **Ready.** Everyone presses **Ready**. The room's owner then presses
    **Start game**. Everyone's game starts from the owner's world.
 

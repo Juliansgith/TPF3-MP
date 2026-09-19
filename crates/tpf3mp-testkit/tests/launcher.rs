@@ -234,12 +234,15 @@ async fn two_players_play_a_room_from_their_launchers() {
         .wait_for("Ann's room", |state| state["room"]["invite"].is_string())
         .await;
     let invite = state["room"]["invite"].as_str().unwrap().to_owned();
+    assert!(
+        invite.starts_with(&format!("{server_address} TPF3MP1.")),
+        "the invite names its server: {invite}"
+    );
 
+    // Bob pastes Ann's whole invite where the server goes: connected and
+    // joined in one step.
     bob_page
-        .act(json!({ "action": "connect", "server": server_address, "name": "Bob" }))
-        .await;
-    bob_page
-        .act(json!({ "action": "join", "invite": invite, "password": null }))
+        .act(json!({ "action": "connect", "server": invite, "name": "Bob" }))
         .await;
     for page in [&ann_page, &bob_page] {
         page.act(json!({ "action": "ready", "ready": true })).await;
