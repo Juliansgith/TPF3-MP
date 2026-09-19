@@ -59,7 +59,7 @@ pub async fn play_room(plan: RoomPlan) -> Result<Vec<BotReport>> {
             .join_room(JoinRoom {
                 invite: invite.clone(),
                 password: None,
-                resume_after_turn: None,
+                resume: None,
             })
             .await?;
     }

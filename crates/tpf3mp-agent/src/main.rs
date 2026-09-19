@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
                 .join_room(JoinRoom {
                     invite,
                     password: password.map(Text::new).transpose().context("password")?,
-                    resume_after_turn: None,
+                    resume: None,
                 })
                 .await?;
             print_room(&room);

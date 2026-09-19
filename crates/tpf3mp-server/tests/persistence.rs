@@ -69,7 +69,7 @@ async fn resume(server: &RunningServer, players: Vec<Player>, invite: &Invite) -
             ..
         } = old;
         let mut player = Player::new(server.client_as(identity, "back").await);
-        let last_turn = follower.as_ref().and_then(|f| f.last_turn());
+        let resume = follower.as_ref().and_then(|f| f.resume_point());
         player.follower = follower;
         player.start = start;
         player.applied = applied;
@@ -79,7 +79,7 @@ async fn resume(server: &RunningServer, players: Vec<Player>, invite: &Invite) -
             .join_room(JoinRoom {
                 invite: invite.clone(),
                 password: None,
-                resume_after_turn: last_turn,
+                resume,
             })
             .await
             .unwrap();
@@ -199,7 +199,7 @@ async fn restored_rooms_need_the_same_secret() {
         .join_room(JoinRoom {
             invite,
             password: None,
-            resume_after_turn: None,
+            resume: None,
         })
         .await
         .unwrap_err();

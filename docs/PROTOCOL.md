@@ -176,11 +176,19 @@ messages can be in flight when a player leaves, so they are not violations.
 
 ## Resuming
 
-A player who reconnects joins the room again with the same identity and
-the number of the last turn it applied (`resume_after_turn`). The server
-opens a turn stream that starts right after that turn. The new connection
-replaces the old one, which is closed with `REPLACED`. A client checks that
-the stream continues its log exactly (`TurnFollower::restart`).
+A player who reconnects joins the room again with the same identity and a
+`Resume`: the last turn it applied and the history that turn belongs to,
+which its stream's `TurnStart` named (`TurnFollower::resume_point`). The
+server opens a turn stream that starts right after that turn. The new
+connection replaces the old one, which is closed with `REPLACED`. A client
+checks that the stream continues its log exactly (`TurnFollower::restart`).
+
+**Histories.** A room restored after a crash may have lost the last turns
+some clients saw, and from then on it numbers different turns the same way.
+Each restore therefore begins a new history, recorded in the log. The server
+resumes a client only on turns its history shares with the current one; a
+client that saw lost turns is told `ResumeUnavailable`, however many turns
+the room has sealed since.
 
 ## Slow and misbehaving clients
 

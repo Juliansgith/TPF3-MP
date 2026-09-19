@@ -110,6 +110,7 @@ async fn a_hostile_server_cannot_fill_the_client_with_turns() {
             next_event: 1,
             steps_per_second: 5,
             checkpoint_interval: 10,
+            history: 0,
         });
         write_message(&mut turns, &start, TURN_MAX_FRAME)
             .await

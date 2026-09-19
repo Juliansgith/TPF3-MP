@@ -412,7 +412,7 @@ impl Client {
                         member,
                         token: join.invite.token,
                         password: join.password,
-                        resume_after_turn: join.resume_after_turn,
+                        resume: join.resume,
                         reply,
                     })
                     .await?;

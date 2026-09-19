@@ -14,6 +14,7 @@ fn start(next_turn: u64, next_event: u64) -> TurnStart {
         next_event,
         steps_per_second: 5,
         checkpoint_interval: 10,
+        history: 0,
     }
 }
 

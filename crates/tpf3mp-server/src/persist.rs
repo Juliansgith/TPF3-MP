@@ -25,8 +25,10 @@ use tpf3mp_proto::{
     ContentFingerprint, Platform, PlayerId, RoomId, RoomSettings, TURN_MAX_FRAME, Text,
 };
 
-/// Version of the start record's layout.
-pub(crate) const FORMAT_VERSION: u16 = 1;
+/// Version of the log's layout. Version 2 added histories: the start
+/// record names the first, and each recovery logs a turn-stream start
+/// naming the next.
+pub(crate) const FORMAT_VERSION: u16 = 2;
 /// Largest record a log may hold: a turn frame at its cap.
 const MAX_RECORD: usize = TURN_MAX_FRAME + 64;
 const HEADER: usize = 8;
@@ -39,6 +41,8 @@ pub(crate) const LOG_LIMIT: u64 = 1 << 30;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StartRecord {
     pub(crate) version: u16,
+    /// The game's first history.
+    pub(crate) history: u64,
     pub(crate) id: RoomId,
     pub(crate) name: Text<48>,
     pub(crate) owner: PlayerId,
@@ -271,6 +275,7 @@ mod tests {
     fn start() -> StartRecord {
         StartRecord {
             version: FORMAT_VERSION,
+            history: 1,
             id: RoomId(FixedBytes([1; 16])),
             name: Text::new("room").unwrap(),
             owner: PlayerId(FixedBytes([2; 32])),

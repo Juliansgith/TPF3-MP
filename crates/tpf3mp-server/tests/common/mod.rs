@@ -140,7 +140,7 @@ pub fn join(invite: &Invite) -> JoinRoom {
     JoinRoom {
         invite: invite.clone(),
         password: None,
-        resume_after_turn: None,
+        resume: None,
     }
 }
 

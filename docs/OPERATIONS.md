@@ -98,7 +98,9 @@ Persistence details:
 - **Crash safety.** Each turn is written to the operating system as it is
   sealed, so a process crash loses nothing. A power loss or kernel crash can
   lose the last few turns; a client that saw them is told
-  `ResumeUnavailable`.
+  `ResumeUnavailable`, even once the room has sealed new turns with the same
+  numbers (see "Histories" in PROTOCOL.md). Logs from before format
+  version 2 are set aside, not restored.
 - **Damaged logs.** Recovery reads a log without changing it. A damaged final
   record is what a crash leaves behind, so it is cut off once the room is
   rebuilt. Any other damage leaves the log exactly as it was, renamed to

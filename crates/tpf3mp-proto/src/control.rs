@@ -118,9 +118,21 @@ pub struct CreateRoom {
 pub struct JoinRoom {
     pub invite: Invite,
     pub password: Option<Text<64>>,
-    /// For a running game: the last turn this client applied, to receive only
+    /// For a running game: where this client continues, to receive only
     /// later turns. `None` receives the game from its first turn.
-    pub resume_after_turn: Option<u64>,
+    pub resume: Option<Resume>,
+}
+
+/// Where a returning client continues a running game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// The last turn this client applied.
+    pub after_turn: u64,
+    /// The history those turns belong to, from the `TurnStart` of the stream
+    /// they came on. A room restored after a crash that lost turns starts a
+    /// new history, and refuses to resume anyone past the point where the
+    /// two differ.
+    pub history: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

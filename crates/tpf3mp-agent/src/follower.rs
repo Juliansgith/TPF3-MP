@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use thiserror::Error;
-use tpf3mp_proto::{Event, EventBody, Speed, Turn, TurnStart};
+use tpf3mp_proto::{Event, EventBody, Resume, Speed, Turn, TurnStart};
 
 /// Bytes of events a follower holds before it refuses more. An honest
 /// server's backlog is far smaller (it keeps at most 64 MiB of turns for
@@ -53,6 +53,8 @@ pub struct TurnFollower {
     queue: VecDeque<Event>,
     /// Bytes of the events in `queue`, counted as [`event_size`].
     queued_bytes: usize,
+    /// The history of the turns accepted, as the latest stream named it.
+    history: u64,
 }
 
 impl TurnFollower {
@@ -66,11 +68,13 @@ impl TurnFollower {
             executed: 0,
             queue: VecDeque::new(),
             queued_bytes: 0,
+            history: start.history,
         }
     }
 
     /// Continues on a new turn stream after reconnecting. The stream must
-    /// pick up exactly where this follower left off.
+    /// pick up exactly where this follower left off. It may name a newer
+    /// history: the server only resumes a client on turns both share.
     pub fn restart(&mut self, start: &TurnStart) -> Result<(), FollowError> {
         if start.next_turn != self.next_turn {
             return Err(FollowError::RestartMismatch {
@@ -84,7 +88,16 @@ impl TurnFollower {
                 got: start.next_event,
             });
         }
+        self.history = start.history;
         Ok(())
+    }
+
+    /// Where to resume after reconnecting, or `None` before any turn.
+    pub fn resume_point(&self) -> Option<Resume> {
+        self.last_turn().map(|after_turn| Resume {
+            after_turn,
+            history: self.history,
+        })
     }
 
     /// Checks a turn against the invariants and queues its events. On error
@@ -212,6 +225,7 @@ mod tests {
             next_event: 1,
             steps_per_second: 5,
             checkpoint_interval: 10,
+            history: 7,
         }
     }
 
@@ -330,7 +344,16 @@ mod tests {
         let mut resumed = start();
         resumed.next_turn = 2;
         resumed.next_event = 2;
+        resumed.history = 8;
+        assert_eq!(
+            follower.resume_point(),
+            Some(Resume {
+                after_turn: 1,
+                history: 7
+            })
+        );
         assert_eq!(follower.restart(&resumed), Ok(()));
+        assert_eq!(follower.resume_point().map(|r| r.history), Some(8));
         resumed.next_turn = 1;
         assert!(follower.restart(&resumed).is_err());
     }

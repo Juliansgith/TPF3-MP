@@ -19,7 +19,7 @@ use tokio::{
 use tpf3mp_net::close;
 use tpf3mp_proto::{
     ContentFingerprint, Event, EventBody, FRAME_HEADER_LEN, FixedBytes, IntentRejection,
-    LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError, RoomId, RoomPhase,
+    LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError, Resume, RoomId, RoomPhase,
     RoomSettings, RoomView, ServerMessage, Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage,
     TurnStart, decode_frame, encode_frame,
 };
@@ -109,7 +109,7 @@ pub(crate) enum RoomCommand {
         member: NewMember,
         token: FixedBytes<32>,
         password: Option<Text<64>>,
-        resume_after_turn: Option<u64>,
+        resume: Option<Resume>,
         reply: Reply<RoomView>,
     },
     Leave {
@@ -359,6 +359,16 @@ struct Game {
     /// for such a step without a kept round is ignored, so nobody can reopen
     /// old rounds, fill the open-round limit and switch verdicts off.
     rounds_closed_through: u64,
+    /// Every history of the game, oldest first; the last is current. A new
+    /// one begins at each recovery, after the last turn logged.
+    histories: Vec<History>,
+}
+
+/// A stretch of a game's turns that clients can resume on.
+struct History {
+    id: u64,
+    /// The last turn this history shares with the one before it.
+    after_turn: u64,
 }
 
 struct Round {
@@ -490,7 +500,7 @@ impl Room {
         if path.file_stem() != Some(std::ffi::OsStr::new(&expected)) {
             return Err(RecoverError::Misnamed);
         }
-        let mut game = Game::new(start.settings);
+        let mut game = Game::new(start.settings, start.history);
         let mut departed = BTreeSet::new();
         let mut index = 0;
         while let Some(frame) = reader.next_record()? {
@@ -499,6 +509,15 @@ impl Room {
                 .map(decode_frame::<TurnMessage>)
             {
                 Some(Ok(TurnMessage::Turn(turn))) => turn,
+                Some(Ok(TurnMessage::Start(marker))) => {
+                    // An earlier recovery began a new history here.
+                    if marker.next_turn != game.next_turn || marker.next_event != game.next_event {
+                        return Err(RecoverError::Continuity(index));
+                    }
+                    game.begin_history(marker.history);
+                    index += 1;
+                    continue;
+                }
                 _ => return Err(RecoverError::Turn(index)),
             };
             if turn.number != game.next_turn || turn.sealed_through < game.sealed_through {
@@ -561,7 +580,19 @@ impl Room {
             return Ok(None);
         }
         // Only now, with the room rebuilt, may a torn final record be cut.
-        let log = reader.into_log()?;
+        let mut log = reader.into_log()?;
+        // Turns after the last one logged may have reached clients before
+        // the crash, and the room will now number different turns the same
+        // way. It begins a new history, so nobody is resumed onto turns that
+        // differ from the ones they saw.
+        game.begin_history(new_history());
+        let marker = TurnMessage::Start(game.turn_start(
+            start.id,
+            start.settings,
+            game.next_turn,
+            game.next_event,
+        ));
+        log.append(&encode_frame(&marker, TURN_MAX_FRAME).map_err(io::Error::other)?)?;
         // The live room hands ownership to the earliest remaining member at
         // each departure, which leaves the same owner as this.
         let owner = if members.iter().any(|member| member.player == start.owner) {
@@ -655,10 +686,10 @@ impl Room {
                 member,
                 token,
                 password,
-                resume_after_turn,
+                resume,
                 reply,
             } => {
-                let result = self.join(member, &token, password.as_ref(), resume_after_turn);
+                let result = self.join(member, &token, password.as_ref(), resume);
                 let joined = result.is_ok();
                 let _ = reply.send(result);
                 if joined {
@@ -756,7 +787,7 @@ impl Room {
         new: NewMember,
         token: &FixedBytes<32>,
         password: Option<&Text<64>>,
-        resume_after_turn: Option<u64>,
+        resume: Option<Resume>,
     ) -> Result<RoomView, RequestError> {
         let now = Instant::now();
         let seated = self.members.iter().any(|m| m.player == new.player);
@@ -773,9 +804,7 @@ impl Room {
             // connection takes over the seat. Validate the resume point
             // before touching the seat, so a failed resume changes nothing.
             let feed = match &self.phase {
-                Phase::Running(game) => {
-                    Some(game.resume_feed(self.id, self.settings, resume_after_turn)?)
-                }
+                Phase::Running(game) => Some(game.resume_feed(self.id, self.settings, resume)?),
                 Phase::Lobby => None,
             };
             let member = &mut self.members[index];
@@ -883,7 +912,7 @@ impl Room {
         if first.is_none() || self.members.iter().any(|member| member.content != first) {
             return Err(RequestError::ContentMismatch);
         }
-        let mut game = Game::new(self.settings);
+        let mut game = Game::new(self.settings, new_history());
         // The log starts by naming everyone at the table, in join order, so a
         // replay of the log alone reproduces membership.
         for member in &self.members {
@@ -895,13 +924,7 @@ impl Room {
                 self.ruleset.as_mut(),
             );
         }
-        let open = TurnStart {
-            room: self.id,
-            next_turn: game.next_turn,
-            next_event: 1,
-            steps_per_second: self.settings.steps_per_second,
-            checkpoint_interval: self.settings.checkpoint_interval,
-        };
+        let open = game.turn_start(self.id, self.settings, game.next_turn, 1);
         for member in &mut self.members {
             member.pace = Pace::Loading;
             if let Some(link) = &member.link {
@@ -914,8 +937,9 @@ impl Room {
                     .is_ok();
             }
         }
+        let history = game.history();
         self.phase = Phase::Running(Box::new(game));
-        self.open_log();
+        self.open_log(history);
         info!(room = %self.id, players = self.members.len(), "game started");
         metrics::increment(&self.metrics.games_started);
         Ok(())
@@ -923,12 +947,13 @@ impl Room {
 
     /// Starts the log of a game that has just started. A game whose log
     /// cannot be written keeps running, in memory only.
-    fn open_log(&mut self) {
+    fn open_log(&mut self, history: u64) {
         let Some(dir) = &self.data_dir else {
             return;
         };
         let start = StartRecord {
             version: persist::FORMAT_VERSION,
+            history,
             id: self.id,
             name: self.name.clone(),
             owner: self.owner,
@@ -1397,8 +1422,16 @@ fn slowest_pacer(members: &[Member]) -> Option<u64> {
     slowest
 }
 
+/// A fresh history ID. It is random, so a client can never mistake a later
+/// history of the room for one it saw.
+fn new_history() -> u64 {
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).expect("the operating system's random source is available");
+    u64::from_le_bytes(bytes)
+}
+
 impl Game {
-    fn new(settings: RoomSettings) -> Self {
+    fn new(settings: RoomSettings, history: u64) -> Self {
         Self {
             pacer: Pacer::new(
                 settings.steps_per_second,
@@ -1419,6 +1452,39 @@ impl Game {
             started: Instant::now(),
             rounds: BTreeMap::new(),
             rounds_closed_through: 0,
+            histories: vec![History {
+                id: history,
+                after_turn: 0,
+            }],
+        }
+    }
+
+    /// The current history.
+    fn history(&self) -> u64 {
+        self.histories.last().map_or(0, |history| history.id)
+    }
+
+    /// Begins a new history after the last turn so far.
+    fn begin_history(&mut self, id: u64) {
+        let after_turn = self.next_turn.saturating_sub(1);
+        self.histories.push(History { id, after_turn });
+    }
+
+    /// The start of a turn stream that continues at `next_turn`.
+    fn turn_start(
+        &self,
+        room: RoomId,
+        settings: RoomSettings,
+        next_turn: u64,
+        next_event: u64,
+    ) -> TurnStart {
+        TurnStart {
+            room,
+            next_turn,
+            next_event,
+            steps_per_second: settings.steps_per_second,
+            checkpoint_interval: settings.checkpoint_interval,
+            history: self.history(),
         }
     }
 
@@ -1517,16 +1583,34 @@ impl Game {
         }
     }
 
-    /// The turn feed for a member resuming after `after_turn` (or from the
-    /// first turn). Resuming before the window, or after a turn that does
-    /// not exist yet, is refused.
+    /// The turn feed for a member resuming at `resume` (or from the first
+    /// turn). Refused: resuming before the window, after a turn that does
+    /// not exist yet, on a history this game never had, or past the point
+    /// where the client's history and the current one part.
     fn resume_feed(
         &self,
         room: RoomId,
         settings: RoomSettings,
-        after_turn: Option<u64>,
+        resume: Option<Resume>,
     ) -> Result<TurnFeed, RequestError> {
-        let from = after_turn.map_or(1, |turn| turn.saturating_add(1));
+        let from = match resume {
+            None => 1,
+            Some(resume) => {
+                let index = self
+                    .histories
+                    .iter()
+                    .position(|history| history.id == resume.history)
+                    .ok_or(RequestError::ResumeUnavailable)?;
+                if self
+                    .histories
+                    .get(index + 1)
+                    .is_some_and(|next| resume.after_turn > next.after_turn)
+                {
+                    return Err(RequestError::ResumeUnavailable);
+                }
+                resume.after_turn.saturating_add(1)
+            }
+        };
         if from > self.next_turn || from < self.log_first_turn {
             return Err(RequestError::ResumeUnavailable);
         }
@@ -1544,13 +1628,7 @@ impl Game {
             |turn| turn.first_event,
         );
         Ok(TurnFeed::Open {
-            start: TurnStart {
-                room,
-                next_turn: from,
-                next_event,
-                steps_per_second: settings.steps_per_second,
-                checkpoint_interval: settings.checkpoint_interval,
-            },
+            start: self.turn_start(room, settings, from, next_event),
             backlog: backlog.iter().map(|turn| Arc::clone(&turn.frame)).collect(),
         })
     }
@@ -1564,13 +1642,19 @@ mod tests {
     fn resuming_is_limited_to_the_window() {
         let room = RoomId(FixedBytes([0; 16]));
         let settings = RoomSettings::DEFAULT;
-        let mut game = Game::new(settings);
+        let mut game = Game::new(settings, 1);
         game.resume_window = 3;
         for frontier in 1..=5 {
             // Five empty turns, numbered 1 to 5; the window keeps 3 to 5.
             game.seal(frontier).unwrap();
         }
-        let feed = |after| game.resume_feed(room, settings, after);
+        let feed = |after_turn: Option<u64>| {
+            let resume = after_turn.map(|after_turn| Resume {
+                after_turn,
+                history: 1,
+            });
+            game.resume_feed(room, settings, resume)
+        };
         assert!(matches!(feed(None), Err(RequestError::ResumeUnavailable)));
         assert!(matches!(
             feed(Some(1)),
@@ -1591,8 +1675,47 @@ mod tests {
     }
 
     #[test]
+    fn resuming_never_crosses_into_turns_the_client_did_not_see() {
+        let room = RoomId(FixedBytes([0; 16]));
+        let settings = RoomSettings::DEFAULT;
+        let mut game = Game::new(settings, 1);
+        for frontier in 1..=4 {
+            game.seal(frontier).unwrap();
+        }
+        // A crash lost the turns after 4. The restored room numbers its new
+        // turns 5 and on too, in history 2.
+        game.begin_history(2);
+        for frontier in 5..=8 {
+            game.seal(frontier).unwrap();
+        }
+        let feed = |after_turn, history| {
+            game.resume_feed(
+                room,
+                settings,
+                Some(Resume {
+                    after_turn,
+                    history,
+                }),
+            )
+        };
+        let Ok(TurnFeed::Open { start, .. }) = feed(4, 1) else {
+            panic!("turns 1 to 4 are the same in both histories");
+        };
+        assert_eq!(start.history, 2, "the stream names the current history");
+        assert!(
+            matches!(feed(6, 1), Err(RequestError::ResumeUnavailable)),
+            "turn 6 of history 1 was lost"
+        );
+        assert!(feed(6, 2).is_ok());
+        assert!(
+            matches!(feed(2, 9), Err(RequestError::ResumeUnavailable)),
+            "a history the game never had"
+        );
+    }
+
+    #[test]
     fn the_resume_window_is_bounded_in_bytes_too() {
-        let mut game = Game::new(RoomSettings::DEFAULT);
+        let mut game = Game::new(RoomSettings::DEFAULT, 1);
         let big = RESUME_WINDOW_BYTES / 4 + 1;
         for _ in 0..8 {
             game.remember(LoggedTurn {

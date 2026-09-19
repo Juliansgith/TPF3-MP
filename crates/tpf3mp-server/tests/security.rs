@@ -1,14 +1,6 @@
-//! Proof-of-concept tests from the security review.
-//!
-//! Every test here asserts the behaviour the server *should* have and fails
-//! today because of the finding named in its doc comment. They are ignored so
-//! the regular suite stays green; run them with
-//!
-//! ```sh
-//! cargo test -p tpf3mp-server --test security -- --ignored
-//! ```
-//!
-//! and un-ignore each one together with its fix.
+//! Tests from the security review. Each asserts the behaviour the server
+//! should have; each failed before the fix for the finding named in its doc
+//! comment, and now guards against it coming back.
 
 #![allow(clippy::unwrap_used)]
 
@@ -344,7 +336,7 @@ async fn a_room_password_cannot_be_guessed_at_line_rate() {
             request: Request::JoinRoom(JoinRoom {
                 invite: invite.clone(),
                 password: Some(Text::new(format!("{pin:04}")).unwrap()),
-                resume_after_turn: None,
+                resume: None,
             }),
         };
         burst.extend(tpf3mp_proto::encode_frame(&request, CONTROL_MAX_FRAME).unwrap());
@@ -598,7 +590,6 @@ async fn one_damaged_turn_does_not_erase_the_rest_of_the_log() {
 /// error. Here Ann applied command X at event 3; after recovery the room
 /// ordered Bob's command Y as event 3; Ann resumes anyway.
 #[tokio::test]
-#[ignore = "security PoC: fails until lost turn numbers are never reused for a resume"]
 async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let dir = data_dir("fork");
     let secret = [5; 32];
@@ -639,6 +630,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
     let bob_old = players.pop().unwrap();
     let ann_old = players.pop().unwrap();
     let ann_last = ann_old.follower.as_ref().unwrap().last_turn().unwrap();
+    let ann_resume = ann_old.follower.as_ref().unwrap().resume_point();
 
     // Bob is told his turns are gone, reloads and follows from turn 1...
     let mut bob = Player::new(
@@ -651,7 +643,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
         .join_room(JoinRoom {
             invite: invite.clone(),
             password: None,
-            resume_after_turn: bob_old.follower.as_ref().unwrap().last_turn(),
+            resume: bob_old.follower.as_ref().unwrap().resume_point(),
         })
         .await;
     assert_eq!(
@@ -685,7 +677,7 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
         .join_room(JoinRoom {
             invite,
             password: None,
-            resume_after_turn: Some(ann_last),
+            resume: ann_resume,
         })
         .await;
     if resumed.is_ok() {

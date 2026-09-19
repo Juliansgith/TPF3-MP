@@ -59,7 +59,7 @@ async fn every_bad_invite_fails_the_same_way() {
             .join_room(JoinRoom {
                 invite,
                 password: password.map(|p| Text::new(p).unwrap()),
-                resume_after_turn: None,
+                resume: None,
             })
             .await
             .unwrap_err();
@@ -70,7 +70,7 @@ async fn every_bad_invite_fails_the_same_way() {
         .join_room(JoinRoom {
             invite,
             password: Some(Text::new("hunter2").unwrap()),
-            resume_after_turn: None,
+            resume: None,
         })
         .await
         .unwrap();

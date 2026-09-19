@@ -28,6 +28,8 @@ pub struct TurnStart {
     pub next_event: u64,
     pub steps_per_second: u16,
     pub checkpoint_interval: u32,
+    /// The history this stream's turns belong to, to name when resuming.
+    pub history: u64,
 }
 
 /// One sealed turn. See the invariants in `docs/PROTOCOL.md`.

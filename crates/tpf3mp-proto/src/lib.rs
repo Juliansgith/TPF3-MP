@@ -22,8 +22,8 @@ pub use bytes::{FixedBytes, MAX_PAYLOAD, Payload, PayloadTooLarge};
 pub use control::{
     AUTH_DOMAIN, AUTH_EXPORTER_LABEL, ClientMessage, ContentFingerprint, CreateRoom, GameMessage,
     Hello, IntentRejection, JoinRoom, LaneDigest, MAX_CHECKPOINT_LANES, MAX_ROOM_MEMBERS,
-    MemberView, Reject, RejectReason, Request, RequestError, Response, RoomPhase, RoomSettings,
-    RoomView, ServerMessage, Speed, Welcome,
+    MemberView, Reject, RejectReason, Request, RequestError, Response, Resume, RoomPhase,
+    RoomSettings, RoomView, ServerMessage, Speed, Welcome,
 };
 pub use ids::{Invite, InviteError, PlayerId, RoomId, SessionId, Signature};
 pub use text::{Text, TextError};

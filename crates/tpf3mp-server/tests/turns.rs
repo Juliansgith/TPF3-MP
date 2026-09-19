@@ -13,7 +13,7 @@ use tpf3mp_agent::ClientError;
 use tpf3mp_net::close;
 use tpf3mp_proto::{
     Event, EventBody, FixedBytes, IntentRejection, Invite, JoinRoom, LaneDigest, Payload, PlayerId,
-    RequestError, RoomSettings, Speed,
+    RequestError, Resume, RoomSettings, Speed,
 };
 use tpf3mp_server::Ruleset;
 
@@ -341,7 +341,7 @@ async fn a_reconnecting_player_resumes_exactly() {
         executed,
         ..
     } = bob;
-    let last_turn = follower.as_ref().unwrap().last_turn();
+    let resume = follower.as_ref().unwrap().resume_point();
 
     // Ann builds while Bob is away.
     for seq in 0..5u8 {
@@ -362,7 +362,7 @@ async fn a_reconnecting_player_resumes_exactly() {
         .join_room(JoinRoom {
             invite,
             password: None,
-            resume_after_turn: last_turn,
+            resume,
         })
         .await
         .unwrap();
@@ -386,6 +386,13 @@ async fn resuming_from_the_future_is_refused() {
     let (players, invite) = start(clients, FAST).await;
     let players = play_all(players, |p| p.executed >= 1).await;
     let identity = Arc::clone(&players[1].test.identity);
+    let history = players[1]
+        .follower
+        .as_ref()
+        .unwrap()
+        .resume_point()
+        .unwrap()
+        .history;
     drop(players);
     let bob = server.client_as(identity, "bob").await;
     let error = bob
@@ -393,7 +400,10 @@ async fn resuming_from_the_future_is_refused() {
         .join_room(JoinRoom {
             invite,
             password: None,
-            resume_after_turn: Some(1_000_000),
+            resume: Some(Resume {
+                after_turn: 1_000_000,
+                history,
+            }),
         })
         .await
         .unwrap_err();
