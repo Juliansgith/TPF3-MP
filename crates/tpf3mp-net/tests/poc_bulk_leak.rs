@@ -108,11 +108,7 @@ async fn a_failed_fetch_pins_partial_chunks_forever() {
     assert!(unique.len() >= 3, "need a multi-chunk world");
     let last = unique.last().unwrap().id;
     let hex = last.to_string();
-    let path = server
-        .root()
-        .join("chunks")
-        .join(&hex[..2])
-        .join(&hex);
+    let path = server.root().join("chunks").join(&hex[..2]).join(&hex);
     std::fs::remove_file(&path).unwrap();
 
     let Pipe {
