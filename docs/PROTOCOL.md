@@ -33,7 +33,8 @@ WebSocket tunnel instead:
   that subprotocol, or refuses: `403` for a request with an `Origin`, as
   browsers send (a web page must not be able to open tunnels from its
   visitors' machines), and `429` for an address over its share of
-  tunnels.
+  tunnels. A server serving the tunnel's TLS itself counts the address
+  before the handshake, and closes such a connection at once instead.
 - Each binary message carries exactly one QUIC datagram of at most 2048
   bytes. Text messages and larger messages end the tunnel. Pings and pongs
   are allowed, carry nothing, and keep nothing open.
