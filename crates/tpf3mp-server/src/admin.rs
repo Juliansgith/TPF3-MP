@@ -2,25 +2,47 @@
 //! `/healthz`, over plain HTTP. It has no authentication, so it must only
 //! listen on a private address: loopback, or a VPN interface.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
 };
+use tracing::warn;
 
 use crate::ServerStats;
 
 /// Largest request head the endpoint reads.
 const MAX_REQUEST: usize = 8 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Requests answered at once; more wait in the listen backlog. A scraper
+/// needs one.
+const MAX_CONNECTIONS: usize = 16;
+/// Pause after a failed accept, such as when the process is out of file
+/// descriptors, so the loop neither spins nor gives up.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Serves the admin endpoint until the listener fails.
+/// Serves the admin endpoint for as long as the server runs. A failed
+/// accept is logged and retried: the endpoint must not vanish silently.
 pub async fn serve_admin(listener: TcpListener, stats: ServerStats) {
-    while let Ok((stream, _)) = listener.accept().await {
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    loop {
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            return;
+        };
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                warn!(%error, "the admin endpoint cannot accept a connection");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
         let stats = stats.clone();
         tokio::spawn(async move {
             let _ = tokio::time::timeout(REQUEST_TIMEOUT, answer(stream, &stats)).await;
+            drop(slot);
         });
     }
 }

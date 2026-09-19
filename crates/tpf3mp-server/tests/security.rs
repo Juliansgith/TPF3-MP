@@ -771,7 +771,6 @@ async fn an_idle_session_does_not_hold_a_slot_forever() {
 /// by everyone (for example, anyone can take over its room seat or owner
 /// rights).
 #[tokio::test]
-#[ignore = "security PoC: fails until small-order identity keys are refused"]
 async fn a_small_order_identity_key_is_refused() {
     let server = RunningServer::start(|_| {}).await;
     let (_endpoint, connection) = server.raw_connection().await;
