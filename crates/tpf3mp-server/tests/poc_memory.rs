@@ -125,9 +125,9 @@ async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
         let warm = server.client("warm").await;
         warm.client.close().await;
     }
-    settle().await;
-    let before = live();
-
+    // The baseline includes the connection and its handshake, which cost
+    // the same with or without the attack; on Linux the client endpoint's
+    // receive buffers alone are about 3 MB.
     let (endpoint, connection) = server.raw_connection().await;
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
     write_preamble(&mut send, PROTOCOL_VERSION).await.unwrap();
@@ -146,6 +146,8 @@ async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
     let _welcome = read_message::<ServerMessage>(&mut recv, CONTROL_MAX_FRAME)
         .await
         .unwrap();
+    settle().await;
+    let before = live();
 
     let refused = Duration::from_millis(500);
     assert!(
@@ -167,7 +169,7 @@ async fn a_connection_cannot_pin_server_memory_with_unread_streams() {
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     server.shut_down().await;
-    assert!(held < 2 * 1024 * 1024, "one connection held {held} bytes");
+    assert!(held < 1024 * 1024, "the attack pinned {held} bytes");
 }
 
 /// Review finding H2: a room kept every sealed turn in memory and on disk
@@ -214,14 +216,26 @@ async fn one_player_cannot_grow_a_room_quickly() {
     server.shut_down().await;
     settle().await;
 
-    // Recovery reads the log back: measure its peak.
-    let base = live();
-    PEAK.store(base, Relaxed);
-    let restarted = RunningServer::start(persistent(&dir, secret)).await;
-    let peak = PEAK.load(Relaxed).saturating_sub(base) as f64;
-    let resident = live().saturating_sub(base) as f64;
-    restarted.shut_down().await;
+    // Recovery reads the log back: measure its peak, less what starting a
+    // server with nothing to restore takes (on Linux the endpoint's receive
+    // buffers alone are about 3 MB).
+    let start_peak = |dir: PathBuf| async move {
+        let base = live();
+        PEAK.store(base, Relaxed);
+        let server = RunningServer::start(persistent(&dir, secret)).await;
+        let peak = PEAK.load(Relaxed).saturating_sub(base) as f64;
+        let resident = live().saturating_sub(base) as f64;
+        server.shut_down().await;
+        settle().await;
+        (peak, resident)
+    };
+    let empty = data_dir("growth-empty");
+    let (empty_peak, empty_resident) = start_peak(empty.clone()).await;
+    let (peak, resident) = start_peak(dir.clone()).await;
+    let peak = peak - empty_peak;
+    let resident = resident - empty_resident;
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
 
     println!(
         "{seq} intents in {seconds:.1} s: server heap +{:.2} MiB, log +{:.2} MiB",
