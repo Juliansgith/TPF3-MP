@@ -244,6 +244,17 @@ impl Server {
     /// Serves connections until `shutdown` completes, then closes every
     /// connection with `SHUTTING_DOWN` and waits for the endpoint to drain.
     pub async fn run(self, shutdown: impl Future<Output = ()>) {
+        let collector = self.shared.snapshots.clone().map(|snapshots| {
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(snapshots::COLLECT_EVERY);
+                every.tick().await;
+                loop {
+                    every.tick().await;
+                    let snapshots = Arc::clone(&snapshots);
+                    let _ = tokio::task::spawn_blocking(move || snapshots.collect_released()).await;
+                }
+            })
+        });
         let mut shutdown = std::pin::pin!(shutdown);
         loop {
             tokio::select! {
@@ -256,6 +267,9 @@ impl Server {
         }
         self.endpoint
             .close(close::SHUTTING_DOWN, b"server shutting down");
+        if let Some(collector) = collector {
+            collector.abort();
+        }
         self.endpoint.wait_idle().await;
         self.shared.directory.shut_down().await;
         // Once every connection's task has ended, and the server with them,

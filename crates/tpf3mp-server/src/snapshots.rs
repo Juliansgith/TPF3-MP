@@ -15,7 +15,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -39,6 +42,10 @@ pub(crate) const BULK_IDLE: Duration = Duration::from_secs(60);
 /// Bulk streams the server runs at once, so snapshots cannot take all of
 /// its disk and bandwidth.
 const TRANSFERS: usize = 32;
+/// How often the server deletes chunks no snapshot uses any more.
+/// Collecting walks the whole store and holds it meanwhile, so it runs on
+/// a timer and only after something was released, not at every release.
+pub(crate) const COLLECT_EVERY: Duration = Duration::from_secs(600);
 /// Version of the snapshot pointer file.
 const POINTER_VERSION: u16 = 1;
 /// Largest pointer file read back.
@@ -78,6 +85,8 @@ pub(crate) struct Snapshots {
     pub(crate) min_gap: Duration,
     /// Bulk streams running at once, across the server.
     pub(crate) transfers: Arc<Semaphore>,
+    /// Whether a snapshot was released since the last collection.
+    released: AtomicBool,
 }
 
 impl Snapshots {
@@ -91,7 +100,29 @@ impl Snapshots {
             every: config.every,
             min_gap: config.min_gap.min(config.every),
             transfers: Arc::new(Semaphore::new(TRANSFERS)),
+            released: AtomicBool::new(false),
         })
+    }
+
+    /// Stops keeping these snapshots. Their chunks go at the next
+    /// collection. Blocking.
+    pub(crate) fn release(&self, ids: &[ManifestId]) {
+        for id in ids {
+            if let Err(error) = self.store.release(id) {
+                warn!(%error, "cannot release a snapshot");
+            }
+        }
+        if !ids.is_empty() {
+            self.released.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Collects the chunks of released snapshots, if any were released
+    /// since the last collection. Blocking.
+    pub(crate) fn collect_released(&self) {
+        if self.released.swap(false, Ordering::Relaxed) {
+            self.collect();
+        }
     }
 
     /// Stops keeping snapshots no room refers to, for example those of

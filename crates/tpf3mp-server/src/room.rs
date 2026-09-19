@@ -1755,14 +1755,7 @@ impl Room {
                 {
                     warn!(%room, %error, "cannot record the room's snapshot; a restart will forget it");
                 }
-                for id in &released {
-                    if let Err(error) = snapshots.store.release(id) {
-                        warn!(%room, %error, "cannot release an old snapshot");
-                    }
-                }
-                if !released.is_empty() {
-                    snapshots.collect();
-                }
+                snapshots.release(&released);
             });
         }
         self.offer_worlds(Instant::now());
@@ -2154,20 +2147,13 @@ fn save_complete(members: &[Member], round: &SaveRound) -> bool {
         })
 }
 
-/// Stops keeping `ids` in the store and collects their chunks, off the
-/// room's task.
+/// Stops keeping `ids` in the store, off the room's task. The server's
+/// next collection deletes their chunks.
 fn release_in_background(snapshots: Arc<Snapshots>, ids: Vec<ManifestId>) {
     if ids.is_empty() {
         return;
     }
-    tokio::task::spawn_blocking(move || {
-        for id in &ids {
-            if let Err(error) = snapshots.store.release(id) {
-                warn!(%error, "cannot release a snapshot");
-            }
-        }
-        snapshots.collect();
-    });
+    tokio::task::spawn_blocking(move || snapshots.release(&ids));
 }
 
 /// The snapshot a restored room last agreed on, if its pointer is readable,
